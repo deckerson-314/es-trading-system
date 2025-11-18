@@ -11,11 +11,16 @@ FINAL PRODUCTION SCRIPT
   • Scalar fitness + IRONCLAD min-trades
   • Enforces TARGET_TRADES_DAY=4, MIN_TRADES_DAY=2
   • Optimizable Trailing Delay (bars) to control quick wins via TP
+  • CHECKPOINT/RESUME: Saves state after each generation
+    - Automatically resumes from interruption
+    - Checkpoint file: ga_diagnostics/ga_checkpoint.pkl
+    - Delete checkpoint file to start fresh
 """
 
 import os
 import warnings
 import random
+import pickle
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -32,6 +37,7 @@ OUTPUT_CSV = 'Bollinger/parameters/BB_Strategy_Parameters_optimized.csv'
 TRADES_OOS_CSV = 'Bollinger/output/trades_oos.csv'
 TRADES_IS_CSV = 'Bollinger/output/trades_is.csv'
 DIAG_DIR = 'ga_diagnostics'
+CHECKPOINT_FILE = os.path.join(DIAG_DIR, 'ga_checkpoint.pkl')
 os.makedirs(DIAG_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(TRADES_IS_CSV), exist_ok=True)
 os.makedirs(os.path.dirname(TRADES_OOS_CSV), exist_ok=True)
@@ -245,12 +251,102 @@ toolbox.register("mutate", custom_mutate)
 toolbox.register("select", tools.selTournament, tournsize=3)
 
 # ----------------------------------------------------------------------
+# Checkpoint Functions
+# ----------------------------------------------------------------------
+def save_checkpoint(pop, hof, logbook, gen, config):
+    """
+    Save GA state to checkpoint file.
+    
+    Args:
+        pop: Current population
+        hof: Hall of Fame
+        logbook: Logbook with statistics
+        gen: Current generation number
+        config: Configuration dictionary (for verification)
+    """
+    checkpoint = {
+        'population': pop,
+        'hall_of_fame': hof,
+        'logbook': logbook,
+        'generation': gen,
+        'config': config,
+        'random_state': random.getstate(),
+        'numpy_random_state': np.random.get_state()
+    }
+    with open(CHECKPOINT_FILE, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    print(f"Checkpoint saved: Generation {gen} → {CHECKPOINT_FILE}")
+
+def load_checkpoint():
+    """
+    Load GA state from checkpoint file if it exists.
+    
+    Returns:
+        tuple: (pop, hof, logbook, start_gen, config) or None if no checkpoint
+    """
+    if not os.path.exists(CHECKPOINT_FILE):
+        return None
+    
+    try:
+        with open(CHECKPOINT_FILE, 'rb') as f:
+            checkpoint = pickle.load(f)
+        
+        # Restore random states
+        random.setstate(checkpoint['random_state'])
+        np.random.set_state(checkpoint['numpy_random_state'])
+        
+        print(f"\n=== CHECKPOINT FOUND ===")
+        print(f"Resuming from Generation {checkpoint['generation']}")
+        print(f"Checkpoint file: {CHECKPOINT_FILE}")
+        print("=" * 50)
+        
+        return (
+            checkpoint['population'],
+            checkpoint['hall_of_fame'],
+            checkpoint['logbook'],
+            checkpoint['generation'] + 1,  # Start from next generation
+            checkpoint['config']
+        )
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        print("Starting fresh run...")
+        return None
+
+def verify_config_compatibility(saved_config, current_config):
+    """
+    Verify that saved checkpoint config matches current config.
+    
+    Returns:
+        bool: True if compatible, False otherwise
+    """
+    critical_params = ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'DATA_SPLITS', 'DATA_SIZE']
+    for param in critical_params:
+        if saved_config.get(param) != current_config.get(param):
+            print(f"WARNING: Config mismatch for {param}")
+            print(f"  Saved: {saved_config.get(param)}")
+            print(f"  Current: {current_config.get(param)}")
+            return False
+    return True
+
+# ----------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------
 def main():
     print("# Genetic Optimization for Bollinger Band Strategy - Version 2.0")
     print("# Using shared bollinger_strategy module")
+    print("# Checkpoint/Resume enabled - saves after each generation")
     toolbox.register("map", map)
+    
+    # Save current configuration
+    current_config = {
+        'POP_SIZE': POP_SIZE,
+        'NUM_GEN': NUM_GEN,
+        'CX_PB': CX_PB,
+        'MUT_PB': MUT_PB,
+        'DATA_SPLITS': DATA_SPLITS,
+        'DATA_SIZE': DATA_SIZE,
+        'PARAM_CSV': PARAM_CSV
+    }
     
     DATA_CSV = 'Bollinger/data/ES_full_1min_continuous_ratio_adjusted.csv'
     df = pd.read_csv(DATA_CSV, header=None,
@@ -261,27 +357,93 @@ def main():
     split = int(len(df) * DATA_SPLITS)
     in_sample, oos = df.iloc[:split], df.iloc[split:]
     
-    pop = toolbox.population(n=POP_SIZE)
-    hof = tools.HallOfFame(1)
+    # Try to load checkpoint
+    checkpoint_data = load_checkpoint()
+    
+    if checkpoint_data is not None:
+        pop, hof, logbook, start_gen, saved_config = checkpoint_data
+        
+        # Verify configuration compatibility
+        if not verify_config_compatibility(saved_config, current_config):
+            print("\nWARNING: Config mismatch detected!")
+            print("Continuing with saved checkpoint despite config mismatch...")
+            print("(Delete checkpoint file to start fresh if needed)")
+    else:
+        # Start fresh
+        pop = toolbox.population(n=POP_SIZE)
+        hof = tools.HallOfFame(1)
+        logbook = tools.Logbook()
+        logbook.header = "gen", "evals", "avg", "min", "max"
+        start_gen = 0
+        print("\nStarting fresh run...")
+    
     stats = tools.Statistics(lambda i: i.fitness.values[0])
     stats.register("avg", np.mean)
     stats.register("min", np.min)
     stats.register("max", np.max)
-    logbook = tools.Logbook()
-    logbook.header = "gen", "evals", "avg", "min", "max"
     
-    print(logbook.header)
+    if start_gen == 0:
+        print(logbook.header)
     
-    for gen in range(NUM_GEN):
-        offspring = algorithms.varAnd(pop, toolbox, CX_PB, MUT_PB)
-        fits = toolbox.map(toolbox.evaluate, [(ind, in_sample) for ind in offspring])
-        for fit, ind in zip(fits, offspring):
-            ind.fitness.values = fit
-        pop = toolbox.select(offspring, len(pop))
-        hof.update(pop)
-        record = stats.compile(pop)
-        logbook.record(gen=gen, evals=len(pop), **record)
-        print(f"{gen}\t{len(pop)}\t{round(record['avg'], 4)}\t{round(record['min'], 4)}\t{round(record['max'], 4)}")
+    print(f"\nConfiguration:")
+    print(f"  NUM_GEN: {NUM_GEN}")
+    print(f"  POP_SIZE: {POP_SIZE}")
+    print(f"  Starting from generation: {start_gen}")
+    print(f"  Will run generations: {list(range(start_gen, NUM_GEN))}")
+    print()
+    
+    # Main evolution loop
+    try:
+        for gen in range(start_gen, NUM_GEN):
+            print(f"Generation {gen} starting...")
+            offspring = algorithms.varAnd(pop, toolbox, CX_PB, MUT_PB)
+            
+            # Evaluate with error handling
+            print(f"  Evaluating {len(offspring)} individuals...")
+            fits = []
+            for i, (ind, df) in enumerate([(ind, in_sample) for ind in offspring]):
+                try:
+                    fit = toolbox.evaluate((ind, df))
+                    fits.append(fit)
+                except Exception as e:
+                    print(f"  ERROR evaluating individual {i}: {e}")
+                    # Assign a very poor fitness to failed evaluations
+                    fits.append((-1000.0,))
+            
+            # Assign fitness values
+            for fit, ind in zip(fits, offspring):
+                ind.fitness.values = fit
+            
+            pop = toolbox.select(offspring, len(pop))
+            hof.update(pop)
+            record = stats.compile(pop)
+            logbook.record(gen=gen, evals=len(pop), **record)
+            print(f"{gen}\t{len(pop)}\t{round(record['avg'], 4)}\t{round(record['min'], 4)}\t{round(record['max'], 4)}")
+            
+            # Save checkpoint after each generation
+            save_checkpoint(pop, hof, logbook, gen, current_config)
+            print(f"Generation {gen} completed.\n")
+            
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user. Checkpoint saved.")
+        if 'gen' in locals():
+            print(f"Completed {gen + 1} out of {NUM_GEN} generations.")
+        return
+    except Exception as e:
+        print(f"\n\nERROR during evolution:")
+        if 'gen' in locals():
+            print(f"Error occurred at generation {gen}")
+        print(f"Exception: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"\nCheckpoint saved. Resume by running the script again.")
+        return
+    
+    # Check if we have any results
+    if len(hof) == 0:
+        print("\nERROR: No individuals in Hall of Fame. Cannot proceed.")
+        print("This may indicate all evaluations failed.")
+        return
     
     best = hof[0]
     best_params = dict(zip(param_keys, best))
@@ -400,6 +562,11 @@ def main():
         param_df.at[idx, 'Value'] = int(val) if typ == 'int' else round(val, 4)
     param_df.to_csv(OUTPUT_CSV, index=False)
     print(f"Optimized CSV → {OUTPUT_CSV}")
+    
+    # Clean up checkpoint file on successful completion
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        print(f"Checkpoint file removed: {CHECKPOINT_FILE}")
 
 
 if __name__ == "__main__":
