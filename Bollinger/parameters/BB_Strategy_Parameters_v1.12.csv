@@ -21,11 +21,11 @@ Fixed ATR TP,false,false,true,bool,FIXED: Entry ± (ATR × Multiplier)
 Fixed BB at Entry TP,true,false,true,bool,FIXED: Upper BB at entry (long)
 ATR Length for TP,26,10,80,int,ATR period for fixed TP
 ATR Multiplier for TP,2.0,1.0,6.0,float,Fixed TP ATR multiplier
-Min ATR Filter (Points),10,0,10,float,Minimum ATR value to allow entries
+Min ATR Filter (Points),7.5,0,10,float,Minimum ATR value to allow entries - lower default for more opportunities
 RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
 RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end
 Enable RTH Filter,true,false,true,bool,Restrict entries to RTH only
-Min Volume Multiplier,1.5,1.0,1.5,float,Volume filter (1.0 = no filter)
+Min Volume Multiplier,1.5,1.0,2.0,float,Volume filter (1.0 = no filter; now optimizable)
 Timeframe (minutes),15,1,8,int,Resample timeframe in minutes
 POP_SIZE,200,100,300,int,Population size
 NUM_GEN,100,50,150,int,Number of generations
@@ -36,7 +36,7 @@ MUT_SIGMA,0.25,0.1,0.4,float,Mutation std dev
 TARGET_TRADES_DAY,4,1,5,int,Ideal trades/day
 TRADES_PENALTY_WEIGHT,0.5,0.1,1.0,float,Penalty for excess trades
 DD_WEIGHT,0.3,0.1,1.0,float,Drawdown penalty weight
-DATA_SPLITS,0.7,0.5,0.9,float,In-sample fraction
-DATA_SIZE,10000000,0,1000000,int,Rows to subsample (0 = full)
-MIN_TRADES_DAY,2.0,0.5,2.0,float,MUST have at least 2 trades/day
+DATA_SPLITS,0.7,0.65,0.85,float,In-sample fraction - 65-85% for better generalization
+DATA_SIZE,0,0,10000000,int,Rows to subsample (0 = full dataset)
+MIN_TRADES_DAY,2.0,1.5,2.0,float,MUST have at least 1.5 trades/day - matches description
 MIN_TRADES_PEN_WEIGHT,-100.0,-200.0,-50.0,float,Scalar penalty — zero trades = -100

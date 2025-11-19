@@ -75,9 +75,142 @@ class StatusTimer:
     
     def _report(self):
         positions_list = ib.positions()
-        pnl = sum(pos.unrealizedPNL for pos in positions_list if pos.contract.symbol == 'ES')
-        msg = f"Status: {len(positions_list)} open position(s)\nUnrealized PNL: ${pnl:,.2f}"
-        logging.info(msg)
+        es_positions = [p for p in positions_list if p.contract.symbol == 'ES']
+        
+        # Check for active orders
+        active_orders_count = 0
+        try:
+            for trade in ib.trades():
+                if trade.contract.conId == contract.conId if contract else False:
+                    if trade.isActive() or (trade.orderStatus and 
+                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                        active_orders_count += 1
+        except:
+            pass
+        
+        # Skip email if no positions and no active orders
+        if len(es_positions) == 0 and len(positions) == 0 and active_orders_count == 0:
+            logging.debug("Skipping status email - no positions, no tracked positions, and no active orders")
+            self.start()  # Restart timer for next check
+            return
+        
+        # Get account summary
+        account = get_account_summary()
+        
+        # Get current market price
+        current_price = 0
+        if len(data) > 0:
+            current_price = data['close'].iloc[-1]
+        
+        # Build position details
+        position_details = []
+        for bracket in positions:
+            entry_order = bracket.get('entry')
+            stop_order = bracket.get('stopLoss')
+            tp_order = bracket.get('takeProfit')
+            direction = bracket.get('direction', 0)
+            entry_price = bracket.get('entry_price', 0)
+            entry_time = bracket.get('entry_time')
+            
+            # Get current stop and TP prices
+            current_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+            tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+            
+            # Calculate duration
+            duration_str = "N/A"
+            if entry_time:
+                duration_seconds = (datetime.now() - entry_time).total_seconds()
+                duration_str = format_duration(duration_seconds)
+            
+            # Get unrealized PNL for this position
+            pos_unrealized = 0
+            for pos in es_positions:
+                if pos.contract.conId == contract.conId:
+                    pos_unrealized = pos.unrealizedPNL
+                    break
+            
+            # Calculate price change
+            price_change = current_price - entry_price if entry_price > 0 and current_price > 0 else 0
+            price_change_pct = (price_change / entry_price * 100) if entry_price > 0 else 0
+            
+            # Get quantity from stop order or entry order
+            qty = 1  # Default
+            if stop_order and hasattr(stop_order, 'totalQuantity'):
+                qty = abs(stop_order.totalQuantity)
+            elif entry_order and hasattr(entry_order, 'totalQuantity'):
+                qty = abs(entry_order.totalQuantity)
+            
+            # Calculate risk and reward for this position
+            contract_multiplier = 50  # ES contract multiplier
+            risk_dollars = abs(entry_price - current_stop) * contract_multiplier * qty if entry_price > 0 and current_stop > 0 else 0
+            reward_dollars = abs(entry_price - tp_price) * contract_multiplier * qty if (tp_price and entry_price > 0) else None
+            risk_reward_ratio = reward_dollars / risk_dollars if (reward_dollars and risk_dollars > 0) else None
+            
+            pos_info = [
+                f"  Position {len(position_details) + 1}: {'LONG' if direction == 1 else 'SHORT'}",
+                f"    Entry: ${entry_price:.2f} @ {entry_time.strftime('%H:%M:%S')}" if entry_time else f"    Entry: ${entry_price:.2f}",
+                f"    Current: ${current_price:.2f} ({price_change_pct:+.2f}%)",
+                f"    Stop: ${current_stop:.2f} (Risk: ${risk_dollars:,.2f})",
+                f"    TP: ${tp_price:.2f} (Reward: ${reward_dollars:,.2f})" if tp_price else "    TP: None",
+                f"    Risk/Reward: {risk_reward_ratio:.2f}:1" if risk_reward_ratio else "    Risk/Reward: N/A",
+                f"    Unrealized PNL: ${pos_unrealized:,.2f}",
+                f"    Duration: {duration_str}"
+            ]
+            position_details.extend(pos_info)
+        
+        # Build comprehensive status email
+        msg_lines = [
+            f"STATUS UPDATE - 15 Minute Report",
+            f"{'='*50}",
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"",
+            f"Positions:",
+            f"  Open ES Positions: {len(es_positions)}",
+            f"  Total Unrealized PNL: ${account.get('UnrealizedPNL', 0):,.2f}",
+            f""
+        ]
+        
+        if position_details:
+            msg_lines.extend(position_details)
+            msg_lines.append("")
+        else:
+            msg_lines.append("  No open positions")
+            msg_lines.append("")
+        
+        msg_lines.append(f"Account Summary:")
+        
+        # Add account values (show 0.00 if available, N/A only if truly missing)
+        net_liq = account.get('NetLiquidation')
+        if net_liq is not None:
+            msg_lines.append(f"  Net Liquidation: ${net_liq:,.2f}")
+        else:
+            msg_lines.append("  Net Liquidation: N/A")
+        
+        total_cash = account.get('TotalCashValue')
+        if total_cash is not None:
+            msg_lines.append(f"  Total Cash: ${total_cash:,.2f}")
+        else:
+            msg_lines.append("  Total Cash: N/A")
+        
+        buying_power = account.get('BuyingPower')
+        if buying_power is not None:
+            msg_lines.append(f"  Buying Power: ${buying_power:,.2f}")
+        else:
+            msg_lines.append("  Buying Power: N/A")
+        
+        msg_lines.extend([
+            f"  Total Unrealized PNL: ${account.get('UnrealizedPNL', 0):,.2f}",
+            f"  Total Realized PNL: ${account.get('RealizedPNL', 0):,.2f}",
+        ])
+        
+        gross_pos = account.get('GrossPositionValue')
+        if gross_pos is not None:
+            msg_lines.append(f"  Gross Position Value: ${gross_pos:,.2f}")
+        else:
+            msg_lines.append("  Gross Position Value: N/A")
+        
+        msg = "\n".join(msg_lines)
+        logging.info(msg.replace('\n', ' | '))
         send_email("BB Strategy - 15-min Status", msg)
         self.start()
     
@@ -114,6 +247,93 @@ def send_email(subject, body):
         logging.info(f"Email sent: {subject}")
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
+
+def get_account_summary():
+    """Get account summary information."""
+    try:
+        account_values = ib.accountValues()
+        summary = {}
+        
+        # Debug: Log first few account values to understand structure
+        if len(account_values) > 0:
+            logging.debug(f"Sample account value structure: {type(account_values[0])}, dir: {[x for x in dir(account_values[0]) if not x.startswith('_')]}")
+            if len(account_values) <= 5:
+                for av in account_values:
+                    logging.debug(f"  Account value: {av}")
+        
+        # Account values can have different formats - try both tag and key access
+        for av in account_values:
+            # Try different ways to access tag and value
+            tag = None
+            value = None
+            
+            if hasattr(av, 'tag'):
+                tag = av.tag
+            elif hasattr(av, 'key'):
+                tag = av.key
+            elif hasattr(av, 'account'):
+                # Sometimes it's an AccountValue object with account, tag, value
+                tag = getattr(av, 'tag', None)
+            
+            if hasattr(av, 'value'):
+                value = av.value
+            elif hasattr(av, 'val'):
+                value = av.val
+            
+            if tag and value is not None:
+                # Check for relevant tags (case-insensitive)
+                tag_upper = tag.upper() if tag else ''
+                if any(keyword in tag_upper for keyword in ['NETLIQUIDATION', 'CASH', 'BUYINGPOWER', 'GROSSPOSITION', 'AVAILABLEFUNDS']):
+                    try:
+                        val = float(value) if value else 0.0
+                        # Store with original tag
+                        summary[tag] = val
+                        
+                        # Map to standard names for easier access
+                        if 'NETLIQUIDATION' in tag_upper and 'CURRENCY' not in tag_upper:
+                            summary['NetLiquidation'] = val
+                        elif 'NETLIQUIDATION' in tag_upper:
+                            summary['NetLiquidation'] = val  # Use currency-specific if that's all we have
+                        if 'CASH' in tag_upper and 'TOTAL' in tag_upper:
+                            summary['TotalCashValue'] = val
+                        elif 'CASH' in tag_upper and 'BALANCE' in tag_upper:
+                            summary['TotalCashValue'] = val
+                        if 'BUYINGPOWER' in tag_upper:
+                            summary['BuyingPower'] = val
+                        if 'GROSSPOSITION' in tag_upper:
+                            summary['GrossPositionValue'] = val
+                    except (ValueError, TypeError) as e:
+                        logging.debug(f"Could not convert account value {tag}={value}: {e}")
+        
+        # Get positions for PNL calculation
+        positions_list = ib.positions()
+        es_positions = [p for p in positions_list if p.contract.symbol == 'ES']
+        total_unrealized_pnl = sum(p.unrealizedPNL for p in es_positions)
+        total_realized_pnl = sum(p.realizedPNL for p in es_positions)
+        
+        summary['UnrealizedPNL'] = total_unrealized_pnl
+        summary['RealizedPNL'] = total_realized_pnl
+        summary['ES_Positions'] = len(es_positions)
+        
+        return summary
+    except Exception as e:
+        logging.debug(f"Error getting account summary: {e}")
+        import traceback
+        logging.debug(f"Traceback: {traceback.format_exc()}")
+        return {}
+
+def format_duration(seconds):
+    """Format duration in seconds to human-readable string."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
 
 def get_front_es_contract():
     for attempt in range(3):
@@ -342,12 +562,14 @@ def check_entries(idx, latest_row):
             return
     
     # Stop loss order (constructor accepts stopPrice, but stores as auxPrice)
+    # Use GTC (Good Till Canceled) for ES futures to allow after-hours execution
     stop_action = 'SELL' if direction == 1 else 'BUY'
     stop_order = StopOrder(
         action=stop_action,
         totalQuantity=qty,
         stopPrice=stop_price,  # Constructor parameter
         parentId=entry_order_id,
+        tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
         transmit=False if tp is not None else True  # Transmit if no TP
     )
     
@@ -360,6 +582,7 @@ def check_entries(idx, latest_row):
             totalQuantity=qty,
             lmtPrice=tp,
             parentId=entry_order_id,
+            tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
             transmit=True  # Transmit the bracket (last order)
         )
         ib.placeOrder(contract, stop_order)
@@ -376,18 +599,72 @@ def check_entries(idx, latest_row):
     
     # Store bracket as dict for easier access
     # Include position_dict fields needed for trailing stop tracking
+    entry_time = datetime.now()
     bracket = {
         'entry': entry_order,
         'stopLoss': stop_order,
         'takeProfit': tp_order,
         'direction': direction,
-        'position_dict': position_dict  # Store full position dict for strategy module
+        'position_dict': position_dict,  # Store full position dict for strategy module
+        'entry_time': entry_time,  # Track entry time for duration calculation
+        'entry_price': entry_price  # Store entry price for close email
     }
     positions.append(bracket)
     
-    tp_str = f"{tp:.2f}" if tp is not None else "None"
-    msg = (f"TRADE OPEN - {'LONG' if direction==1 else 'SHORT'}\n"
-           f"Entry Order ID: {entry_order.permId}\nStop: {stop_price:.2f}\nTP: {tp_str}")
+    # Get account summary
+    account = get_account_summary()
+    current_price = latest_row['close']
+    
+    # Calculate risk and reward in dollars
+    # ES contract multiplier is 50
+    contract_multiplier = 50
+    risk_dollars = abs(entry_price - stop_price) * contract_multiplier * qty
+    reward_dollars = abs(entry_price - tp) * contract_multiplier * qty if tp is not None else None
+    risk_reward_ratio = reward_dollars / risk_dollars if (tp is not None and risk_dollars > 0) else None
+    
+    # Build comprehensive email
+    msg_lines = [
+        f"TRADE OPEN - {'LONG' if direction==1 else 'SHORT'}",
+        f"{'='*50}",
+        f"Entry Price: ${entry_price:.2f}",
+        f"Current Price: ${current_price:.2f}",
+        f"Stop Loss: ${stop_price:.2f} (Risk: ${risk_dollars:,.2f})",
+        f"Take Profit: ${tp:.2f} (Reward: ${reward_dollars:,.2f})" if tp is not None else "Take Profit: None",
+        f"Risk/Reward Ratio: {risk_reward_ratio:.2f}:1" if risk_reward_ratio else "Risk/Reward Ratio: N/A",
+        f"Position Size: {qty} contract(s)",
+        f"Entry Order ID: {entry_order.permId}",
+        f"",
+        f"Account Information:",
+    ]
+    
+    # Add account values (show 0.00 if available, N/A only if truly missing)
+    net_liq = account.get('NetLiquidation')
+    if net_liq is not None:
+        msg_lines.append(f"  Net Liquidation: ${net_liq:,.2f}")
+    else:
+        msg_lines.append("  Net Liquidation: N/A")
+    
+    total_cash = account.get('TotalCashValue')
+    if total_cash is not None:
+        msg_lines.append(f"  Total Cash: ${total_cash:,.2f}")
+    else:
+        msg_lines.append("  Total Cash: N/A")
+    
+    buying_power = account.get('BuyingPower')
+    if buying_power is not None:
+        msg_lines.append(f"  Buying Power: ${buying_power:,.2f}")
+    else:
+        msg_lines.append("  Buying Power: N/A")
+    
+    msg_lines.extend([
+        f"  Total Unrealized PNL: ${account.get('UnrealizedPNL', 0):,.2f}",
+        f"  Total Realized PNL: ${account.get('RealizedPNL', 0):,.2f}",
+        f"  Open ES Positions: {account.get('ES_Positions', 0)}",
+        f"",
+        f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    ])
+    
+    msg = "\n".join(msg_lines)
     send_email("BB Strategy - Trade OPEN", msg)
     logging.info(msg.replace('\n', ' | '))
     
@@ -439,14 +716,127 @@ def check_exits(idx, latest_row):
         else:  # Short position
             stop_should_trigger = current_price >= stop_price
         
-        # If stop should trigger but hasn't, and TP is still active, cancel TP
-        if stop_should_trigger and stop_trade and stop_trade.isActive():
-            if tp_order and tp_trade and tp_trade.isActive():
-                logging.warning(f"Stop should trigger at {stop_price:.2f}, current price {current_price:.2f}. Cancelling TP order.")
-                log_all_open_orders("Before cancelling TP (stop should trigger)")
-                ib.cancelOrder(tp_order)
-                ib.sleep(0.5)
-                log_all_open_orders("After cancelling TP")
+        # If stop should trigger, handle it
+        if stop_should_trigger:
+            # Check stop order status
+            stop_order_status = None
+            stop_order_why_held = ''
+            if stop_trade and stop_trade.orderStatus:
+                stop_order_status = stop_trade.orderStatus.status
+                stop_order_why_held = getattr(stop_trade.orderStatus, 'whyHeld', '')
+            
+            # If stop order is in PreSubmitted with 'trigger' (waiting for market open),
+            # and price has moved through stop level, we need to manually close the position
+            if stop_order_status == 'PreSubmitted' and 'trigger' in stop_order_why_held.lower():
+                logging.warning(f"CRITICAL: Stop should trigger at {stop_price:.2f}, current price {current_price:.2f}")
+                logging.warning(f"Stop order is in PreSubmitted (waiting for market open). Manually closing position to protect against further loss.")
+                
+                # Cancel TP order if active
+                if tp_order and tp_trade and tp_trade.isActive():
+                    try:
+                        ib.cancelOrder(tp_order)
+                        logging.info("Cancelled TP order before manual stop execution")
+                    except Exception as e:
+                        logging.warning(f"Error cancelling TP order: {e}")
+                
+                # Cancel the stop order (it won't execute anyway during after-hours)
+                try:
+                    ib.cancelOrder(stop_order)
+                    logging.info("Cancelled stop order (was waiting for market open)")
+                except Exception as e:
+                    logging.warning(f"Error cancelling stop order: {e}")
+                
+                # Manually close the position with a market order
+                # CRITICAL: Get actual position from IB to ensure correct direction and quantity
+                try:
+                    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                    if not es_positions or es_positions[0].position == 0:
+                        logging.warning("No position found in IB. Position may have already closed.")
+                        # Remove bracket anyway
+                        positions.remove(bracket)
+                        continue
+                    
+                    actual_position = es_positions[0].position
+                    actual_qty = abs(actual_position)
+                    actual_direction = 1 if actual_position > 0 else -1
+                    
+                    # Close action is opposite of position direction
+                    # LONG position (positive) -> SELL to close
+                    # SHORT position (negative) -> BUY to close
+                    close_action = 'SELL' if actual_position > 0 else 'BUY'
+                    
+                    logging.warning(f"Actual position from IB: {actual_position} contracts ({'LONG' if actual_position > 0 else 'SHORT'})")
+                    logging.warning(f"Placing {close_action} {actual_qty} @ market to close position")
+                    
+                    close_order = MarketOrder(action=close_action, totalQuantity=actual_qty, transmit=True)
+                    close_trade = ib.placeOrder(contract, close_order)
+                    
+                    # Wait for execution
+                    ib.sleep(3)
+                    
+                    # Check if position was closed
+                    es_positions_after = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                    position_closed = not es_positions_after or es_positions_after[0].position == 0
+                    
+                    if position_closed:
+                        logging.info("Position successfully closed via manual market order")
+                        # Remove bracket and exit this iteration
+                        positions.remove(bracket)
+                        # Send close email
+                        try:
+                            entry_price = bracket.get('entry_price', 0)
+                            if not entry_price and entry_trade and entry_trade.fills:
+                                entry_price = entry_trade.fills[0].execution.price
+                            
+                            exit_price = close_trade.fills[0].execution.price if close_trade.fills else current_price
+                            pnl = (exit_price - entry_price) * actual_direction * contract.multiplier * actual_qty if entry_price > 0 else 0
+                            
+                            # Try to get PNL from commission report
+                            if close_trade.fills:
+                                for fill in close_trade.fills:
+                                    if fill.commissionReport and hasattr(fill.commissionReport, 'realizedPNL'):
+                                        pnl = fill.commissionReport.realizedPNL
+                                        break
+                            
+                            # Send close email (simplified version)
+                            msg_lines = [
+                                f"TRADE CLOSE - {'LONG' if actual_direction==1 else 'SHORT'} (Manual Close)",
+                                f"{'='*50}",
+                                f"Entry Price: ${entry_price:.2f}",
+                                f"Exit Price: ${exit_price:.2f}",
+                                f"Position Size: {actual_qty} contract(s)",
+                                f"Reason: Manual Close (Stop triggered, order in PreSubmitted)",
+                                f"PNL: ${pnl:,.2f}",
+                                f"",
+                                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            ]
+                            msg = "\n".join(msg_lines)
+                            send_email("BB Strategy - Trade CLOSE", msg)
+                            logging.info(msg.replace('\n', ' | '))
+                        except Exception as e:
+                            logging.warning(f"Error sending close email: {e}")
+                        
+                        if not positions:
+                            status_timer.stop()
+                        continue  # Skip trailing stop update for this bracket
+                    else:
+                        remaining_position = es_positions_after[0].position if es_positions_after else 0
+                        logging.error(f"WARNING: Position still open after manual close attempt! Remaining: {remaining_position}")
+                        # Don't remove bracket - position is still open
+                        
+                except Exception as e:
+                    logging.error(f"CRITICAL ERROR: Failed to manually close position: {e}")
+                    import traceback
+                    logging.error(f"Traceback: {traceback.format_exc()}")
+            
+            # If stop order is active (not waiting for market open), just cancel TP
+            elif stop_trade and stop_trade.isActive():
+                if tp_order and tp_trade and tp_trade.isActive():
+                    logging.warning(f"Stop should trigger at {stop_price:.2f}, current price {current_price:.2f}. Cancelling TP order.")
+                    log_all_open_orders("Before cancelling TP (stop should trigger)")
+                    ib.cancelOrder(tp_order)
+                    ib.sleep(0.5)
+                    log_all_open_orders("After cancelling TP")
         
         # Check if position still exists before updating trailing stop
         # (Position may have closed via TP or stop)
@@ -512,6 +902,7 @@ def check_exits(idx, latest_row):
                         action=stop_action,
                         totalQuantity=qty,
                         stopPrice=new_stop,
+                        tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
                         transmit=True  # Ensure it's transmitted immediately
                     )
                     
@@ -524,16 +915,68 @@ def check_exits(idx, latest_row):
                         ib.sleep(1.5)  # Give IB time to process
                         
                         # Verify new order is active before canceling old one
+                        # Try multiple methods to find the new order:
+                        # 1. Use the trade object returned by placeOrder
+                        # 2. Find by orderId if available
+                        # 3. Find by permId if available
+                        # 4. Find by matching characteristics (stop price, action, type)
                         new_order_active = False
                         new_trade_obj = None
-                        for trade in ib.trades():
-                            if (hasattr(new_stop_order, 'permId') and 
-                                trade.order.permId == new_stop_order.permId and 
-                                trade.contract.conId == contract.conId):
-                                new_trade_obj = trade
-                                if trade.isActive():
-                                    new_order_active = True
-                                break
+                        
+                        # Method 1: Use the trade object returned by placeOrder
+                        if new_trade and new_trade.order:
+                            new_trade_obj = new_trade
+                            # Check if it's active or in a valid pending state
+                            if new_trade.isActive() or (new_trade.orderStatus and 
+                                new_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                new_order_active = True
+                                # Update permId if available
+                                if hasattr(new_trade.order, 'permId') and new_trade.order.permId != 0:
+                                    new_stop_order.permId = new_trade.order.permId
+                                if hasattr(new_trade.order, 'orderId') and new_trade.order.orderId != 0:
+                                    new_stop_order.orderId = new_trade.order.orderId
+                        
+                        # Method 2: Find by orderId if not found yet
+                        if not new_order_active and hasattr(new_stop_order, 'orderId') and new_stop_order.orderId != 0:
+                            for trade in ib.trades():
+                                if (trade.contract.conId == contract.conId and 
+                                    trade.order.orderId == new_stop_order.orderId):
+                                    new_trade_obj = trade
+                                    if trade.isActive() or (trade.orderStatus and 
+                                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                        new_order_active = True
+                                        if hasattr(trade.order, 'permId') and trade.order.permId != 0:
+                                            new_stop_order.permId = trade.order.permId
+                                    break
+                        
+                        # Method 3: Find by permId if available
+                        if not new_order_active and hasattr(new_stop_order, 'permId') and new_stop_order.permId != 0:
+                            for trade in ib.trades():
+                                if (trade.contract.conId == contract.conId and 
+                                    trade.order.permId == new_stop_order.permId):
+                                    new_trade_obj = trade
+                                    if trade.isActive() or (trade.orderStatus and 
+                                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                        new_order_active = True
+                                    break
+                        
+                        # Method 4: Find by matching characteristics (stop price, action, type)
+                        if not new_order_active:
+                            for trade in ib.trades():
+                                if (trade.contract.conId == contract.conId and 
+                                    isinstance(trade.order, StopOrder) and
+                                    trade.order.action == stop_action):
+                                    trade_stop = getattr(trade.order, 'auxPrice', getattr(trade.order, 'stopPrice', 0))
+                                    if abs(trade_stop - new_stop) < 0.01:  # Match within 1 cent
+                                        new_trade_obj = trade
+                                        if trade.isActive() or (trade.orderStatus and 
+                                            trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                            new_order_active = True
+                                            if hasattr(trade.order, 'permId') and trade.order.permId != 0:
+                                                new_stop_order.permId = trade.order.permId
+                                            if hasattr(trade.order, 'orderId') and trade.order.orderId != 0:
+                                                new_stop_order.orderId = trade.order.orderId
+                                        break
                         
                         if new_order_active:
                             # New order is active, safe to cancel old one
@@ -584,6 +1027,7 @@ def check_exits(idx, latest_row):
                                                 action=tp_action,
                                                 totalQuantity=qty,
                                                 lmtPrice=tp_price,
+                                                tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
                                                 transmit=True
                                             )
                                             tp_trade = ib.placeOrder(contract, new_tp_order)
@@ -632,21 +1076,240 @@ def check_exits(idx, latest_row):
                             # New order didn't activate - could be rejected or pending
                             if new_trade_obj:
                                 status = new_trade_obj.orderStatus.status if new_trade_obj.orderStatus else "Unknown"
-                                logging.warning(f"New stop order status: {status}. Keeping old stop active.")
+                                why_held = getattr(new_trade_obj.orderStatus, 'whyHeld', '') if new_trade_obj.orderStatus else ''
+                                logging.warning(f"New stop order status: {status} (whyHeld: {why_held}). Keeping old stop active.")
+                                
+                                # Log order details for debugging
+                                if hasattr(new_trade_obj.order, 'orderId'):
+                                    logging.warning(f"  OrderID: {new_trade_obj.order.orderId}")
+                                if hasattr(new_trade_obj.order, 'permId'):
+                                    logging.warning(f"  PermID: {new_trade_obj.order.permId}")
+                                
+                                # If order is in PreSubmitted with trigger, it's waiting for market open - that's OK
+                                if status == 'PreSubmitted' and 'trigger' in why_held.lower():
+                                    logging.info("Order is waiting for market open (PreSubmitted with trigger). Will activate when market opens.")
+                                    # Don't cancel - let it activate when market opens
+                                    # Update bracket with new order anyway so we track it
+                                    bracket['stopLoss'] = new_stop_order
+                                    if hasattr(new_trade_obj.order, 'permId') and new_trade_obj.order.permId != 0:
+                                        new_stop_order.permId = new_trade_obj.order.permId
                             else:
                                 logging.warning(f"New stop order not found in trades. Keeping old stop active.")
+                                logging.warning(f"  Attempted to place stop at {new_stop:.2f}, but order not found after placement.")
+                                # Log all active orders to help debug
+                                log_all_open_orders("After failed order placement")
                             
-                            # Cancel the new order if it exists but isn't active
+                            # Cancel the new order if it exists but isn't active (unless it's waiting for market open)
                             try:
-                                if new_trade_obj:
-                                    ib.cancelOrder(new_stop_order)
-                            except:
-                                pass
+                                if new_trade_obj and new_trade_obj.orderStatus:
+                                    status = new_trade_obj.orderStatus.status
+                                    why_held = getattr(new_trade_obj.orderStatus, 'whyHeld', '')
+                                    if not (status == 'PreSubmitted' and 'trigger' in why_held.lower()):
+                                        ib.cancelOrder(new_stop_order)
+                                        logging.info("Cancelled new stop order that failed to activate")
+                            except Exception as cancel_err:
+                                logging.debug(f"Error cancelling new order: {cancel_err}")
                             # Old stop order remains active as protection
                             
                     except Exception as e:
                         logging.error(f"Failed to place new stop order: {e}")
+                        import traceback
+                        logging.error(f"Traceback: {traceback.format_exc()}")
                         # Old stop order remains active as fallback protection
+            
+            # Update dynamic TP (Opposite BB TP) if enabled and position is still open
+            if position_still_open and strategy.opposite_bb_tp and tp_order:
+                # Calculate new TP from current opposite BB level
+                if 'upper' in data.columns and 'lower' in data.columns and len(data) > 0:
+                    new_tp = float(data['upper'].iloc[-1]) if dir_ == 1 else float(data['lower'].iloc[-1])
+                    new_tp = round(new_tp * 4) / 4  # Round to tick size
+                    
+                    # Get current TP price
+                    current_tp = getattr(tp_order, 'lmtPrice', 0)
+                    
+                    # Debug logging - always log when checking
+                    logging.info(f"Opposite BB TP check: current_tp={current_tp:.2f}, new_tp={new_tp:.2f}, dir={'LONG' if dir_==1 else 'SHORT'}")
+                    
+                    # For Opposite BB TP, the TP should track the opposite BB level in BOTH directions
+                    # Only update if the new TP is different from current (within tick size tolerance)
+                    tp_should_update = abs(new_tp - current_tp) >= 0.25  # ES tick size is 0.25
+                    
+                    if tp_should_update:
+                        logging.info(f"Opposite BB TP update: old={current_tp:.2f}, new={new_tp:.2f}")
+                        
+                        # Find tp_trade from ib.trades() if not already available
+                        tp_trade = None
+                        if hasattr(tp_order, 'permId') and tp_order.permId != 0:
+                            for trade in ib.trades():
+                                if (trade.contract.conId == contract.conId and 
+                                    trade.order.permId == tp_order.permId):
+                                    tp_trade = trade
+                                    break
+                        
+                        # If still not found, try to find by matching characteristics
+                        if tp_trade is None:
+                            tp_action = 'SELL' if dir_ == 1 else 'BUY'
+                            for trade in ib.trades():
+                                if (trade.contract.conId == contract.conId and 
+                                    isinstance(trade.order, LimitOrder) and
+                                    trade.order.action == tp_action and
+                                    abs(getattr(trade.order, 'lmtPrice', 0) - current_tp) < 0.01):
+                                    tp_trade = trade
+                                    # Update permId if found
+                                    if hasattr(trade.order, 'permId') and trade.order.permId != 0:
+                                        tp_order.permId = trade.order.permId
+                                    break
+                        
+                        # Check if TP order is active
+                        tp_order_active = False
+                        if tp_trade:
+                            tp_order_active = tp_trade.isActive()
+                            if not tp_order_active and tp_trade.orderStatus:
+                                status = tp_trade.orderStatus.status
+                                if status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']:
+                                    tp_order_active = True
+                        else:
+                            logging.warning(f"Could not find tp_trade for TP order. Checking if order exists in ib.trades()...")
+                            # Last resort: check if any active TP order exists
+                            tp_action = 'SELL' if dir_ == 1 else 'BUY'
+                            for trade in ib.trades():
+                                if (trade.contract.conId == contract.conId and 
+                                    isinstance(trade.order, LimitOrder) and
+                                    trade.order.action == tp_action):
+                                    if trade.isActive() or (trade.orderStatus and 
+                                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                        tp_trade = trade
+                                        tp_order_active = True
+                                        # Update the order object with permId
+                                        if hasattr(trade.order, 'permId') and trade.order.permId != 0:
+                                            tp_order.permId = trade.order.permId
+                                            tp_order.lmtPrice = trade.order.lmtPrice
+                                        break
+                        
+                        if not tp_order_active:
+                            logging.warning(f"TP order is not active. Status: {tp_trade.orderStatus.status if tp_trade and tp_trade.orderStatus else 'Unknown'}")
+                        
+                        if tp_order_active:
+                            # SAFER APPROACH: Place new TP first, verify it's active, then cancel old one
+                            tp_action = 'SELL' if dir_ == 1 else 'BUY'
+                            qty = abs(tp_order.totalQuantity) if hasattr(tp_order, 'totalQuantity') else 1
+                            
+                            # Create and place new TP order first
+                            new_tp_order = LimitOrder(
+                                action=tp_action,
+                                totalQuantity=qty,
+                                lmtPrice=new_tp,
+                                tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
+                                transmit=True
+                            )
+                            
+                            try:
+                                # Place new TP order
+                                new_tp_trade = ib.placeOrder(contract, new_tp_order)
+                                logging.info(f"Placed new TP order at {new_tp:.2f} (old TP: {current_tp:.2f})")
+                                
+                                # Wait for new order to be submitted and check status
+                                ib.sleep(1.5)  # Give IB time to process
+                                
+                                # Verify new TP order is active
+                                new_tp_active = False
+                                new_tp_trade_obj = None
+                                
+                                # Method 1: Use the trade object returned by placeOrder
+                                if new_tp_trade and new_tp_trade.order:
+                                    new_tp_trade_obj = new_tp_trade
+                                    if new_tp_trade.isActive() or (new_tp_trade.orderStatus and 
+                                        new_tp_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                        new_tp_active = True
+                                        if hasattr(new_tp_trade.order, 'permId') and new_tp_trade.order.permId != 0:
+                                            new_tp_order.permId = new_tp_trade.order.permId
+                                        if hasattr(new_tp_trade.order, 'orderId') and new_tp_trade.order.orderId != 0:
+                                            new_tp_order.orderId = new_tp_trade.order.orderId
+                                
+                                # Method 2: Find by permId if available
+                                if not new_tp_active and hasattr(new_tp_order, 'permId') and new_tp_order.permId != 0:
+                                    for trade in ib.trades():
+                                        if (trade.contract.conId == contract.conId and 
+                                            trade.order.permId == new_tp_order.permId):
+                                            new_tp_trade_obj = trade
+                                            if trade.isActive() or (trade.orderStatus and 
+                                                trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                                new_tp_active = True
+                                            break
+                                
+                                # Method 3: Find by matching characteristics
+                                if not new_tp_active:
+                                    for trade in ib.trades():
+                                        if (trade.contract.conId == contract.conId and 
+                                            isinstance(trade.order, LimitOrder) and
+                                            trade.order.action == tp_action and
+                                            abs(getattr(trade.order, 'lmtPrice', 0) - new_tp) < 0.01):
+                                            new_tp_trade_obj = trade
+                                            if trade.isActive() or (trade.orderStatus and 
+                                                trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                                                new_tp_active = True
+                                                if hasattr(trade.order, 'permId') and trade.order.permId != 0:
+                                                    new_tp_order.permId = trade.order.permId
+                                                if hasattr(trade.order, 'orderId') and trade.order.orderId != 0:
+                                                    new_tp_order.orderId = trade.order.orderId
+                                            break
+                                
+                                if new_tp_active:
+                                    # New TP order is active, safe to cancel old one
+                                    try:
+                                        ib.cancelOrder(tp_order)
+                                        ib.sleep(0.5)
+                                        logging.info(f"Cancelled old TP order at {current_tp:.2f}")
+                                    except Exception as e:
+                                        logging.warning(f"Error cancelling old TP order (new one is active): {e}")
+                                        # Check if old order was auto-cancelled by IB
+                                        old_tp_still_active = False
+                                        for trade in ib.trades():
+                                            if (trade.order.permId == tp_order.permId and 
+                                                trade.isActive() and 
+                                                trade.contract.conId == contract.conId):
+                                                old_tp_still_active = True
+                                                break
+                                        if not old_tp_still_active:
+                                            logging.info("Old TP order was automatically cancelled by IB")
+                                    
+                                    # Update the bracket with the new TP order
+                                    bracket['takeProfit'] = new_tp_order
+                                    logging.info(f"Successfully updated opposite BB TP to {new_tp:.2f}")
+                                else:
+                                    if new_tp_trade_obj:
+                                        status = new_tp_trade_obj.orderStatus.status if new_tp_trade_obj.orderStatus else "Unknown"
+                                        logging.warning(f"New TP order status: {status}. Keeping old TP active.")
+                                    else:
+                                        logging.warning(f"New TP order not found in trades. Keeping old TP active.")
+                                    
+                                    try:
+                                        if new_tp_trade_obj:
+                                            ib.cancelOrder(new_tp_order)
+                                    except:
+                                        pass
+                                    # Old TP order remains active as fallback
+                                    
+                            except Exception as e:
+                                logging.error(f"Failed to update opposite BB TP: {e}")
+                                import traceback
+                                logging.error(f"Traceback: {traceback.format_exc()}")
+                                # Old TP order remains active as fallback
+                        else:
+                            logging.warning(f"TP order not active, skipping opposite BB TP update")
+                    else:
+                        # TP should not update (new TP is same as current, within tick size)
+                        logging.debug(f"Opposite BB TP: new_tp={new_tp:.2f} is same as current_tp={current_tp:.2f} (within tick size), no update needed")
+                else:
+                    logging.warning(f"Opposite BB TP: Cannot calculate - missing BB columns in data")
+            else:
+                # Log why the check is skipped (only at debug level to avoid spam)
+                if not position_still_open:
+                    logging.debug(f"Opposite BB TP check skipped: position not open")
+                elif not strategy.opposite_bb_tp:
+                    logging.debug(f"Opposite BB TP check skipped: strategy.opposite_bb_tp={strategy.opposite_bb_tp}")
+                elif not tp_order:
+                    logging.debug(f"Opposite BB TP check skipped: no tp_order")
         
         # Check if position closed
         if not any(t.contract.conId == contract.conId for t in ib.positions()):
@@ -662,6 +1325,19 @@ def check_exits(idx, latest_row):
                     reason = 'Stop'
                     break
             
+            # Get entry information from bracket or entry_trade
+            entry_price = bracket.get('entry_price', 0)
+            entry_time = bracket.get('entry_time')
+            if not entry_price and entry_trade and entry_trade.fills:
+                entry_price = entry_trade.fills[0].execution.price
+            
+            # Get current stop and TP prices
+            current_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0))
+            tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+            
+            # Get position size
+            qty = abs(stop_order.totalQuantity) if stop_order and hasattr(stop_order, 'totalQuantity') else 1
+            
             if exit_trade:
                 exit_price = exit_trade.fills[0].execution.price if exit_trade.fills else 0
                 # Get PNL from commission report if available
@@ -672,16 +1348,85 @@ def check_exits(idx, latest_row):
                             pnl = fill.commissionReport.realizedPNL
                             break
                 # If no commission report, calculate manually
-                if pnl == 0 and entry_trade.fills:
-                    entry_price = entry_trade.fills[0].execution.price if entry_trade.fills else 0
-                    pnl = (exit_price - entry_price) * dir_ * contract.multiplier if entry_price > 0 else 0
+                if pnl == 0 and entry_price > 0:
+                    pnl = (exit_price - entry_price) * dir_ * contract.multiplier
             else:
                 reason = 'Unknown'
                 exit_price = latest_row['close']
                 pnl = 0
+                if entry_price > 0:
+                    pnl = (exit_price - entry_price) * dir_ * contract.multiplier
             
-            msg = (f"TRADE CLOSE - {'LONG' if dir_==1 else 'SHORT'}\n"
-                   f"Exit: {exit_price:.2f}\nReason: {reason}\nPNL: {pnl:,.2f}")
+            # Calculate duration
+            exit_time = datetime.now()
+            duration_seconds = 0
+            duration_str = "N/A"
+            if entry_time:
+                duration_seconds = (exit_time - entry_time).total_seconds()
+                duration_str = format_duration(duration_seconds)
+            
+            # Get account summary
+            account = get_account_summary()
+            
+            # Calculate price change
+            price_change = exit_price - entry_price if entry_price > 0 else 0
+            price_change_pct = (price_change / entry_price * 100) if entry_price > 0 else 0
+            
+            # Calculate risk and reward in dollars (based on original entry)
+            contract_multiplier = 50  # ES contract multiplier
+            risk_dollars = abs(entry_price - current_stop) * contract_multiplier * qty
+            reward_dollars = abs(entry_price - tp_price) * contract_multiplier * qty if tp_price else None
+            risk_reward_ratio = reward_dollars / risk_dollars if (tp_price and risk_dollars > 0) else None
+            
+            # Calculate actual PNL vs expected risk/reward
+            expected_risk = -risk_dollars if reason == 'Stop' else None
+            expected_reward = reward_dollars if reason == 'TP' else None
+            
+            # Build comprehensive email
+            msg_lines = [
+                f"TRADE CLOSE - {'LONG' if dir_==1 else 'SHORT'}",
+                f"{'='*50}",
+                f"Entry Price: ${entry_price:.2f}",
+                f"Exit Price: ${exit_price:.2f}",
+                f"Price Change: ${price_change:.2f} ({price_change_pct:+.2f}%)",
+                f"Position Size: {qty} contract(s)",
+                f"",
+                f"Exit Details:",
+                f"  Reason: {reason}",
+                f"  Stop Loss: ${current_stop:.2f} (Risk: ${risk_dollars:,.2f})",
+                f"  Take Profit: ${tp_price:.2f} (Reward: ${reward_dollars:,.2f})" if tp_price else "  Take Profit: None",
+                f"  Risk/Reward Ratio: {risk_reward_ratio:.2f}:1" if risk_reward_ratio else "  Risk/Reward Ratio: N/A",
+                f"",
+                f"Performance:",
+                f"  PNL: ${pnl:,.2f}",
+                f"  Expected Risk: ${expected_risk:,.2f}" if expected_risk else f"  Expected Reward: ${expected_reward:,.2f}" if expected_reward else "",
+                f"  Duration: {duration_str}",
+                f"  Entry Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}" if entry_time else "  Entry Time: N/A",
+                f"  Exit Time: {exit_time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"",
+                f"Account Information:",
+            ]
+            
+            # Add account values (show 0.00 if available, N/A only if truly missing)
+            net_liq = account.get('NetLiquidation')
+            if net_liq is not None:
+                msg_lines.append(f"  Net Liquidation: ${net_liq:,.2f}")
+            else:
+                msg_lines.append("  Net Liquidation: N/A")
+            
+            total_cash = account.get('TotalCashValue')
+            if total_cash is not None:
+                msg_lines.append(f"  Total Cash: ${total_cash:,.2f}")
+            else:
+                msg_lines.append("  Total Cash: N/A")
+            
+            msg_lines.extend([
+                f"  Total Unrealized PNL: ${account.get('UnrealizedPNL', 0):,.2f}",
+                f"  Total Realized PNL: ${account.get('RealizedPNL', 0):,.2f}",
+                f"  Open ES Positions: {account.get('ES_Positions', 0)}"
+            ])
+            
+            msg = "\n".join(msg_lines)
             send_email("BB Strategy - Trade CLOSE", msg)
             logging.info(msg.replace('\n', ' | '))
             
@@ -784,6 +1529,72 @@ def cleanup_orphaned_orders():
                         logging.warning(f"Error cancelling orphaned order {order.permId}: {e}")
 
 # Check and protect existing positions
+def close_orphaned_positions():
+    """
+    Close any positions that don't match any tracked brackets.
+    This handles cases where positions exist but aren't tracked (e.g., from manual close errors).
+    """
+    global positions, contract, strategy
+    
+    if contract is None:
+        return
+    
+    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+    
+    if not es_positions:
+        return
+    
+    # Check each position
+    for pos in es_positions:
+        position_size = pos.position
+        if position_size == 0:
+            continue
+        
+        # Check if this position matches any tracked bracket
+        position_matched = False
+        for bracket in positions:
+            bracket_dir = bracket.get('direction', 0)
+            # Check if direction matches
+            pos_dir = 1 if position_size > 0 else -1
+            if bracket_dir == pos_dir:
+                # Check if quantity matches (approximately)
+                stop_order = bracket.get('stopLoss')
+                bracket_qty = abs(stop_order.totalQuantity) if stop_order and hasattr(stop_order, 'totalQuantity') else 1
+                if abs(abs(position_size) - bracket_qty) <= 1:  # Allow 1 contract difference
+                    position_matched = True
+                    break
+        
+        # If position doesn't match any bracket, close it
+        if not position_matched:
+            logging.warning(f"ORPHANED POSITION DETECTED: {position_size} contracts ({'LONG' if position_size > 0 else 'SHORT'})")
+            logging.warning("This position doesn't match any tracked bracket. Closing it...")
+            
+            try:
+                close_action = 'SELL' if position_size > 0 else 'BUY'
+                close_qty = abs(position_size)
+                
+                close_order = MarketOrder(action=close_action, totalQuantity=close_qty, transmit=True)
+                close_trade = ib.placeOrder(contract, close_order)
+                logging.warning(f"Placed market order to close orphaned position: {close_action} {close_qty} @ market")
+                
+                # Wait for execution
+                ib.sleep(3)
+                
+                # Verify position closed
+                es_positions_after = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                position_closed = not es_positions_after or es_positions_after[0].position == 0
+                
+                if position_closed:
+                    logging.info("Orphaned position successfully closed")
+                else:
+                    remaining = es_positions_after[0].position if es_positions_after else 0
+                    logging.error(f"WARNING: Orphaned position still open! Remaining: {remaining}")
+                    
+            except Exception as e:
+                logging.error(f"CRITICAL ERROR: Failed to close orphaned position: {e}")
+                import traceback
+                logging.error(f"Traceback: {traceback.format_exc()}")
+
 def protect_existing_positions():
     """
     Check for existing positions and ensure they have stop loss orders.
@@ -871,6 +1682,7 @@ def protect_existing_positions():
                     action=stop_action,
                     totalQuantity=qty,
                     stopPrice=stop_price,
+                    tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
                     transmit=True
                 )
                 
@@ -897,6 +1709,196 @@ def protect_existing_positions():
             else:
                 logging.warning("Not enough data to calculate stop loss. Position remains unprotected!")
 
+# Check and recreate missing TP orders
+def check_and_recreate_tp_orders():
+    """
+    Check all tracked positions and ensure they have TP orders if they should.
+    This handles cases where TP orders were cancelled or lost.
+    """
+    global positions, contract, strategy, data
+    
+    if contract is None or not positions:
+        return
+    
+    # First, check if we have an actual open position
+    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+    has_open_position = any(abs(p.position) > 0 for p in es_positions)
+    
+    if not has_open_position:
+        # No open position, clear all tracked brackets
+        logging.info("No open ES position found. Clearing tracked positions.")
+        positions.clear()
+        return
+    
+    # Check if we're at max positions
+    if len(positions) >= strategy.max_open_trades:
+        logging.warning(f"Already at max positions ({strategy.max_open_trades}). Skipping TP recreation.")
+        return
+    
+    for bracket in positions[:]:  # Use slice to allow safe removal
+        tp_order = bracket.get('takeProfit')
+        direction = bracket.get('direction', 0)
+        
+        if direction == 0:
+            continue
+        
+        # Verify the position still exists
+        position_size = 0
+        for pos in es_positions:
+            if abs(pos.position) > 0:
+                # Check if direction matches
+                pos_direction = 1 if pos.position > 0 else -1
+                if pos_direction == direction:
+                    position_size = abs(pos.position)
+                    break
+        
+        if position_size == 0:
+            # Position no longer exists, remove this bracket
+            logging.info(f"Position for bracket (direction={direction}) no longer exists. Removing bracket.")
+            positions.remove(bracket)
+            continue
+        
+        # Check if TP should exist (based on strategy - if TP is enabled)
+        # TP is enabled if fixed_atr_tp or fixed_bb_entry_tp is True
+        if not (strategy.fixed_atr_tp or strategy.fixed_bb_entry_tp):
+            continue  # Strategy doesn't use TP
+        
+        # Check if TP order exists and is active
+        tp_active = False
+        if tp_order:
+            for trade in ib.trades():
+                if (trade.contract.conId == contract.conId and 
+                    hasattr(tp_order, 'permId') and 
+                    trade.order.permId == tp_order.permId):
+                    if trade.isActive() or (trade.orderStatus and 
+                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                        tp_active = True
+                    break
+        
+        if not tp_active:
+            # TP is missing - need to recreate it
+            logging.warning(f"TP order missing for {'LONG' if direction == 1 else 'SHORT'} position. Attempting to recreate...")
+            
+            # Get entry price from position or bracket
+            entry_order = bracket.get('entry')
+            entry_price = None
+            
+            # Try to get entry price from filled entry order
+            if entry_order and hasattr(entry_order, 'permId') and entry_order.permId != 0:
+                for trade in ib.trades():
+                    if (trade.contract.conId == contract.conId and 
+                        trade.order.permId == entry_order.permId):
+                        if trade.fills:
+                            entry_price = trade.fills[0].execution.price
+                            break
+            
+            # Fallback: get from position average cost
+            if entry_price is None:
+                es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                if es_positions:
+                    entry_price = es_positions[0].averageCost
+            
+            # Fallback: use current market price (less ideal)
+            if entry_price is None or entry_price == 0:
+                if len(data) > 0:
+                    entry_price = data['close'].iloc[-1]
+                else:
+                    logging.error("Cannot recreate TP - no entry price available")
+                    continue
+            
+            # Calculate TP price using strategy
+            try:
+                # Use the strategy's take profit calculation
+                # Check which TP method is enabled
+                if strategy.fixed_atr_tp:
+                    # Use ATR-based TP
+                    atr_tp = data['atr_tp'].iloc[-1] if 'atr_tp' in data.columns and len(data) > 0 else None
+                    if atr_tp is None or pd.isna(atr_tp):
+                        # Fallback to atr_ts if atr_tp not available
+                        atr_tp = data['atr_ts'].iloc[-1] if 'atr_ts' in data.columns and len(data) > 0 else 0
+                    if atr_tp > 0:
+                        tp = entry_price + direction * atr_tp * strategy.atr_mult_tp
+                    else:
+                        logging.error("Cannot recreate TP - ATR not available")
+                        continue
+                elif strategy.fixed_bb_entry_tp:
+                    # Use BB-based TP (fixed at entry)
+                    if 'upper' in data.columns and 'lower' in data.columns and len(data) > 0:
+                        tp = data['upper'].iloc[-1] if direction == 1 else data['lower'].iloc[-1]
+                    else:
+                        logging.error("Cannot recreate TP - BB bands not available")
+                        continue
+                elif strategy.opposite_bb_tp:
+                    # Use dynamic opposite BB TP (current opposite BB level)
+                    if 'upper' in data.columns and 'lower' in data.columns and len(data) > 0:
+                        tp = data['upper'].iloc[-1] if direction == 1 else data['lower'].iloc[-1]
+                    else:
+                        logging.error("Cannot recreate TP - BB bands not available")
+                        continue
+                else:
+                    logging.error("Cannot recreate TP - TP method not enabled")
+                    continue
+                
+                tp = round(tp * 4) / 4  # Round to tick size
+                
+                # Get current price to verify TP won't immediately fill
+                current_price = data['close'].iloc[-1] if len(data) > 0 else 0
+                
+                # Verify TP price is appropriate (won't immediately fill)
+                # For LONG: TP should be above current price
+                # For SHORT: TP should be below current price
+                if direction == 1:  # LONG position
+                    if tp <= current_price:
+                        logging.warning(f"TP price {tp:.2f} is not above current price {current_price:.2f} for LONG position. Skipping TP recreation.")
+                        continue
+                else:  # SHORT position
+                    if tp >= current_price:
+                        logging.warning(f"TP price {tp:.2f} is not below current price {current_price:.2f} for SHORT position. Skipping TP recreation.")
+                        continue
+                
+                # Get quantity from stop order or position
+                qty = position_size  # Use the verified position size
+                stop_order = bracket.get('stopLoss')
+                if stop_order and hasattr(stop_order, 'totalQuantity'):
+                    qty = abs(stop_order.totalQuantity)
+                
+                # Double-check we're not exceeding max positions
+                if len(positions) >= strategy.max_open_trades:
+                    logging.warning(f"At max positions ({strategy.max_open_trades}). Skipping TP recreation.")
+                    continue
+                
+                tp_action = 'SELL' if direction == 1 else 'BUY'
+                new_tp_order = LimitOrder(
+                    action=tp_action,
+                    totalQuantity=qty,
+                    lmtPrice=tp,
+                    tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
+                    transmit=True
+                )
+                
+                logging.info(f"Recreating TP order: {tp_action} {qty} @ {tp:.2f} (current price: {current_price:.2f})")
+                tp_trade = ib.placeOrder(contract, new_tp_order)
+                ib.sleep(0.5)
+                
+                # Verify new TP order is active
+                new_tp_active = False
+                if tp_trade and tp_trade.order:
+                    if tp_trade.isActive() or (tp_trade.orderStatus and 
+                        tp_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                        new_tp_active = True
+                        if hasattr(tp_trade.order, 'permId') and tp_trade.order.permId != 0:
+                            new_tp_order.permId = tp_trade.order.permId
+                
+                if new_tp_active:
+                    bracket['takeProfit'] = new_tp_order
+                    logging.info(f"Successfully recreated TP order at {tp:.2f}")
+                else:
+                    logging.error(f"Failed to recreate TP order - new order is not active")
+            except Exception as e:
+                logging.error(f"Error recreating TP order: {e}")
+                import traceback
+                logging.error(f"Traceback: {traceback.format_exc()}")
+
 # Periodic position protection check
 async def periodic_protection_check():
     """Periodically check that all positions are protected."""
@@ -905,7 +1907,9 @@ async def periodic_protection_check():
         if ib.isConnected() and contract is not None:
             try:
                 cleanup_orphaned_orders()  # Clean up any orphaned orders first
+                close_orphaned_positions()  # Close any orphaned positions
                 protect_existing_positions()
+                check_and_recreate_tp_orders()  # Check and recreate missing TP orders
                 # Log orders periodically to monitor for excessive orders
                 log_all_open_orders("Periodic check")
             except Exception as e:
@@ -1033,9 +2037,12 @@ async def main():
         await asyncio.sleep(2)
         
         # Check and protect existing positions on startup
+        logging.info("Checking for orphaned positions and closing them...")
+        close_orphaned_positions()
         logging.info("Checking for existing positions and ensuring protection...")
         log_all_open_orders("On startup (before protection check)")
         protect_existing_positions()
+        check_and_recreate_tp_orders()  # Check and recreate missing TP orders
         log_all_open_orders("On startup (after protection check)")
         
         # Start periodic protection check
@@ -1050,7 +2057,9 @@ async def main():
                     ensure_connected_and_subscribed()
                     # Re-check protection after reconnection
                     await asyncio.sleep(2)
+                    close_orphaned_positions()
                     protect_existing_positions()
+                    check_and_recreate_tp_orders()  # Check and recreate missing TP orders
                 await asyncio.sleep(10)
             except KeyboardInterrupt:
                 logging.info("Keyboard interrupt received...")

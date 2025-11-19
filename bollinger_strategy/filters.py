@@ -31,8 +31,18 @@ def apply_rth_filter(df, enable_rth_filter, rth_start, rth_end):
         if isinstance(rth_end, str):
             rth_end = pd.to_datetime(rth_end, format='%H:%M').time()
         
-        df['in_rth'] = pd.Series([t.time() for t in df.index], index=df.index)\
-                        .between(rth_start, rth_end)
+        # Get time series from index
+        time_series = pd.Series([t.time() for t in df.index], index=df.index)
+        
+        # Handle trading hours that span midnight (e.g., 18:00 to 17:00 for ES futures)
+        if rth_start <= rth_end:
+            # Normal case: trading hours don't span midnight (e.g., 09:30 to 16:00)
+            df['in_rth'] = time_series.between(rth_start, rth_end, inclusive='both')
+        else:
+            # Trading hours span midnight (e.g., 18:00 to 17:00)
+            # Time is in RTH if it's >= start OR <= end
+            # Example: 18:00-17:00 means trade from 6pm to midnight, then midnight to 5pm
+            df['in_rth'] = (time_series >= rth_start) | (time_series <= rth_end)
     else:
         df['in_rth'] = True
     

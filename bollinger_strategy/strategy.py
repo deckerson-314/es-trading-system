@@ -259,6 +259,11 @@ class BollingerBandStrategy:
             tp = entry_price + direction * atr_tp * self.atr_mult_tp
         elif self.fixed_bb_entry_tp:
             tp = upper if direction == 1 else lower
+        elif self.opposite_bb_tp:
+            # Dynamic TP: use current opposite BB level
+            # For LONG: exit at upper BB (opposite is upper)
+            # For SHORT: exit at lower BB (opposite is lower)
+            tp = upper if direction == 1 else lower
         
         # Initial trailing stop (if enabled)
         if self.enable_trailing:

@@ -15,11 +15,11 @@ Initial Stop Loss (%),1.8586,0.1,2.0,float,Fixed stop loss %
 Enable Trailing Stop,true,false,true,bool,Use ATR trailing stop
 ATR Length for Trailing Stop,55,10,100,int,ATR period for trailing
 ATR Multiplier for Trailing Stop,4,1.0,5.0,float,Trailing stop ATR multiplier
-Opposite Bollinger Band TP,false,false,true,bool,DYNAMIC: Exit at current opposite BB
+Opposite Bollinger Band TP,true,false,true,bool,DYNAMIC: Exit at current opposite BB
 Fixed ATR TP,false,false,true,bool,FIXED: Entry ± (ATR × Multiplier)
-Fixed BB at Entry TP,true,false,true,bool,FIXED: Upper BB at entry (long)
+Fixed BB at Entry TP,false,false,true,bool,FIXED: Upper BB at entry (long)
 ATR Length for TP,43,10,80,int,ATR period for fixed TP
-ATR Multiplier for TP,3.1878,1.0,6.0,float,Fixed TP ATR multiplier
+ATR Multiplier for TP,6,1.0,6.0,float,Fixed TP ATR multiplier
 Min ATR Filter (Points),0,0,10,float,Minimum ATR value to allow entries
 RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
 RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end
