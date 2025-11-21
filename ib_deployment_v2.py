@@ -63,10 +63,43 @@ logging.info(f"Loaded {len(params_dict)} parameters from {PARAM_CSV}")
 # Initialize strategy
 strategy = BollingerBandStrategy(params_dict)
 
-logging.info("\n=== LOADED PARAMETERS ===")
-for name, value_dict in sorted(params_dict.items()):
-    if not name.startswith('__'):
-        logging.info(f"{name:45} = {value_dict['value']}")
+logging.info("\n=== LOADED PARAMETERS (grouped by category) ===")
+
+# Group parameters for display
+def group_params_for_display(params_dict_local):
+    """Group parameters into logical categories."""
+    groups = {
+        'Entry Criteria': ['Enable Long Trades', 'Enable Short Trades', 'Bollinger Band Length', 
+                          'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
+                          'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
+                          'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
+                          'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                          'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                          'Max Open Trades'],
+        'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
+                                'ATR Length for TP', 'ATR Multiplier for TP'],
+        'Stop Loss Criteria': ['Initial Stop Loss (%)', 'Enable Trailing Stop', 
+                              'ATR Length for Trailing Stop', 'ATR Multiplier for Trailing Stop',
+                              'Trailing Delay (bars)'],
+        'GA Criteria': ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
+                       'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
+                       'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
+                       'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+    }
+    
+    grouped = {}
+    for group_name, param_list in groups.items():
+        grouped[group_name] = {k: v for k, v in params_dict_local.items() if k in param_list}
+    
+    return grouped
+
+grouped_params = group_params_for_display(params_dict)
+for group_name, params in grouped_params.items():
+    if params:
+        logging.info(f"\n--- {group_name} ---")
+        for name in sorted(params.keys()):
+            value_dict = params[name]
+            logging.info(f"  {name:45} = {value_dict['value']}")
 
 # 15-min Status Timer
 class StatusTimer:
@@ -234,6 +267,11 @@ bar_count = 0
 bars = None
 contract = None
 
+# Disconnect tracking for email alerts
+disconnect_start_time = None  # Timestamp when disconnect was first detected
+disconnect_email_sent = False  # Flag to prevent spam - only send one email per disconnect
+DISCONNECT_ALERT_THRESHOLD = 30  # Send email if disconnected for more than 30 seconds
+
 # Define helper functions
 def send_email(subject, body):
     try:
@@ -247,6 +285,102 @@ def send_email(subject, body):
         logging.info(f"Email sent: {subject}")
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
+
+def check_disconnect_status():
+    """
+    Check if API is disconnected and send email alert if disconnected for too long.
+    Called periodically from main loop.
+    """
+    global disconnect_start_time, disconnect_email_sent
+    
+    if not ib.isConnected():
+        # Disconnected - track when it started
+        if disconnect_start_time is None:
+            disconnect_start_time = datetime.now()
+            disconnect_email_sent = False
+            logging.warning("API disconnected - tracking disconnect time")
+        
+        # Check if we've been disconnected long enough to send alert
+        if not disconnect_email_sent:
+            disconnect_duration = (datetime.now() - disconnect_start_time).total_seconds()
+            
+            if disconnect_duration >= DISCONNECT_ALERT_THRESHOLD:
+                # Send disconnect alert email
+                duration_str = format_duration(disconnect_duration)
+                
+                # Get current position info if available (from tracked brackets, since we can't query IB while disconnected)
+                position_info = []
+                try:
+                    # Use tracked positions since we can't query IB while disconnected
+                    for bracket in positions:
+                        direction = bracket.get('direction', 0)
+                        if direction != 0:
+                            stop_order = bracket.get('stopLoss')
+                            if stop_order and hasattr(stop_order, 'totalQuantity'):
+                                qty = abs(stop_order.totalQuantity)
+                                direction_str = 'LONG' if direction == 1 else 'SHORT'
+                                position_info.append(f"  {qty} contract(s) {direction_str}")
+                except:
+                    pass
+                
+                position_summary = "\n".join(position_info) if position_info else "  No tracked positions (may have closed while disconnected)"
+                
+                msg_lines = [
+                    f"API DISCONNECTION ALERT",
+                    f"{'='*50}",
+                    f"",
+                    f"The Interactive Brokers API connection has been lost.",
+                    f"",
+                    f"Disconnect Duration: {duration_str}",
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"",
+                    f"Current Open Positions:",
+                    position_summary,
+                    f"",
+                    f"WARNING: While disconnected:",
+                    f"  - Orders may fill without notification",
+                    f"  - Positions may close without protection updates",
+                    f"  - Orphaned orders may remain active",
+                    f"",
+                    f"The script will attempt to reconnect automatically.",
+                    f"After reconnection, all positions will be checked and protected."
+                ]
+                
+                msg = "\n".join(msg_lines)
+                send_email("BB Strategy - API DISCONNECTION ALERT", msg)
+                disconnect_email_sent = True
+                logging.warning(f"Disconnect alert email sent (disconnected for {duration_str})")
+    else:
+        # Connected - check if we just reconnected
+        if disconnect_start_time is not None:
+            # We were disconnected but are now connected
+            disconnect_duration = (datetime.now() - disconnect_start_time).total_seconds()
+            duration_str = format_duration(disconnect_duration)
+            
+            # Send reconnection email
+            msg_lines = [
+                f"API RECONNECTION NOTIFICATION",
+                f"{'='*50}",
+                f"",
+                f"The Interactive Brokers API connection has been restored.",
+                f"",
+                f"Disconnect Duration: {duration_str}",
+                f"Reconnection Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"",
+                f"The script will now:",
+                f"  1. Check for orphaned orders and cancel them",
+                f"  2. Verify all positions are protected",
+                f"  3. Recreate any missing TP orders",
+                f"  4. Resume normal operation"
+            ]
+            
+            msg = "\n".join(msg_lines)
+            send_email("BB Strategy - API RECONNECTED", msg)
+            logging.info(f"Reconnection email sent (was disconnected for {duration_str})")
+            
+            # Reset disconnect tracking
+            disconnect_start_time = None
+            disconnect_email_sent = False
 
 def get_account_summary():
     """Get account summary information."""
@@ -1473,10 +1607,31 @@ def cleanup_orphaned_orders():
     """
     Cancel any active ES orders that don't belong to any tracked position.
     This handles cases where orders remain active after positions close.
+    CRITICAL: This is especially important after reconnection, as orders may have
+    filled while disconnected, leaving orphaned opposite orders active.
     """
     global positions, contract
     
     if contract is None:
+        return
+    
+    # First, verify actual positions match tracked brackets
+    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+    has_open_position = any(abs(p.position) > 0 for p in es_positions)
+    
+    # If no open position, all protective orders should be cancelled
+    if not has_open_position:
+        logging.info("No open ES position detected. Cancelling all active ES orders (orphaned from position close).")
+        for trade in ib.trades():
+            if (trade.contract.conId == contract.conId and 
+                trade.isActive()):
+                try:
+                    ib.cancelOrder(trade.order)
+                    logging.info(f"Cancelled orphaned order after position close: {type(trade.order).__name__} (PermID: {trade.order.permId})")
+                except Exception as e:
+                    logging.warning(f"Error cancelling orphaned order {trade.order.permId}: {e}")
+        # Clear all tracked brackets since position is closed
+        positions.clear()
         return
     
     # Get all tracked order IDs from active positions
@@ -1495,44 +1650,55 @@ def cleanup_orphaned_orders():
             if hasattr(entry_order, 'permId') and entry_order.permId:
                 tracked_order_ids.add(entry_order.permId)
     
-    # Check if there are any active ES positions
-    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
-    has_position = any(abs(p.position) > 0 for p in es_positions)
-    
-    # If no position, cancel all active ES orders
-    if not has_position:
-        for trade in ib.trades():
-            if (trade.contract.conId == contract.conId and 
-                trade.isActive() and
-                hasattr(trade.order, 'permId') and
-                trade.order.permId not in tracked_order_ids):
+    # If we reach here, there's an open position, so only cancel untracked standalone orders
+    # (standalone orders from trailing stop updates that got orphaned)
+    for trade in ib.trades():
+        order = trade.order
+        if (trade.contract.conId == contract.conId and 
+            trade.isActive() and
+            hasattr(order, 'permId') and
+            order.permId not in tracked_order_ids):
+            # Only cancel standalone orders (no parentId) - these are likely orphaned from trailing updates
+            # OR orders with parentId pointing to filled entry orders (orphaned from position close while disconnected)
+            should_cancel = False
+            if not hasattr(order, 'parentId') or order.parentId == 0:
+                # Standalone order - likely orphaned from trailing update
+                should_cancel = True
+            else:
+                # Check if parent order is filled (position closed, but this protective order remains)
+                parent_filled = False
+                for parent_trade in ib.trades():
+                    if (hasattr(order, 'parentId') and 
+                        parent_trade.order.permId == order.parentId and
+                        parent_trade.filled()):
+                        parent_filled = True
+                        break
+                if parent_filled:
+                    # Parent is filled but this protective order is still active - orphaned!
+                    should_cancel = True
+                    logging.warning(f"Found orphaned protective order (PermID: {order.permId}) with filled parent. Cancelling.")
+            
+            if should_cancel:
                 try:
-                    ib.cancelOrder(trade.order)
-                    logging.info(f"Cancelled orphaned order: {type(trade.order).__name__} (PermID: {trade.order.permId})")
+                    ib.cancelOrder(order)
+                    logging.info(f"Cancelled orphaned order: {type(order).__name__} (PermID: {order.permId})")
                 except Exception as e:
-                    logging.warning(f"Error cancelling orphaned order {trade.order.permId}: {e}")
-    else:
-        # If there is a position, only cancel orders that aren't tracked and don't have a parentId
-        # (standalone orders from trailing stop updates that got orphaned)
-        for trade in ib.trades():
-            order = trade.order
-            if (trade.contract.conId == contract.conId and 
-                trade.isActive() and
-                hasattr(order, 'permId') and
-                order.permId not in tracked_order_ids):
-                # Only cancel standalone orders (no parentId) - these are likely orphaned from trailing updates
-                if not hasattr(order, 'parentId') or order.parentId == 0:
-                    try:
-                        ib.cancelOrder(order)
-                        logging.info(f"Cancelled orphaned standalone order: {type(order).__name__} (PermID: {order.permId})")
-                    except Exception as e:
-                        logging.warning(f"Error cancelling orphaned order {order.permId}: {e}")
+                    logging.warning(f"Error cancelling orphaned order {order.permId}: {e}")
 
-# Check and protect existing positions
+# Check and handle orphaned positions
 def close_orphaned_positions():
     """
-    Close any positions that don't match any tracked brackets.
-    This handles cases where positions exist but aren't tracked (e.g., from manual close errors).
+    Handle positions that don't match any tracked brackets.
+    
+    Strategy:
+    1. If position is UNPROTECTED (no stop loss), protect it first (safer than closing)
+    2. If position is protected but doesn't match tracked brackets, it might be from:
+       - Orphaned order fill (should be protected, not closed)
+       - Manual trade (should be protected, not closed)
+       - Error in tracking (should be protected, not closed)
+    
+    We now PROTECT orphaned positions instead of closing them, as closing might cause
+    unnecessary losses if the position is profitable. The strategy will manage it normally.
     """
     global positions, contract, strategy
     
@@ -1564,36 +1730,42 @@ def close_orphaned_positions():
                     position_matched = True
                     break
         
-        # If position doesn't match any bracket, close it
+        # If position doesn't match any bracket, check if it's protected
         if not position_matched:
-            logging.warning(f"ORPHANED POSITION DETECTED: {position_size} contracts ({'LONG' if position_size > 0 else 'SHORT'})")
-            logging.warning("This position doesn't match any tracked bracket. Closing it...")
+            qty = abs(position_size)
+            direction = 1 if position_size > 0 else -1
             
-            try:
-                close_action = 'SELL' if position_size > 0 else 'BUY'
-                close_qty = abs(position_size)
+            # Check if position has protection
+            has_protection = False
+            for trade in ib.trades():
+                order = trade.order
+                # Check if it's a stop order for this contract
+                is_stop_order = (isinstance(order, StopOrder) or 
+                                (hasattr(order, 'auxPrice') and order.auxPrice > 0 and 
+                                 hasattr(order, 'lmtPrice') and order.lmtPrice == 0))
                 
-                close_order = MarketOrder(action=close_action, totalQuantity=close_qty, transmit=True)
-                close_trade = ib.placeOrder(contract, close_order)
-                logging.warning(f"Placed market order to close orphaned position: {close_action} {close_qty} @ market")
+                if (trade.contract.conId == contract.conId and 
+                    trade.isActive() and 
+                    is_stop_order and
+                    abs(order.totalQuantity) == qty):
+                    # Check if it's the right direction
+                    order_dir = 1 if order.action == 'SELL' else -1
+                    if order_dir == direction:
+                        has_protection = True
+                        break
+            
+            if not has_protection:
+                # UNPROTECTED orphaned position - protect it instead of closing
+                logging.warning(f"UNPROTECTED ORPHANED POSITION DETECTED: {qty} contracts ({'LONG' if direction==1 else 'SHORT'})")
+                logging.warning("This position doesn't match any tracked bracket and has no protection.")
+                logging.warning("Protecting it with stop loss instead of closing (safer approach).")
                 
-                # Wait for execution
-                ib.sleep(3)
-                
-                # Verify position closed
-                es_positions_after = [p for p in ib.positions() if p.contract.conId == contract.conId]
-                position_closed = not es_positions_after or es_positions_after[0].position == 0
-                
-                if position_closed:
-                    logging.info("Orphaned position successfully closed")
-                else:
-                    remaining = es_positions_after[0].position if es_positions_after else 0
-                    logging.error(f"WARNING: Orphaned position still open! Remaining: {remaining}")
-                    
-            except Exception as e:
-                logging.error(f"CRITICAL ERROR: Failed to close orphaned position: {e}")
-                import traceback
-                logging.error(f"Traceback: {traceback.format_exc()}")
+                # protect_existing_positions() will handle this, but we log it here for clarity
+                # The protect_existing_positions() function will be called after this
+            else:
+                # Protected orphaned position - log it but don't close
+                logging.info(f"ORPHANED POSITION DETECTED (but protected): {qty} contracts ({'LONG' if direction==1 else 'SHORT'})")
+                logging.info("Position doesn't match tracked brackets but has protection. Leaving it active.")
 
 def protect_existing_positions():
     """
@@ -2051,15 +2223,24 @@ async def main():
         # Main loop
         while True:
             try:
+                # Check disconnect status and send email alerts if needed
+                check_disconnect_status()
+                
                 if not ib.isConnected():
                     logging.warning("Connection lost, reconnecting...")
                     await connect_with_retry('127.0.0.1', 7497, base_client_id=100)
                     ensure_connected_and_subscribed()
-                    # Re-check protection after reconnection
+                    # CRITICAL: After reconnection, immediately check for orphaned orders
+                    # This handles cases where TP/SL filled while disconnected, leaving
+                    # the opposite order active and potentially fillable
                     await asyncio.sleep(2)
-                    close_orphaned_positions()
-                    protect_existing_positions()
+                    logging.info("Checking for orphaned orders after reconnection...")
+                    cleanup_orphaned_orders()  # Cancel any orphaned orders first
+                    close_orphaned_positions()  # Close any positions that don't match tracked brackets
+                    protect_existing_positions()  # Ensure remaining positions are protected
                     check_and_recreate_tp_orders()  # Check and recreate missing TP orders
+                    log_all_open_orders("After reconnection cleanup")
+                    # Note: check_disconnect_status() will send reconnection email on next iteration
                 await asyncio.sleep(10)
             except KeyboardInterrupt:
                 logging.info("Keyboard interrupt received...")

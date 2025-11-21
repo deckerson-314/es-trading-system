@@ -1,6 +1,6 @@
 Name,Value,Min,Max,Type,Description
 __indicatorName,BB Strategy,,,,Strategy identifier
-Max Open Trades,1,1,5,int,Maximum concurrent positions
+=== ENTRY CRITERIA ===
 Enable Long Trades,true,false,true,bool,Allow long entries
 Enable Short Trades,true,false,true,bool,Allow short entries
 Bollinger Band Length,10,10,100,int,Lookback period for BB
@@ -11,21 +11,26 @@ Long Trigger (% From Lower Band),0,0.0,2.0,float,% below lower band to trigger
 Short Entry on Wick Touch,true,false,true,bool,Enter if high touches upper band
 Short Entry on Body in Zone,true,false,true,bool,Enter if close ≥ upper band
 Short Trigger (% From Upper Band),0,0.0,2.0,float,% above upper band to trigger
-Initial Stop Loss (%),1.8586,0.1,2.0,float,Fixed stop loss %
-Enable Trailing Stop,true,false,true,bool,Use ATR trailing stop
-ATR Length for Trailing Stop,55,10,100,int,ATR period for trailing
-ATR Multiplier for Trailing Stop,4,1.0,5.0,float,Trailing stop ATR multiplier
-Opposite Bollinger Band TP,true,false,true,bool,DYNAMIC: Exit at current opposite BB
-Fixed ATR TP,false,false,true,bool,FIXED: Entry ± (ATR × Multiplier)
-Fixed BB at Entry TP,false,false,true,bool,FIXED: Upper BB at entry (long)
-ATR Length for TP,43,10,80,int,ATR period for fixed TP
-ATR Multiplier for TP,6,1.0,6.0,float,Fixed TP ATR multiplier
 Min ATR Filter (Points),0,0,10,float,Minimum ATR value to allow entries
 RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
 RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end
 Enable RTH Filter,false,false,true,bool,Restrict entries to RTH only
 Min Volume Multiplier,1.0,1.0,1.5,float,Volume filter (1.0 = no filter)
 Timeframe (minutes),1,1,8,int,Resample timeframe in minutes
+Max Open Trades,1,1,5,int,Maximum concurrent positions
+=== TAKE PROFIT CRITERIA ===
+Opposite Bollinger Band TP,false,false,true,bool,DYNAMIC: Exit at current opposite BB
+Fixed ATR TP,false,false,true,bool,FIXED: Entry ± (ATR × Multiplier)
+Fixed BB at Entry TP,true,false,true,bool,FIXED: Upper BB at entry (long)
+ATR Length for TP,43,10,80,int,ATR period for fixed TP
+ATR Multiplier for TP,6,1.0,6.0,float,Fixed TP ATR multiplier
+=== STOP LOSS CRITERIA ===
+Initial Stop Loss (%),1.8586,0.1,2.0,float,Fixed stop loss %
+Enable Trailing Stop,true,false,true,bool,Use ATR trailing stop
+ATR Length for Trailing Stop,55,10,100,int,ATR period for trailing
+ATR Multiplier for Trailing Stop,4,1.0,5.0,float,Trailing stop ATR multiplier
+Trailing Delay (bars),5,0,20,int,Bars before trailing stop begins tightening (0 = immediate)
+=== GA CRITERIA ===
 POP_SIZE,151,100,300,int,Population size
 NUM_GEN,52,50,150,int,Number of generations
 CX_PB,0.585,0.5,0.9,float,Crossover probability

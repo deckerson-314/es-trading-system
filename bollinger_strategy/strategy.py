@@ -269,7 +269,13 @@ class BollingerBandStrategy:
         if self.enable_trailing:
             peak = high if direction == 1 else low
             trail = peak - direction * atr_ts * self.atr_mult_ts_opt
-            stop = max(stop, trail) if direction == 1 else min(stop, trail)
+            # Update stop, but ensure it doesn't go above entry for longs or below entry for shorts
+            if direction == 1:
+                stop = max(stop, trail)
+                stop = min(stop, entry_price)  # Cap at entry price for longs
+            else:
+                stop = min(stop, trail)
+                stop = max(stop, entry_price)  # Cap at entry price for shorts
         
         # Create position
         position = {
@@ -289,6 +295,7 @@ class BollingerBandStrategy:
     def update_trailing_stop(self, position, row, df):
         """
         Update trailing stop if enabled and delay met.
+        Always records stop value in stop_history for visualization.
         
         Args:
             position: Position dictionary
@@ -298,38 +305,44 @@ class BollingerBandStrategy:
         Returns:
             bool: True if stop was updated
         """
-        if not self.enable_trailing:
-            return False
-        
-        # Increment bars held
-        position['bars_held'] = position.get('bars_held', 0) + 1
-        
-        # Check if delay met
-        if position['bars_held'] < self.trailing_delay:
-            return False
-        
-        # Get current values
+        # Get current bar index
         if hasattr(row, 'Index'):
+            idx = row.Index
             high = row.high
             low = row.low
             atr_ts = row.atr_ts
         else:
+            idx = row.name if hasattr(row, 'name') else df.index[-1]
             high = row['high']
             low = row['low']
             atr_ts = row['atr_ts']
         
-        # Update peak tracking
-        dir_ = position['direction']
-        if dir_ == 1:
-            position['max_high'] = max(position['max_high'], high)
-            new_stop = position['max_high'] - atr_ts * self.atr_mult_ts_opt
-            position['stop'] = max(position['stop'], new_stop)
-        else:
-            position['min_low'] = min(position['min_low'], low)
-            new_stop = position['min_low'] + atr_ts * self.atr_mult_ts_opt
-            position['stop'] = min(position['stop'], new_stop)
+        # Initialize stop_history if missing
+        if 'stop_history' not in position:
+            position['stop_history'] = []
         
-        return True
+        # Increment bars held
+        position['bars_held'] = position.get('bars_held', 0) + 1
+        
+        # Update trailing stop if enabled and delay met
+        stop_updated = False
+        if self.enable_trailing and position['bars_held'] >= self.trailing_delay:
+            # Update peak tracking
+            dir_ = position['direction']
+            if dir_ == 1:
+                position['max_high'] = max(position['max_high'], high)
+                new_stop = position['max_high'] - atr_ts * self.atr_mult_ts_opt
+                position['stop'] = max(position['stop'], new_stop)
+            else:
+                position['min_low'] = min(position['min_low'], low)
+                new_stop = position['min_low'] + atr_ts * self.atr_mult_ts_opt
+                position['stop'] = min(position['stop'], new_stop)
+            stop_updated = True
+        
+        # Always record current stop in history (for visualization)
+        position['stop_history'].append((idx, position['stop']))
+        
+        return stop_updated
     
     def check_exit(self, position, row, df):
         """

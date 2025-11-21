@@ -42,7 +42,7 @@ os.makedirs(HTML_DIR, exist_ok=True)
 # === Config ===
 VERSION = '3.0'
 FROM_DATE = '2025-04-01'
-TO_DATE = '2025-10-01'
+TO_DATE = '2025-08-01'
 multiplier = 50
 initial_capital = 50000
 candles_before_after = 50
@@ -72,12 +72,45 @@ except FileNotFoundError:
 strategy = BollingerBandStrategy(params_dict)
 
 log("\n" + "="*70)
-log("STRATEGY PARAMETERS")
+log("STRATEGY PARAMETERS (grouped by category)")
 log("="*70)
-for name in sorted(params_dict.keys()):
-    if not name.startswith('__'):
-        value = params_dict[name]['value']
-        log(f"{name:45} = {value}")
+
+# Group parameters for display
+def group_params_for_display(params_dict_local):
+    """Group parameters into logical categories."""
+    groups = {
+        'Entry Criteria': ['Enable Long Trades', 'Enable Short Trades', 'Bollinger Band Length', 
+                          'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
+                          'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
+                          'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
+                          'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                          'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                          'Max Open Trades'],
+        'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
+                                'ATR Length for TP', 'ATR Multiplier for TP'],
+        'Stop Loss Criteria': ['Initial Stop Loss (%)', 'Enable Trailing Stop', 
+                              'ATR Length for Trailing Stop', 'ATR Multiplier for Trailing Stop',
+                              'Trailing Delay (bars)'],
+        'GA Criteria': ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
+                       'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
+                       'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
+                       'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+    }
+    
+    grouped = {}
+    for group_name, param_list in groups.items():
+        grouped[group_name] = {k: v for k, v in params_dict_local.items() if k in param_list}
+    
+    return grouped
+
+grouped_params = group_params_for_display(params_dict)
+for group_name, params in grouped_params.items():
+    if params:
+        log(f"\n--- {group_name} ---")
+        for name in sorted(params.keys()):
+            value = params[name]['value']
+            log(f"  {name:45} = {value}")
+
 log("="*70 + "\n")
 
 # === Load Data ===
@@ -200,6 +233,15 @@ if not trades_df.empty:
     avg_duration = trades_df['duration'].mean()
     max_duration = trades_df['duration'].max()
     min_duration = trades_df['duration'].min()
+    
+    # Duration stats by direction
+    long_avg_duration = long_trades['duration'].mean() if len(long_trades) > 0 else 0
+    long_max_duration = long_trades['duration'].max() if len(long_trades) > 0 else 0
+    long_min_duration = long_trades['duration'].min() if len(long_trades) > 0 else 0
+    
+    short_avg_duration = short_trades['duration'].mean() if len(short_trades) > 0 else 0
+    short_max_duration = short_trades['duration'].max() if len(short_trades) > 0 else 0
+    short_min_duration = short_trades['duration'].min() if len(short_trades) > 0 else 0
     
     # Equity curve, drawdown, run-up
     trades_df = trades_df.sort_values('exit_time')
@@ -412,7 +454,7 @@ if not trades_df.empty:
                              f"Price: ${trade['tp']:.2f}<extra></extra>"
             ), row=1, col=1)
         
-        # Trailing Stop line (if stop_history exists)
+        # Trailing Stop line (if stop_history exists) - make it very visible
         if 'stop_history' in trade and trade['stop_history'] and len(trade['stop_history']) > 0:
             stop_times, stop_prices = zip(*trade['stop_history'])
             fig_main.add_trace(go.Scatter(
@@ -420,7 +462,8 @@ if not trades_df.empty:
                 y=list(stop_prices),
                 mode='lines',
                 name='Trailing Stop',
-                line=dict(color='orange', width=2),
+                line=dict(color='red', width=4, dash='solid'),
+                opacity=0.9,
                 showlegend=False,
                 hovertemplate="<b>Trailing Stop</b><br>" +
                              "Time: %{x}<br>" +
@@ -455,10 +498,32 @@ if not trades_df.empty:
     )
     
     fig_main.update_xaxes(title_text="Date", row=4, col=1)
-    fig_main.update_yaxes(title_text="Price ($)", row=1, col=1)
-    fig_main.update_yaxes(title_text="Volume", row=2, col=1)
-    fig_main.update_yaxes(title_text="Equity ($)", row=3, col=1)
-    fig_main.update_yaxes(title_text="Drawdown ($)", row=4, col=1)
+    
+    # Configure y-axes with auto-scaling when x-axis is zoomed
+    fig_main.update_yaxes(
+        title_text="Price ($)", 
+        row=1, col=1,
+        autorange=True,  # Auto-scale based on visible data
+        fixedrange=False  # Allow manual y-axis zoom
+    )
+    fig_main.update_yaxes(
+        title_text="Volume", 
+        row=2, col=1,
+        autorange=True,
+        fixedrange=False
+    )
+    fig_main.update_yaxes(
+        title_text="Equity ($)", 
+        row=3, col=1,
+        autorange=True,
+        fixedrange=False
+    )
+    fig_main.update_yaxes(
+        title_text="Drawdown ($)", 
+        row=4, col=1,
+        autorange=True,
+        fixedrange=False
+    )
     
     # 2. PERFORMANCE METRICS DASHBOARD
     fig_metrics = make_subplots(
@@ -591,11 +656,19 @@ if not trades_df.empty:
             name='Exit', showlegend=True
         ))
         
-        # Trailing stop (if available)
+        # Trailing stop (if available) - make it very visible
         if hasattr(trade, 'stop_history') and trade.stop_history:
             stop_times, stop_prices = zip(*trade.stop_history)
-            fig_trade.add_trace(go.Scatter(x=list(stop_times), y=list(stop_prices),
-                                          name='Trailing Stop', line=dict(color='orange', width=2)))
+            fig_trade.add_trace(go.Scatter(
+                x=list(stop_times), 
+                y=list(stop_prices),
+                name='Trailing Stop', 
+                line=dict(color='red', width=4, dash='solid'),
+                opacity=0.9,
+                hovertemplate="<b>Trailing Stop</b><br>" +
+                             "Time: %{x}<br>" +
+                             "Stop: $%{y:.2f}<extra></extra>"
+            ))
         
         # Take Profit line (if fixed)
         if trade.tp is not None:
@@ -615,7 +688,11 @@ if not trades_df.empty:
             xaxis_title="Time",
             yaxis_title="Price ($)",
             height=600,
-            hovermode='x unified'
+            hovermode='x unified',
+            yaxis=dict(
+                autorange=True,  # Auto-scale based on visible data
+                fixedrange=False  # Allow manual y-axis zoom
+            )
         )
         
         filename = f"trade_last_{i:03d}_{trade_type}_{result}_{pnl_str.replace('$', '').replace(',', '')}_v{VERSION}.html"
@@ -754,6 +831,24 @@ if not trades_df.empty:
                 <td class="negative">${long_largest_loss:,.2f}</td>
                 <td class="negative">${short_largest_loss:,.2f}</td>
             </tr>
+            <tr>
+                <td>Avg Duration (min)</td>
+                <td>{avg_duration:.1f}</td>
+                <td>{long_avg_duration:.1f}</td>
+                <td>{short_avg_duration:.1f}</td>
+            </tr>
+            <tr>
+                <td>Max Duration (min)</td>
+                <td>{max_duration:.0f}</td>
+                <td>{long_max_duration:.0f}</td>
+                <td>{short_max_duration:.0f}</td>
+            </tr>
+            <tr>
+                <td>Min Duration (min)</td>
+                <td>{min_duration:.0f}</td>
+                <td>{long_min_duration:.0f}</td>
+                <td>{short_min_duration:.0f}</td>
+            </tr>
         </table>
         
         <h2>Monthly Performance</h2>
@@ -802,6 +897,13 @@ if not trades_df.empty:
         <div id="performance_metrics_chart"></div>
         
         <h2>Input Parameters</h2>
+""")
+        # Add parameters to table (grouped)
+        grouped_params_html = group_params_for_display(params_dict)
+        for group_name, params in grouped_params_html.items():
+            if params:
+                f.write(f"""
+        <h3 style='margin-top: 20px; color: #555; border-bottom: 2px solid #ddd; padding-bottom: 5px;'>{group_name}</h3>
         <table>
             <tr>
                 <th>Parameter Name</th>
@@ -811,30 +913,28 @@ if not trades_df.empty:
                 <th>Max</th>
             </tr>
 """)
-        # Add parameters to table
-        for name in sorted(params_dict.keys()):
-            if not name.startswith('__'):
-                param_info = params_dict[name]
-                value = param_info.get('value', 'N/A')
-                param_type = param_info.get('type', 'N/A')
-                min_val = param_info.get('min', 'N/A')
-                max_val = param_info.get('max', 'N/A')
-                
-                # Format value based on type
-                if param_type == 'bool':
-                    value_str = 'True' if value else 'False'
-                elif param_type == 'float':
-                    value_str = f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
-                elif param_type == 'int':
-                    value_str = str(int(value)) if isinstance(value, (int, float)) else str(value)
-                else:
-                    value_str = str(value)
-                
-                # Format min/max
-                min_str = f"{min_val:.4f}" if isinstance(min_val, float) else (str(int(min_val)) if isinstance(min_val, int) else str(min_val)) if min_val is not None else 'N/A'
-                max_str = f"{max_val:.4f}" if isinstance(max_val, float) else (str(int(max_val)) if isinstance(max_val, int) else str(max_val)) if max_val is not None else 'N/A'
-                
-                f.write(f"""
+                for name in sorted(params.keys()):
+                    param_info = params[name]
+                    value = param_info.get('value', 'N/A')
+                    param_type = param_info.get('type', 'N/A')
+                    min_val = param_info.get('min', 'N/A')
+                    max_val = param_info.get('max', 'N/A')
+                    
+                    # Format value based on type
+                    if param_type == 'bool':
+                        value_str = 'True' if value else 'False'
+                    elif param_type == 'float':
+                        value_str = f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
+                    elif param_type == 'int':
+                        value_str = str(int(value)) if isinstance(value, (int, float)) else str(value)
+                    else:
+                        value_str = str(value)
+                    
+                    # Format min/max
+                    min_str = f"{min_val:.4f}" if isinstance(min_val, float) else (str(int(min_val)) if isinstance(min_val, int) else str(min_val)) if min_val is not None else 'N/A'
+                    max_str = f"{max_val:.4f}" if isinstance(max_val, float) else (str(int(max_val)) if isinstance(max_val, int) else str(max_val)) if max_val is not None else 'N/A'
+                    
+                    f.write(f"""
             <tr>
                 <td><strong>{name}</strong></td>
                 <td>{value_str}</td>
@@ -843,9 +943,9 @@ if not trades_df.empty:
                 <td>{max_str}</td>
             </tr>
 """)
-        f.write("""
-        </table>
+                f.write("        </table>\n")
         
+        f.write("""
         <h2>Main Overview Chart</h2>
         <div id="main_overview_chart"></div>
         

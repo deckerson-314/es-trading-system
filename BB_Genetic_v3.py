@@ -28,9 +28,15 @@ import random
 import pickle
 import multiprocessing
 import signal
+import time
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.offline as pyo
+import webbrowser
 from deap import base, creator, tools, algorithms
 from bollinger_strategy import BollingerBandStrategy, load_params
 
@@ -49,7 +55,11 @@ TRADES_OOS_CSV = 'Bollinger/output/trades_oos_v3.csv'
 TRADES_IS_CSV = 'Bollinger/output/trades_is_v3.csv'
 DIAG_DIR = 'ga_diagnostics_v3'
 CHECKPOINT_FILE = os.path.join(DIAG_DIR, 'ga_checkpoint_v3.pkl')
+START_TIME_FILE = os.path.join(DIAG_DIR, 'ga_start_time.txt')
+HTML_DIR = os.path.join(DIAG_DIR, 'html')
+HTML_DASHBOARD = os.path.join(HTML_DIR, 'ga_dashboard_v3.html')
 os.makedirs(DIAG_DIR, exist_ok=True)
+os.makedirs(HTML_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(TRADES_IS_CSV), exist_ok=True)
 os.makedirs(os.path.dirname(TRADES_OOS_CSV), exist_ok=True)
 
@@ -404,10 +414,14 @@ def _evaluate_worker(args):
     sortino = min(sortino, 100.0)
     
     # Heavy penalty for too few trades (violates minimum constraint)
+    # BUT: Use a gradient penalty instead of hard cutoff to allow some diversity
     if low_pen > 0:
-        sortino = -100.0  # Very poor fitness
-        max_dd = 100000.0  # Very poor fitness
-        pf = 0.0
+        # Gradient penalty: worse penalty for larger violations
+        # This allows solutions with slightly fewer trades to still compete
+        penalty_factor = min(1.0, low_pen / min_trades)  # 0 to 1 based on how far below min
+        sortino = -100.0 * penalty_factor  # Scale penalty
+        max_dd = 100000.0 * penalty_factor  # Scale penalty
+        pf = 0.0 * (1.0 - penalty_factor)  # Scale penalty
     
     # Light penalty for too many trades (soft constraint)
     if excess_pen > 0:
@@ -448,6 +462,603 @@ def parallel_evaluate(individuals, df, param_dict_local, param_keys_local):
     finally:
         pool.close()
         pool.join()
+
+# ----------------------------------------------------------------------
+# HTML Dashboard Generation
+# ----------------------------------------------------------------------
+def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict,
+                            logbook, is_res, oos_res, trades_is, trades_oos,
+                            html_path, diag_dir, current_gen=None, total_gen=None, 
+                            is_final=False, auto_launch=False):
+    """
+    Generate comprehensive interactive HTML dashboard for GA results.
+    
+    Args:
+        current_gen: Current generation number (for progress tracking)
+        total_gen: Total number of generations
+        is_final: Whether this is the final generation
+        auto_launch: Whether to auto-launch the HTML file
+    """
+    # Helper function to clamp parameters
+    def clamp_params(raw_params, param_dict_local):
+        """Clamp parameters to valid ranges."""
+        clamped = {}
+        for n, v in raw_params.items():
+            if n not in param_dict_local:
+                continue
+            mn, mx, typ = param_dict_local[n]['min'], param_dict_local[n]['max'], param_dict_local[n]['type']
+            v = max(mn, min(v, mx))  # Clamp to valid range
+            if typ == 'int':
+                clamped[n] = int(round(v))
+            else:
+                clamped[n] = float(v)
+        
+        # Ensure critical integer parameters
+        if 'Bollinger Band Length' in clamped:
+            clamped['Bollinger Band Length'] = max(1, int(round(clamped['Bollinger Band Length'])))
+        if 'ATR Length for Trailing Stop' in clamped:
+            clamped['ATR Length for Trailing Stop'] = max(1, int(round(clamped['ATR Length for Trailing Stop'])))
+        if 'ATR Length for TP' in clamped:
+            clamped['ATR Length for TP'] = max(1, int(round(clamped['ATR Length for TP'])))
+        if 'Trailing Delay (bars)' in clamped:
+            clamped['Trailing Delay (bars)'] = max(0, int(round(clamped['Trailing Delay (bars)'])))
+        if 'Timeframe (minutes)' in clamped:
+            clamped['Timeframe (minutes)'] = max(1, int(round(clamped['Timeframe (minutes)'])))
+        if 'Max Open Trades' in clamped:
+            clamped['Max Open Trades'] = max(1, int(round(clamped['Max Open Trades'])))
+        return clamped
+    
+    # Extract Pareto front data with clamped parameters
+    pareto_data = []
+    for i, ind in enumerate(hof):
+        raw_params = dict(zip(param_keys, ind))
+        clamped_params = clamp_params(raw_params, param_dict)
+        fitness = ind.fitness.values
+        pareto_data.append({
+            'index': i,
+            'sortino': fitness[0],
+            'max_dd': fitness[1],
+            'profit_factor': fitness[2],
+            'params': clamped_params,  # Use clamped parameters
+            'is_selected': (ind == best)
+        })
+    
+    pareto_df = pd.DataFrame(pareto_data)
+    
+    # Sort by different criteria for top candidates
+    top_sortino = pareto_df.nlargest(5, 'sortino')
+    top_pf = pareto_df.nlargest(5, 'profit_factor')
+    top_dd = pareto_df.nsmallest(5, 'max_dd')
+    
+    # Create convergence plots
+    gens = logbook.select("gen")
+    fig_convergence = make_subplots(rows=1, cols=3,
+        subplot_titles=('Sortino Convergence', 'Drawdown Convergence', 'Profit Factor Convergence'))
+    
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_sortino"), name='Avg', line=dict(dash='dash')), row=1, col=1)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("max_sortino"), name='Best', line=dict(width=2)), row=1, col=1)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_dd"), name='Avg', line=dict(dash='dash')), row=1, col=2)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("min_dd"), name='Best', line=dict(width=2)), row=1, col=2)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_pf"), name='Avg', line=dict(dash='dash')), row=1, col=3)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("max_pf"), name='Best', line=dict(width=2)), row=1, col=3)
+    fig_convergence.update_layout(height=400, showlegend=True, title_text="Convergence Plots")
+    fig_convergence.update_xaxes(title_text="Generation")
+    fig_convergence.update_yaxes(title_text="Sortino", row=1, col=1)
+    fig_convergence.update_yaxes(title_text="Drawdown", row=1, col=2)
+    fig_convergence.update_yaxes(title_text="Profit Factor", row=1, col=3)
+    
+    # Pareto front 3D (only if we have solutions)
+    if len(hof) > 0:
+        sortinos = [ind.fitness.values[0] for ind in hof]
+        dds = [ind.fitness.values[1] for ind in hof]
+        pfs = [ind.fitness.values[2] for ind in hof]
+        is_selected = [ind == best for ind in hof] if best is not None else [False] * len(hof)
+    else:
+        sortinos = []
+        dds = []
+        pfs = []
+        is_selected = []
+    
+    fig_pareto_3d = go.Figure(data=go.Scatter3d(
+        x=dds, y=sortinos, z=pfs, mode='markers',
+        marker=dict(size=8, color=sortinos, colorscale='Viridis', showscale=True,
+                   line=dict(width=2, color=[('red' if sel else 'black') for sel in is_selected])),
+        text=[f"Sol {i}: S={s:.3f}, DD={d:.1f}, PF={p:.3f}" for i, (s, d, p) in enumerate(zip(sortinos, dds, pfs))],
+        hovertemplate="<b>%{{text}}</b><extra></extra>"
+    ))
+    fig_pareto_3d.add_trace(go.Scatter3d(
+        x=[best_fitness[1]], y=[best_fitness[0]], z=[best_fitness[2]],
+        mode='markers', marker=dict(size=15, color='red', symbol='diamond'),
+        name='Selected', hovertemplate=f"Selected: S={best_fitness[0]:.3f}, DD={best_fitness[1]:.1f}, PF={best_fitness[2]:.3f}<extra></extra>"
+    ))
+    fig_pareto_3d.update_layout(
+        title="Pareto Front 3D: Sortino vs Drawdown vs Profit Factor",
+        scene=dict(xaxis_title="Max Drawdown", yaxis_title="Sortino", zaxis_title="Profit Factor"),
+        height=600
+    )
+    
+    # Pareto 2D projections
+    fig_pareto_2d = make_subplots(rows=1, cols=3,
+        subplot_titles=('Sortino vs DD', 'Sortino vs PF', 'DD vs PF'))
+    fig_pareto_2d.add_trace(go.Scatter(x=dds, y=sortinos, mode='markers', name='Solutions',
+        marker=dict(size=8, color=sortinos, colorscale='Viridis', showscale=False,
+                   line=dict(width=2, color=[('red' if sel else 'black') for sel in is_selected]))), row=1, col=1)
+    fig_pareto_2d.add_trace(go.Scatter(x=[best_fitness[1]], y=[best_fitness[0]], mode='markers',
+        marker=dict(size=15, color='red', symbol='diamond'), name='Selected', showlegend=False), row=1, col=1)
+    fig_pareto_2d.add_trace(go.Scatter(x=sortinos, y=pfs, mode='markers', showlegend=False,
+        marker=dict(size=8, color=sortinos, colorscale='Viridis', showscale=False,
+                   line=dict(width=2, color=[('red' if sel else 'black') for sel in is_selected]))), row=1, col=2)
+    fig_pareto_2d.add_trace(go.Scatter(x=[best_fitness[0]], y=[best_fitness[2]], mode='markers',
+        marker=dict(size=15, color='red', symbol='diamond'), showlegend=False), row=1, col=2)
+    fig_pareto_2d.add_trace(go.Scatter(x=dds, y=pfs, mode='markers', showlegend=False,
+        marker=dict(size=8, color=sortinos, colorscale='Viridis', showscale=False,
+                   line=dict(width=2, color=[('red' if sel else 'black') for sel in is_selected]))), row=1, col=3)
+    fig_pareto_2d.add_trace(go.Scatter(x=[best_fitness[1]], y=[best_fitness[2]], mode='markers',
+        marker=dict(size=15, color='red', symbol='diamond'), showlegend=False), row=1, col=3)
+    fig_pareto_2d.update_xaxes(title_text="Drawdown", row=1, col=1)
+    fig_pareto_2d.update_xaxes(title_text="Sortino", row=1, col=2)
+    fig_pareto_2d.update_xaxes(title_text="Drawdown", row=1, col=3)
+    fig_pareto_2d.update_yaxes(title_text="Sortino", row=1, col=1)
+    fig_pareto_2d.update_yaxes(title_text="Profit Factor", row=1, col=2)
+    fig_pareto_2d.update_yaxes(title_text="Profit Factor", row=1, col=3)
+    fig_pareto_2d.update_layout(height=400)
+    
+    # Pareto size
+    fig_pareto_size = go.Figure()
+    if len(gens) > 0:
+        fig_pareto_size.add_trace(go.Scatter(x=gens, y=logbook.select("pareto_size"), mode='lines+markers', name='Size'))
+    fig_pareto_size.update_layout(title="Pareto Front Size", xaxis_title="Generation", yaxis_title="Solutions", height=300)
+    
+    # Generate HTML tables and content
+    pareto_table_html = """<table class='pareto-table'><thead><tr>
+        <th>Rank<span class="tooltip-icon">?</span><span class="tooltip">Ranking by Sortino Ratio (highest to lowest). Lower rank = better risk-adjusted returns.</span></th>
+        <th>Sortino<span class="tooltip-icon">?</span><span class="tooltip">Sortino Ratio - risk-adjusted return focusing on downside volatility. Higher is better.</span></th>
+        <th>Max DD<span class="tooltip-icon">?</span><span class="tooltip">Maximum Drawdown in dollars. Lower is better for risk management.</span></th>
+        <th>PF<span class="tooltip-icon">?</span><span class="tooltip">Profit Factor (Gross Profit / Gross Loss). Values >1.0 are profitable, >2.0 are excellent.</span></th>
+        <th>Selected<span class="tooltip-icon">?</span><span class="tooltip">★ indicates the solution selected for use (highest Sortino Ratio).</span></th>
+    </tr></thead><tbody>"""
+    pareto_sorted = sorted(pareto_data, key=lambda x: x['sortino'], reverse=True)
+    for rank, sol in enumerate(pareto_sorted, 1):
+        mark = "★" if sol['is_selected'] else ""
+        pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{sol['sortino']:.4f}</td><td>{sol['max_dd']:.2f}</td><td>{sol['profit_factor']:.4f}</td><td>{mark}</td></tr>"
+    pareto_table_html += "</tbody></table>"
+    
+    # Best params table - grouped by category
+    def group_parameters(param_keys_local, param_dict_local):
+        """Group parameters into logical categories."""
+        groups = {
+            'Entry Criteria': [],
+            'Take Profit Criteria': [],
+            'Stop Loss Criteria': [],
+            'GA Criteria': []
+        }
+        
+        # Define parameter groups
+        entry_params = ['Enable Long Trades', 'Enable Short Trades', 'Bollinger Band Length', 
+                        'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
+                        'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
+                        'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
+                        'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                        'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                        'Max Open Trades']
+        
+        tp_params = ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
+                    'ATR Length for TP', 'ATR Multiplier for TP']
+        
+        sl_params = ['Initial Stop Loss (%)', 'Enable Trailing Stop', 
+                     'ATR Length for Trailing Stop', 'ATR Multiplier for Trailing Stop',
+                     'Trailing Delay (bars)']
+        
+        ga_params = ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
+                     'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
+                     'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
+                     'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+        
+        # Group parameters
+        for pname in param_keys_local:
+            if pname in entry_params:
+                groups['Entry Criteria'].append(pname)
+            elif pname in tp_params:
+                groups['Take Profit Criteria'].append(pname)
+            elif pname in sl_params:
+                groups['Stop Loss Criteria'].append(pname)
+            elif pname in ga_params:
+                groups['GA Criteria'].append(pname)
+            else:
+                # Default to Entry Criteria if not found
+                groups['Entry Criteria'].append(pname)
+        
+        return groups
+    
+    param_groups = group_parameters(param_keys, param_dict)
+    
+    best_params_html = ""
+    for group_name, params_list in param_groups.items():
+        if params_list:  # Only show group if it has parameters
+            best_params_html += f"<h3 style='margin-top: 20px; color: #555; border-bottom: 2px solid #ddd; padding-bottom: 5px;'>{group_name}</h3>"
+            best_params_html += "<table class='params-table'><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>"
+            for pname in params_list:
+                if pname in best_params:
+                    val = best_params[pname]
+                    typ = param_dict[pname].get('type', 'float')
+                    formatted = int(round(val)) if typ == 'int' else f"{val:.4f}"
+                    best_params_html += f"<tr><td>{pname}</td><td>{formatted}</td></tr>"
+            best_params_html += "</tbody></table>"
+    
+    # Comparison table - match console output exactly
+    comparison_html = """<table class='comparison-table'><thead><tr>
+        <th>Metric<span class="tooltip-icon">?</span><span class="tooltip">Performance metric being compared between training (IS) and validation (OOS) data.</span></th>
+        <th>In-Sample<span class="tooltip-icon">?</span><span class="tooltip">Performance on training data used for optimization. This is what the GA optimized for.</span></th>
+        <th>OOS<span class="tooltip-icon">?</span><span class="tooltip">Out-of-Sample performance on validation data not seen during optimization. This tests generalization.</span></th>
+        <th>Difference<span class="tooltip-icon">?</span><span class="tooltip">OOS - IS. Green = OOS better (good generalization), Red = OOS worse (potential overfitting).</span></th>
+    </tr></thead><tbody>"""
+    
+    # Metrics to compare (matching console output)
+    metrics_to_compare = [
+        ('sortino', 'Sortino Ratio', False),  # (key, display_name, lower_is_better)
+        ('max_drawdown', 'Max Drawdown', True),
+        ('avg_trades_day', 'Avg Trades/Day', False),
+        ('profit_factor', 'Profit Factor', False)
+    ]
+    
+    for metric_key, metric_name, lower_is_better in metrics_to_compare:
+        # Get values from backtest results (these should match console output)
+        is_val = is_res.get(metric_key, 0) if isinstance(is_res, dict) else 0
+        oos_val = oos_res.get(metric_key, 0) if isinstance(oos_res, dict) else 0
+        
+        # Calculate difference (for drawdown, lower is better, so flip the diff)
+        if lower_is_better:
+            diff = is_val - oos_val  # Positive diff means OOS is better (lower drawdown)
+        else:
+            diff = oos_val - is_val  # Positive diff means OOS is better (higher value)
+        
+        diff_class = 'positive' if diff > 0 else 'negative' if diff < 0 else ''
+        diff_pct = (diff / is_val * 100) if is_val != 0 else 0
+        
+        # Format values appropriately to match console output
+        if metric_key == 'max_drawdown':
+            is_str = f"{is_val:.6f}"  # Match console format
+            oos_str = f"{oos_val:.6f}"
+            diff_str = f"{diff:+.6f} ({diff_pct:+.1f}%)"
+        elif metric_key == 'avg_trades_day':
+            is_str = f"{is_val:.6f}"
+            oos_str = f"{oos_val:.6f}"
+            diff_str = f"{diff:+.6f} ({diff_pct:+.1f}%)"
+        else:
+            is_str = f"{is_val:.6f}"
+            oos_str = f"{oos_val:.6f}"
+            diff_str = f"{diff:+.6f} ({diff_pct:+.1f}%)"
+        
+        comparison_html += f"<tr><td>{metric_name}</td><td>{is_str}</td><td>{oos_str}</td><td class='{diff_class}'>{diff_str}</td></tr>"
+    
+    comparison_html += "</tbody></table>"
+    
+    # Add summary statistics matching console output
+    summary_html = """<h3>Performance Summary</h3>
+    <div class="info-section">
+        <strong>Summary Metrics:</strong> These metrics provide a quick overview of strategy performance. Compare IS vs OOS to assess generalization. Large differences indicate potential overfitting.
+    </div>
+    <table class='summary-table'><thead><tr>
+        <th>Dataset<span class="tooltip-icon">?</span><span class="tooltip">In-Sample (training) or OOS (validation) dataset.</span></th>
+        <th>PNL<span class="tooltip-icon">?</span><span class="tooltip">Total Profit and Loss in dollars. Sum of all trade PNLs.</span></th>
+        <th>Win Rate<span class="tooltip-icon">?</span><span class="tooltip">Percentage of profitable trades. Higher is generally better, but not always (depends on risk/reward).</span></th>
+        <th>Profit Factor<span class="tooltip-icon">?</span><span class="tooltip">Gross Profit / Gross Loss. >1.0 = profitable, >2.0 = excellent. Shows dollar efficiency.</span></th>
+        <th>Calmar Ratio<span class="tooltip-icon">?</span><span class="tooltip">Total PNL / Max Drawdown. Higher is better. Measures return per unit of maximum risk.</span></th>
+    </tr></thead><tbody>"""
+    
+    for label, trades, res in [('In-Sample', trades_is, is_res), ('OOS', trades_oos, oos_res)]:
+        if not trades.empty:
+            total_pnl = trades['pnl'].sum()
+            win_rate = (trades['pnl'] > 0).mean() * 100
+            pf = abs(trades[trades['pnl'] > 0]['pnl'].sum() / trades[trades['pnl'] < 0]['pnl'].sum()) if (trades['pnl'] < 0).any() else np.inf
+            max_dd = res.get('max_drawdown', 0)
+            calmar = total_pnl / max_dd if max_dd > 0 else np.inf
+            summary_html += f"<tr><td>{label}</td><td>${total_pnl:,.0f}</td><td>{win_rate:.1f}%</td><td>{pf:.2f}</td><td>{calmar:.2f}</td></tr>"
+        else:
+            summary_html += f"<tr><td>{label}</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td></tr>"
+    
+    summary_html += "</tbody></table>"
+    
+    # Generate HTML snippets for charts
+    conv_html = fig_convergence.to_html(include_plotlyjs=False, div_id='conv_chart')
+    pareto3d_html = fig_pareto_3d.to_html(include_plotlyjs=False, div_id='pareto3d_chart')
+    pareto2d_html = fig_pareto_2d.to_html(include_plotlyjs=False, div_id='pareto2d_chart')
+    paretosize_html = fig_pareto_size.to_html(include_plotlyjs=False, div_id='paretosize_chart')
+    
+    # Extract div and script from each chart
+    def extract_chart_html(html_snippet):
+        div_start = html_snippet.find('<div')
+        div_end = html_snippet.find('</div>') + 6
+        script_start = html_snippet.find('<script')
+        script_end = html_snippet.find('</script>') + 9
+        div_part = html_snippet[div_start:div_end]
+        script_part = html_snippet[script_start:script_end]
+        return div_part, script_part
+    
+    conv_div, conv_script = extract_chart_html(conv_html)
+    pareto3d_div, pareto3d_script = extract_chart_html(pareto3d_html)
+    pareto2d_div, pareto2d_script = extract_chart_html(pareto2d_html)
+    paretosize_div, paretosize_script = extract_chart_html(paretosize_html)
+    
+    # Progress information with time tracking
+    progress_html = ""
+    if current_gen is not None and total_gen is not None:
+        progress_pct = (current_gen / total_gen * 100) if total_gen > 0 else 0
+        status = "COMPLETE" if is_final else "IN PROGRESS"
+        status_color = "#4CAF50" if is_final else "#FF9800"
+        
+        # Calculate elapsed time and predicted completion
+        elapsed_time_str = "N/A"
+        predicted_completion_str = "N/A"
+        
+        # Try to read start time from file
+        start_time = None
+        START_TIME_FILE = os.path.join(diag_dir, 'ga_start_time.txt')
+        if os.path.exists(START_TIME_FILE):
+            try:
+                with open(START_TIME_FILE, 'r') as f:
+                    start_time = float(f.read().strip())
+            except:
+                pass
+        
+        if start_time is not None:
+            elapsed_seconds = time.time() - start_time
+            elapsed_td = timedelta(seconds=int(elapsed_seconds))
+            # Format as HH:MM:SS
+            hours, remainder = divmod(elapsed_td.seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            elapsed_time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            if elapsed_td.days > 0:
+                elapsed_time_str = f"{elapsed_td.days}d {elapsed_time_str}"
+            
+            # Calculate predicted completion time
+            if current_gen > 0 and not is_final:
+                avg_time_per_gen = elapsed_seconds / current_gen
+                remaining_gens = total_gen - current_gen
+                predicted_seconds = avg_time_per_gen * remaining_gens
+                predicted_completion = datetime.now() + timedelta(seconds=int(predicted_seconds))
+                predicted_completion_str = predicted_completion.strftime('%Y-%m-%d %H:%M:%S')
+            elif is_final:
+                predicted_completion_str = "Complete"
+        
+        progress_html = f"""
+<div style="background: {status_color}; color: white; padding: 15px; border-radius: 5px; margin: 20px 0;">
+    <h3 style="margin: 0 0 10px 0;">Optimization Status: {status}</h3>
+    <div style="background: rgba(255,255,255,0.3); border-radius: 3px; height: 30px; position: relative; margin: 10px 0;">
+        <div style="background: white; height: 100%; width: {progress_pct}%; border-radius: 3px; transition: width 0.3s;"></div>
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-weight: bold; color: {status_color};">
+            Generation {current_gen} / {total_gen} ({progress_pct:.1f}%)
+        </div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin: 10px 0; font-size: 0.9em;">
+        <div><strong>Last Updated:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+        <div><strong>Elapsed Time:</strong> {elapsed_time_str}</div>
+        <div><strong>Predicted Completion:</strong> {predicted_completion_str}</div>
+        <div><strong>Elapsed Generations:</strong> {len(gens)}</div>
+        <div><strong>Pareto Solutions Found:</strong> {len(hof)}</div>
+    </div>
+</div>"""
+    
+    # Generate full HTML with tooltips and auto-refresh
+    # Auto-refresh every 30 seconds if not final
+    refresh_meta = '<meta http-equiv="refresh" content="30">' if not is_final else ''
+    
+    html_content = f"""<!DOCTYPE html>
+<html><head><title>GA Dashboard v3.0</title>
+{refresh_meta}
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+body {{ font-family: Arial; margin: 20px; background: #f5f5f5; }}
+.container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
+h1 {{ color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }}
+h2 {{ color: #555; margin-top: 30px; border-bottom: 2px solid #ddd; position: relative; }}
+h2 .tooltip-icon {{ 
+    display: inline-block; 
+    width: 18px; 
+    height: 18px; 
+    background: #4CAF50; 
+    color: white; 
+    border-radius: 50%; 
+    text-align: center; 
+    line-height: 18px; 
+    font-size: 12px; 
+    margin-left: 8px; 
+    cursor: help;
+    vertical-align: middle;
+}}
+h2 .tooltip {{ 
+    visibility: hidden; 
+    width: 300px; 
+    background-color: #333; 
+    color: #fff; 
+    text-align: left; 
+    border-radius: 6px; 
+    padding: 10px; 
+    position: absolute; 
+    z-index: 1; 
+    bottom: 125%; 
+    left: 0; 
+    font-size: 12px;
+    line-height: 1.4;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}}
+h2 .tooltip-icon:hover + .tooltip {{ visibility: visible; }}
+table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+th {{ background: #4CAF50; color: white; padding: 10px; text-align: left; position: relative; }}
+th .tooltip-icon {{ 
+    display: inline-block; 
+    width: 16px; 
+    height: 16px; 
+    background: rgba(255,255,255,0.3); 
+    color: white; 
+    border-radius: 50%; 
+    text-align: center; 
+    line-height: 16px; 
+    font-size: 11px; 
+    margin-left: 5px; 
+    cursor: help;
+    vertical-align: middle;
+}}
+th .tooltip {{ 
+    visibility: hidden; 
+    width: 280px; 
+    background-color: #333; 
+    color: #fff; 
+    text-align: left; 
+    border-radius: 6px; 
+    padding: 8px; 
+    position: absolute; 
+    z-index: 1; 
+    bottom: 125%; 
+    left: 0; 
+    font-size: 11px;
+    line-height: 1.3;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}}
+th .tooltip-icon:hover + .tooltip {{ visibility: visible; }}
+td {{ padding: 8px; border: 1px solid #ddd; }}
+tr:nth-child(even) {{ background: #f9f9f9; }}
+.selected-row {{ background: #fff3cd !important; font-weight: bold; }}
+.positive {{ color: green; }}
+.negative {{ color: red; }}
+.metric-box {{ 
+    display: inline-block; 
+    background: #4CAF50; 
+    color: white; 
+    padding: 10px 20px; 
+    margin: 5px; 
+    border-radius: 5px; 
+    font-weight: bold;
+    position: relative;
+    cursor: help;
+}}
+.metric-box .tooltip {{ 
+    visibility: hidden; 
+    width: 250px; 
+    background-color: #333; 
+    color: #fff; 
+    text-align: left; 
+    border-radius: 6px; 
+    padding: 8px; 
+    position: absolute; 
+    z-index: 1; 
+    bottom: 125%; 
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 11px;
+    line-height: 1.3;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}}
+.metric-box:hover .tooltip {{ visibility: visible; }}
+.info-section {{ 
+    background: #e3f2fd; 
+    border-left: 4px solid #2196F3; 
+    padding: 12px; 
+    margin: 15px 0; 
+    border-radius: 4px;
+    font-size: 0.9em;
+    line-height: 1.5;
+}}
+</style></head><body>
+<div class="container">
+<h1>GA Optimization Dashboard - v3.0</h1>
+<p><strong>Generated:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+{progress_html}
+<div class="metric-box">
+    Pareto Solutions: {len(hof)}
+    <span class="tooltip">Number of non-dominated solutions found. These represent the best trade-offs between Sortino Ratio, Max Drawdown, and Profit Factor. Higher is generally better, indicating more diverse optimal solutions.</span>
+</div>
+<div class="metric-box">
+    Generations: {len(gens)}
+    <span class="tooltip">Total number of generations completed. Each generation evaluates a population of candidate solutions and evolves them through selection, crossover, and mutation.</span>
+</div>
+<h2>Selected Solution Performance<span class="tooltip-icon">?</span>
+    <span class="tooltip">The best solution selected from the Pareto front based on highest Sortino Ratio. This represents the optimized strategy parameters that will be used for live trading.</span>
+</h2>
+<div class="info-section">
+    <strong>Selection Criteria:</strong> The solution with the highest Sortino Ratio is selected as the "best" solution. This prioritizes risk-adjusted returns while still considering drawdown and profit factor through the Pareto front.
+</div>
+<h3>Actual Backtest Results (In-Sample)</h3>
+<div class="metric-box">
+    Sortino: {is_res.get('sortino', 0) if isinstance(is_res, dict) else 0:.6f}
+    <span class="tooltip">Sortino Ratio measures risk-adjusted returns, focusing only on downside volatility (negative returns). Higher is better. Values above 1.0 are considered good, above 2.0 are excellent. This is preferred over Sharpe Ratio for trading strategies as it doesn't penalize upside volatility.</span>
+</div>
+<div class="metric-box">
+    Max DD: ${is_res.get('max_drawdown', 0) if isinstance(is_res, dict) else 0:,.2f}
+    <span class="tooltip">Maximum Drawdown is the largest peak-to-trough decline in equity during the backtest period. Lower is better. This represents the worst-case loss an investor would have experienced. Critical for risk management.</span>
+</div>
+<div class="metric-box">
+    PF: {is_res.get('profit_factor', 0) if isinstance(is_res, dict) else 0:.6f}
+    <span class="tooltip">Profit Factor = Total Gross Profit / Total Gross Loss. Values above 1.0 indicate profitable strategy. Above 2.0 is excellent. This metric shows the ratio of winning to losing trades in dollar terms.</span>
+</div>
+<div class="metric-box">
+    Avg Trades/Day: {is_res.get('avg_trades_day', 0) if isinstance(is_res, dict) else 0:.6f}
+    <span class="tooltip">Average number of trades executed per day. This helps assess strategy activity level. Too few trades may indicate over-filtering, too many may indicate overtrading. Target range is typically 1-5 trades/day.</span>
+</div>
+<p><em>Note: GA fitness values (used for optimization) may differ from actual backtest results due to penalties for constraint violations.</em></p>
+<h2>Parameters<span class="tooltip-icon">?</span>
+    <span class="tooltip">Optimized parameter values for the selected solution. These are the actual values that will be used in live trading. Compare these to your initial parameter ranges to see how the GA adjusted them.</span>
+</h2>
+{best_params_html}
+<h2>Convergence<span class="tooltip-icon">?</span>
+    <span class="tooltip">Convergence plots show how the optimization objectives improve over generations. Look for: (1) Steady upward trend in Sortino and Profit Factor, (2) Steady downward trend in Drawdown, (3) Convergence where improvements plateau (indicates optimization is complete). If lines are still improving, consider running more generations.</span>
+</h2>
+<div class="info-section">
+    <strong>Interpreting Convergence:</strong> The "Best" line shows the best individual in each generation. The "Avg" line shows the population average. Convergence occurs when both lines plateau. If they're still improving, the GA may benefit from more generations. Divergence between Best and Avg indicates good diversity in the population.
+</div>
+{conv_div}
+<h2>Pareto Front 3D<span class="tooltip-icon">?</span>
+    <span class="tooltip">3D visualization of all Pareto-optimal solutions showing the trade-offs between Sortino Ratio (Y-axis), Max Drawdown (X-axis), and Profit Factor (Z-axis). Each point is a non-dominated solution. The red diamond is the selected solution. Color intensity represents Sortino Ratio (darker = higher). Rotate the chart to see trade-offs from different angles.</span>
+</h2>
+<div class="info-section">
+    <strong>Understanding Pareto Optimality:</strong> A solution is Pareto-optimal if no other solution is better in ALL objectives simultaneously. For example, Solution A might have higher Sortino but higher Drawdown than Solution B - both are Pareto-optimal. The selected solution (red diamond) has the highest Sortino among all Pareto solutions.
+</div>
+{pareto3d_div}
+<h2>Pareto Front 2D<span class="tooltip-icon">?</span>
+    <span class="tooltip">2D projections of the Pareto front showing pairwise relationships between objectives. These help identify trade-offs: (1) Sortino vs DD: Higher Sortino often comes with higher drawdown risk, (2) Sortino vs PF: Both should ideally be high, (3) DD vs PF: Lower drawdown may reduce profit factor. The red diamond is the selected solution.</span>
+</h2>
+<div class="info-section">
+    <strong>Trade-off Analysis:</strong> The 2D projections reveal relationships between objectives. A "knee" in the curve (where small improvement in one objective requires large sacrifice in another) often indicates a good compromise solution. Solutions in the upper-right regions (for maximization) or lower-left (for minimization) are generally preferred.
+</div>
+{pareto2d_div}
+<h2>Pareto Size<span class="tooltip-icon">?</span>
+    <span class="tooltip">Number of Pareto-optimal solutions found over generations. Generally increases over time as the GA explores the solution space. A large Pareto front (20+ solutions) indicates good diversity. A small front (1-5 solutions) may indicate premature convergence or limited solution space. Steady growth is healthy.</span>
+</h2>
+<div class="info-section">
+    <strong>Pareto Size Interpretation:</strong> Early generations typically have few Pareto solutions. As optimization progresses, more non-dominated solutions are discovered. If the size plateaus early, the GA may have converged. If it keeps growing, the solution space is rich with trade-offs.
+</div>
+{paretosize_div}
+<h2>All Solutions<span class="tooltip-icon">?</span>
+    <span class="tooltip">Complete list of all Pareto-optimal solutions ranked by Sortino Ratio. The selected solution is marked with ★. You can compare different solutions to see parameter variations. Higher-ranked solutions have better risk-adjusted returns, but may have different drawdown or profit factor characteristics.</span>
+</h2>
+<div class="info-section">
+    <strong>Solution Selection:</strong> While the highest Sortino solution is automatically selected, you may want to manually review other solutions. For example, if Solution #2 has similar Sortino but much lower drawdown, it might be a better choice for risk-averse trading. All solutions in this table are Pareto-optimal.
+</div>
+{pareto_table_html}
+<h2>In-Sample vs OOS Comparison<span class="tooltip-icon">?</span>
+    <span class="tooltip">Comparison of strategy performance between in-sample (training) and out-of-sample (validation) data. This is critical for detecting overfitting. Good generalization: IS and OOS metrics are similar. Overfitting: IS is much better than OOS. Green differences indicate OOS is better (good sign), red indicates OOS is worse (potential overfitting).</span>
+</h2>
+<div class="info-section">
+    <strong>Overfitting Detection:</strong> If OOS performance is significantly worse than IS, the strategy may be overfitted to the training data. Look for: (1) Sortino dropping >50% in OOS, (2) Drawdown increasing >100% in OOS, (3) Trade frequency dropping dramatically. Small differences (<20%) are normal and acceptable.
+</div>
+{comparison_html}
+{summary_html}
+</div>
+{conv_script}
+{pareto3d_script}
+{pareto2d_script}
+{paretosize_script}
+</body></html>"""
+    
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    # Auto-launch only if requested (first update or final update)
+    if auto_launch:
+        try:
+            webbrowser.open(f'file://{os.path.abspath(html_path)}')
+        except:
+            pass
 
 # ----------------------------------------------------------------------
 # Checkpoint Functions
@@ -559,10 +1170,50 @@ def main():
     # Load Parameters (only in main process, not in workers)
     param_dict, param_df = load_params(PARAM_CSV, return_dataframe=True)
     
-    # Print the exact parameter file that will be used
-    print("\n=== PARAMETER FILE USED (exact copy) ===")
-    print(param_df.to_string(index=False))
-    print("========================================\n")
+    # Print the exact parameter file that will be used (grouped)
+    print("\n=== PARAMETER FILE USED (grouped by category) ===")
+    
+    def group_and_print_params(param_df_local):
+        """Group and print parameters by category."""
+        groups = {
+            'Entry Criteria': ['Enable Long Trades', 'Enable Short Trades', 'Bollinger Band Length', 
+                              'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
+                              'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
+                              'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
+                              'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                              'Max Open Trades'],
+            'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
+                                    'ATR Length for TP', 'ATR Multiplier for TP'],
+            'Stop Loss Criteria': ['Initial Stop Loss (%)', 'Enable Trailing Stop', 
+                                  'ATR Length for Trailing Stop', 'ATR Multiplier for Trailing Stop',
+                                  'Trailing Delay (bars)'],
+            'GA Criteria': ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
+                           'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
+                           'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
+                           'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+        }
+        
+        # Filter out section headers
+        param_df_filtered = param_df_local[~param_df_local['Name'].str.startswith('===')]
+        
+        for group_name, param_list in groups.items():
+            group_df = param_df_filtered[param_df_filtered['Name'].isin(param_list)]
+            if not group_df.empty:
+                print(f"\n--- {group_name} ---")
+                print(group_df[['Name', 'Value', 'Min', 'Max', 'Type']].to_string(index=False))
+        
+        # Print any remaining parameters not in groups
+        all_grouped = []
+        for param_list in groups.values():
+            all_grouped.extend(param_list)
+        remaining = param_df_filtered[~param_df_filtered['Name'].isin(all_grouped + ['__indicatorName'])]
+        if not remaining.empty:
+            print(f"\n--- Other Parameters ---")
+            print(remaining[['Name', 'Value', 'Min', 'Max', 'Type']].to_string(index=False))
+    
+    group_and_print_params(param_df)
+    print("\n========================================\n")
     
     # Set GA configuration from parameters
     POP_SIZE = param_dict.get('POP_SIZE', {'value': 20})['value']
@@ -576,6 +1227,8 @@ def main():
     DD_WEIGHT = param_dict.get('DD_WEIGHT', {'value': 0.3})['value']
     DATA_SPLITS = param_dict.get('DATA_SPLITS', {'value': 0.7})['value']
     DATA_SIZE = param_dict.get('DATA_SIZE', {'value': 100000})['value']
+    USE_INTERLEAVED = param_dict.get('USE_INTERLEAVED_SPLIT', {'value': True})['value'] if 'USE_INTERLEAVED_SPLIT' in param_dict else True
+    NUM_PERIODS = param_dict.get('NUM_SPLIT_PERIODS', {'value': 5})['value'] if 'NUM_SPLIT_PERIODS' in param_dict else 5
     MIN_TRADES_DAY = param_dict.get('MIN_TRADES_DAY', {'value': 1.0})['value']
     MIN_TRADES_PEN_WEIGHT = param_dict.get('MIN_TRADES_PEN_WEIGHT', {'value': -100.0})['value']
     
@@ -604,8 +1257,55 @@ def main():
                      parse_dates=['datetime'], index_col='datetime')
     if DATA_SIZE > 0:
         df = df.tail(DATA_SIZE)
-    split = int(len(df) * DATA_SPLITS)
-    in_sample, oos = df.iloc[:split], df.iloc[split:]
+    
+    # Check if we should use interleaved periods or simple split
+    # USE_INTERLEAVED and NUM_PERIODS are already loaded above
+    if USE_INTERLEAVED and NUM_PERIODS > 1:
+        # Interleaved approach: Split into alternating IS/OOS periods
+        # Example with 5 periods: IS-OOS-IS-OOS-IS (3 IS, 2 OOS)
+        # This ensures the strategy is tested across different market conditions
+        print(f"\n=== Using Interleaved Data Split ===")
+        print(f"Number of periods: {NUM_PERIODS}")
+        print(f"Pattern: Alternating IS-OOS-IS-OOS...")
+        
+        # Ensure data is sorted by index (chronological order)
+        df = df.sort_index()
+        
+        period_size = len(df) // NUM_PERIODS
+        is_periods = []
+        oos_periods = []
+        
+        for i in range(NUM_PERIODS):
+            start_idx = i * period_size
+            end_idx = (i + 1) * period_size if i < NUM_PERIODS - 1 else len(df)
+            period = df.iloc[start_idx:end_idx].copy()
+            
+            # Alternate: even indices (0, 2, 4...) are IS, odd (1, 3, 5...) are OOS
+            if i % 2 == 0:
+                is_periods.append(period)
+                print(f"  Period {i+1}: IS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
+            else:
+                oos_periods.append(period)
+                print(f"  Period {i+1}: OOS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
+        
+        # Combine all IS periods and all OOS periods (will maintain chronological order)
+        in_sample = pd.concat(is_periods).sort_index() if is_periods else pd.DataFrame()
+        oos = pd.concat(oos_periods).sort_index() if oos_periods else pd.DataFrame()
+        
+        print(f"\nCombined IS: {len(in_sample):,} rows ({len(in_sample)/len(df)*100:.1f}%)")
+        print(f"  Date range: {in_sample.index[0]} to {in_sample.index[-1]}")
+        print(f"Combined OOS: {len(oos):,} rows ({len(oos)/len(df)*100:.1f}%)")
+        if len(oos) > 0:
+            print(f"  Date range: {oos.index[0]} to {oos.index[-1]}")
+        print("=" * 50)
+    else:
+        # Simple chronological split (original approach)
+        split = int(len(df) * DATA_SPLITS)
+        in_sample, oos = df.iloc[:split], df.iloc[split:]
+        print(f"\n=== Using Simple Chronological Split ===")
+        print(f"IS: {len(in_sample)} rows ({len(in_sample)/len(df)*100:.1f}%)")
+        print(f"OOS: {len(oos)} rows ({len(oos)/len(df)*100:.1f}%)")
+        print("=" * 50)
     
     # Try to load checkpoint
     checkpoint_data = load_checkpoint()
@@ -667,6 +1367,26 @@ def main():
     print(f"  Will run generations: {list(range(start_gen, NUM_GEN))}")
     print()
     
+    # Record start time (only if starting fresh or resuming from checkpoint)
+    # This allows time tracking across runs
+    if start_gen == 0 or not os.path.exists(START_TIME_FILE):
+        start_time = time.time()
+        with open(START_TIME_FILE, 'w') as f:
+            f.write(str(start_time))
+        print(f"Start time recorded: {datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        # If resuming, try to keep original start time, or update if file is missing
+        try:
+            with open(START_TIME_FILE, 'r') as f:
+                start_time = float(f.read().strip())
+            print(f"Resuming from previous run. Original start: {datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        except:
+            start_time = time.time()
+            with open(START_TIME_FILE, 'w') as f:
+                f.write(str(start_time))
+            print(f"Start time recorded: {datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+    
     # Main evolution loop with NSGA-II
     try:
         for gen in range(start_gen, NUM_GEN):
@@ -680,6 +1400,22 @@ def main():
             print(f"  Evaluating {len(offspring)} individuals in parallel ({NUM_WORKERS} workers)...")
             try:
                 fits = parallel_evaluate(offspring, in_sample, param_dict, param_keys)
+                
+                # Diagnostic: Check if all solutions are getting penalized
+                penalty_count = sum(1 for f in fits if f[0] < 0)  # Count negative Sortino (penalties)
+                if penalty_count == len(fits) and gen % 5 == 0:  # Only print every 5 generations to avoid spam
+                    print(f"  ⚠️  WARNING: All {len(fits)} solutions are getting penalized (likely failing MIN_TRADES_DAY={MIN_TRADES_DAY})")
+                    # Sample a few to see what avg_trades_day values are
+                    sample_indices = [0, len(fits)//4, len(fits)//2]
+                    for idx in sample_indices:
+                        sample_params = dict(zip(param_keys, offspring[idx]))
+                        # Run a quick diagnostic
+                        sample_metrics = run_backtest(sample_params, in_sample, param_dict, suppress_output=True)
+                        trades_df = sample_metrics.get('trades_df', pd.DataFrame())
+                        total_trades = len(trades_df)
+                        days = (trades_df['exit_time'].max() - trades_df['entry_time'].min()).days if not trades_df.empty and len(trades_df) > 1 else 0
+                        print(f"    Sample {idx}: avg_trades_day={sample_metrics['avg_trades_day']:.3f}, "
+                              f"total_trades={total_trades}, days={days}")
             except KeyboardInterrupt:
                 print("\n\nInterrupted during evaluation. Saving checkpoint...")
                 save_checkpoint(pop, hof, logbook, gen, current_config)
@@ -715,7 +1451,7 @@ def main():
                     ind.fitness.values = (-1000.0, 100000.0, 0.0)
                 elif len(ind.fitness.values) != 3:
                     # Wrong fitness format - this shouldn't happen but handle it
-                    logging.warning(f"Individual has {len(ind.fitness.values)} fitness values, expected 3. Assigning poor fitness.")
+                    print(f"WARNING: Individual has {len(ind.fitness.values)} fitness values, expected 3. Assigning poor fitness.")
                     ind.fitness.values = (-1000.0, 100000.0, 0.0)
             
             # Select next generation using NSGA-II
@@ -732,8 +1468,63 @@ def main():
             print(f"{gen}\t{len(pop)}\t{round(record['avg_sortino'], 4)}\t{round(record['avg_dd'], 2)}\t{round(record['avg_pf'], 4)}\t{len(hof)}")
             print(f"  Best: Sortino={round(record['max_sortino'], 4)}, DD={round(record['min_dd'], 2)}, PF={round(record['max_pf'], 4)}")
             
+            # Diagnostic: If all solutions are penalized, show more info
+            if record['max_sortino'] < 0 and gen % 5 == 0:  # Only print every 5 generations
+                print(f"  ⚠️  All solutions appear to be penalized (Sortino < 0)")
+                print(f"     This suggests MIN_TRADES_DAY constraint ({MIN_TRADES_DAY}) may be too strict")
+                print(f"     Consider reducing MIN_TRADES_DAY in the parameter CSV or relaxing filters")
+            
             # Save checkpoint after each generation
             save_checkpoint(pop, hof, logbook, gen, current_config)
+            
+            # Update HTML dashboard after each generation (with progress info)
+            # Select best solution for display (highest Sortino)
+            if len(hof) > 0:
+                best_for_display = max(hof, key=lambda ind: ind.fitness.values[0])
+                best_params_display = dict(zip(param_keys, best_for_display))
+                # Clamp parameters
+                for n, v in best_params_display.items():
+                    if n in param_dict:
+                        mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
+                        v = max(mn, min(v, mx))
+                        if typ == 'int':
+                            best_params_display[n] = int(round(v))
+                        else:
+                            best_params_display[n] = float(v)
+                best_fitness_display = best_for_display.fitness.values
+            else:
+                # No solutions yet - use placeholder
+                best_for_display = None
+                best_params_display = {}
+                best_fitness_display = (0.0, 0.0, 0.0)
+            
+            # For intermediate generations, use placeholder data (will be updated at end)
+            is_res_display = {'sortino': best_fitness_display[0], 'max_drawdown': best_fitness_display[1], 
+                             'profit_factor': best_fitness_display[2], 'avg_trades_day': 0}
+            oos_res_display = {'sortino': 0, 'max_drawdown': 0, 'profit_factor': 0, 'avg_trades_day': 0}
+            trades_is_display = pd.DataFrame()
+            trades_oos_display = pd.DataFrame()
+            
+            # Auto-launch on first generation only (gen == start_gen means first generation of this run)
+            auto_launch_now = (gen == start_gen)
+            
+            try:
+                generate_html_dashboard(
+                    hof, best_for_display, best_params_display, best_fitness_display,
+                    param_keys, param_dict, logbook,
+                    is_res_display, oos_res_display, trades_is_display, trades_oos_display,
+                    HTML_DASHBOARD, DIAG_DIR,
+                    current_gen=gen + 1, total_gen=NUM_GEN, is_final=False, auto_launch=auto_launch_now
+                )
+                if auto_launch_now:
+                    print(f"  HTML Dashboard updated and opened → {HTML_DASHBOARD}")
+                else:
+                    print(f"  HTML Dashboard updated → {HTML_DASHBOARD}")
+            except Exception as e:
+                print(f"  WARNING: Failed to update HTML dashboard: {e}")
+                import traceback
+                traceback.print_exc()
+            
             print(f"Generation {gen} completed.\n")
             
     except KeyboardInterrupt:
@@ -763,15 +1554,73 @@ def main():
     # Select best solution from Pareto front
     # Strategy: Choose solution with highest Sortino Ratio (primary objective)
     best = max(hof, key=lambda ind: ind.fitness.values[0])
-    best_params = dict(zip(param_keys, best))
+    
+    # Clamp and format best parameters properly
+    best_params_raw = dict(zip(param_keys, best))
+    best_params = {}
+    for n, v in best_params_raw.items():
+        mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
+        v = max(mn, min(v, mx))  # Clamp to valid range
+        if typ == 'int':
+            best_params[n] = int(round(v))
+        else:
+            best_params[n] = float(v)
+    
+    # Ensure critical integer parameters are properly set
+    if 'Bollinger Band Length' in best_params:
+        best_params['Bollinger Band Length'] = max(1, int(round(best_params['Bollinger Band Length'])))
+    if 'ATR Length for Trailing Stop' in best_params:
+        best_params['ATR Length for Trailing Stop'] = max(1, int(round(best_params['ATR Length for Trailing Stop'])))
+    if 'ATR Length for TP' in best_params:
+        best_params['ATR Length for TP'] = max(1, int(round(best_params['ATR Length for TP'])))
+    if 'Trailing Delay (bars)' in best_params:
+        best_params['Trailing Delay (bars)'] = max(0, int(round(best_params['Trailing Delay (bars)'])))
+    if 'Timeframe (minutes)' in best_params:
+        best_params['Timeframe (minutes)'] = max(1, int(round(best_params['Timeframe (minutes)'])))
+    if 'Max Open Trades' in best_params:
+        best_params['Max Open Trades'] = max(1, int(round(best_params['Max Open Trades'])))
+    
     best_fitness = best.fitness.values
     
     print("\n=== BEST SOLUTION FROM PARETO FRONT ===")
     print(f"Selected based on highest Sortino Ratio")
     print(f"Fitness: Sortino={best_fitness[0]:.4f}, MaxDD={best_fitness[1]:.2f}, PF={best_fitness[2]:.4f}")
-    print(f"Parameters:")
-    for k, v in best_params.items():
-        print(f"  {k}: {round(v, 4) if isinstance(v, float) else v}")
+    print(f"Parameters (grouped by category):")
+    
+    # Group parameters for display
+    def group_params_for_display(params_dict_local):
+        """Group parameters into logical categories."""
+        groups = {
+            'Entry Criteria': ['Enable Long Trades', 'Enable Short Trades', 'Bollinger Band Length', 
+                              'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
+                              'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
+                              'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
+                              'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                              'Max Open Trades'],
+            'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
+                                    'ATR Length for TP', 'ATR Multiplier for TP'],
+            'Stop Loss Criteria': ['Initial Stop Loss (%)', 'Enable Trailing Stop', 
+                                  'ATR Length for Trailing Stop', 'ATR Multiplier for Trailing Stop',
+                                  'Trailing Delay (bars)'],
+            'GA Criteria': ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
+                           'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
+                           'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
+                           'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+        }
+        
+        grouped = {}
+        for group_name, param_list in groups.items():
+            grouped[group_name] = {k: v for k, v in params_dict_local.items() if k in param_list}
+        
+        return grouped
+    
+    grouped_params = group_params_for_display(best_params)
+    for group_name, params in grouped_params.items():
+        if params:
+            print(f"\n  {group_name}:")
+            for k, v in params.items():
+                print(f"    {k}: {round(v, 4) if isinstance(v, float) else v}")
     
     print(f"\n=== PARETO FRONT SUMMARY ===")
     print(f"Total Pareto-optimal solutions: {len(hof)}")
@@ -963,12 +1812,34 @@ def main():
             print("OOS equity is suspicious (straight line) - no trades or zero variation")
     
     # ------------------------------------------------------------------
-    # Write optimized CSV
+    # Generate Interactive HTML Dashboard
+    # ------------------------------------------------------------------
+    print("\n=== Generating Interactive HTML Dashboard ===")
+    # Generate final HTML dashboard with complete results
+    generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict, 
+                            logbook, is_res, oos_res, trades_is, trades_oos,
+                            HTML_DASHBOARD, DIAG_DIR,
+                            current_gen=NUM_GEN, total_gen=NUM_GEN, is_final=True, auto_launch=True)
+    print(f"HTML Dashboard (FINAL) → {HTML_DASHBOARD}")
+    
+    # Clean up start time file after completion
+    if os.path.exists(START_TIME_FILE):
+        try:
+            os.remove(START_TIME_FILE)
+            print("Start time file cleaned up.")
+        except:
+            pass
+    
+    # ------------------------------------------------------------------
+    # Write optimized CSV (maintains grouping structure)
     # ------------------------------------------------------------------
     for name, val in best_params.items():
-        idx = param_df[param_df['Name'] == name].index[0]
-        typ = param_dict[name]['type']
-        param_df.at[idx, 'Value'] = int(val) if typ == 'int' else round(val, 4)
+        # Find the parameter in the dataframe (skip section headers)
+        matching_rows = param_df[param_df['Name'] == name]
+        if not matching_rows.empty:
+            idx = matching_rows.index[0]
+            typ = param_dict[name]['type']
+            param_df.at[idx, 'Value'] = int(val) if typ == 'int' else round(val, 4)
     param_df.to_csv(OUTPUT_CSV, index=False)
     print(f"Optimized CSV → {OUTPUT_CSV}")
     

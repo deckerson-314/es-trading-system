@@ -26,6 +26,11 @@ def load_params(csv_path, return_dataframe=False):
     
     for _, r in df.iterrows():
         name = r['Name'].strip()
+        
+        # Skip section headers (lines starting with ===)
+        if name.startswith('==='):
+            continue
+        
         val = r['Value']
         mn = r.get('Min', None)
         mx = r.get('Max', None)
