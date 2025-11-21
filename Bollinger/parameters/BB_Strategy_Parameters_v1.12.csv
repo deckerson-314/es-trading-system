@@ -7,10 +7,10 @@ Bollinger Band Length,30,20,100,int,Lookback period for BB
 Bollinger Band StdDev,2.0,1.5,3.0,float,StdDev multiplier for BB width
 Long Entry on Wick Touch,false,false,true,bool,Enter if low touches lower band
 Long Entry on Body in Zone,true,false,true,bool,Enter if close ≤ lower band
-Long Trigger (% From Lower Band),0.0,0.0,2.0,float,% below lower band to trigger
+Long Trigger (% From Lower Band),0.0,0.1,2.0,float,% below lower band to trigger (min 0.1% to avoid band extremes)
 Short Entry on Wick Touch,false,false,true,bool,Enter if high touches upper band
 Short Entry on Body in Zone,true,false,true,bool,Enter if close ≥ upper band
-Short Trigger (% From Upper Band),0.0,0.0,2.0,float,% above upper band to trigger
+Short Trigger (% From Upper Band),0.0,0.1,2.0,float,% above upper band to trigger (min 0.1% to avoid band extremes)
 Min ATR Filter (Points),0.5,0,10,float,Minimum ATR value to allow entries - lower default for more opportunities
 RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
 RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end

@@ -159,7 +159,14 @@ class StatusTimer:
             pos_unrealized = 0
             for pos in es_positions:
                 if pos.contract.conId == contract.conId:
-                    pos_unrealized = pos.unrealizedPNL
+                    # Try to get unrealized PNL with fallbacks
+                    pos_unrealized = getattr(pos, 'unrealizedPNL', None)
+                    if pos_unrealized is None:
+                        pos_unrealized = getattr(pos, 'unrealizedPnl', None)
+                    if pos_unrealized is None:
+                        pos_unrealized = getattr(pos, 'unrealized_pnl', None)
+                    if pos_unrealized is None:
+                        pos_unrealized = 0  # Default to 0 if not available
                     break
             
             # Calculate price change
@@ -271,6 +278,25 @@ contract = None
 disconnect_start_time = None  # Timestamp when disconnect was first detected
 disconnect_email_sent = False  # Flag to prevent spam - only send one email per disconnect
 DISCONNECT_ALERT_THRESHOLD = 30  # Send email if disconnected for more than 30 seconds
+
+# Dashboard tracking variables
+connection_start_time = None  # When connection was established
+total_uptime_seconds = 0  # Cumulative uptime
+last_disconnect_time = None  # Last disconnect timestamp
+error_log = []  # List of recent errors (max 100)
+dashboard_stats = {
+    'trades_opened': 0,
+    'trades_closed': 0,
+    'orders_placed': 0,
+    'orders_filled': 0,
+    'orders_cancelled': 0,
+    'reconnections': 0,
+    'last_update': None
+}
+live_tracker = []  # List of recent events (max 200)
+HTML_DASHBOARD = 'ib_deployment_dashboard.html'
+WEB_DIR = os.path.join(os.getcwd(), 'web')  # Common web directory
+WEB_DASHBOARD = os.path.join(WEB_DIR, 'ib_deployment_dashboard.html')
 
 # Define helper functions
 def send_email(subject, body):
@@ -442,8 +468,27 @@ def get_account_summary():
         # Get positions for PNL calculation
         positions_list = ib.positions()
         es_positions = [p for p in positions_list if p.contract.symbol == 'ES']
-        total_unrealized_pnl = sum(p.unrealizedPNL for p in es_positions)
-        total_realized_pnl = sum(p.realizedPNL for p in es_positions)
+        # Calculate PNL with fallbacks for different attribute names
+        total_unrealized_pnl = 0
+        total_realized_pnl = 0
+        for p in es_positions:
+            unrealized = getattr(p, 'unrealizedPNL', None)
+            if unrealized is None:
+                unrealized = getattr(p, 'unrealizedPnl', None)
+            if unrealized is None:
+                unrealized = getattr(p, 'unrealized_pnl', None)
+            if unrealized is None:
+                unrealized = 0
+            total_unrealized_pnl += unrealized
+            
+            realized = getattr(p, 'realizedPNL', None)
+            if realized is None:
+                realized = getattr(p, 'realizedPnl', None)
+            if realized is None:
+                realized = getattr(p, 'realized_pnl', None)
+            if realized is None:
+                realized = 0
+            total_realized_pnl += realized
         
         summary['UnrealizedPNL'] = total_unrealized_pnl
         summary['RealizedPNL'] = total_realized_pnl
@@ -468,6 +513,412 @@ def format_duration(seconds):
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         return f"{hours}h {minutes}m"
+
+def add_to_live_tracker(event_type, message):
+    """Add an event to the live tracker."""
+    global live_tracker
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    live_tracker.append({
+        'timestamp': timestamp,
+        'type': event_type,  # 'info', 'warning', 'error', 'trade', 'order'
+        'message': message
+    })
+    # Keep only last 200 entries
+    if len(live_tracker) > 200:
+        live_tracker = live_tracker[-200:]
+
+def add_error(error_msg):
+    """Add an error to the error log."""
+    global error_log
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    error_log.append({
+        'timestamp': timestamp,
+        'error': error_msg
+    })
+    # Keep only last 100 errors
+    if len(error_log) > 100:
+        error_log = error_log[-100:]
+
+def generate_dashboard_html():
+    """Generate the live trading dashboard HTML."""
+    global connection_start_time, total_uptime_seconds, dashboard_stats, error_log, live_tracker, params_dict, ib, contract, data
+    
+    # Calculate connection uptime
+    current_uptime = 0
+    is_connected = False
+    try:
+        is_connected = ib.isConnected()
+    except:
+        pass
+    
+    if connection_start_time and is_connected:
+        current_uptime = (datetime.now() - connection_start_time).total_seconds()
+    total_uptime = total_uptime_seconds + current_uptime
+    
+    # Get current account info
+    account = {}
+    try:
+        account = get_account_summary()
+    except Exception as e:
+        logging.debug(f"Error getting account summary: {e}")
+    
+    # Get current positions
+    es_positions = []
+    try:
+        if is_connected:
+            positions_list = ib.positions()
+            es_positions = [p for p in positions_list if p.contract.conId == contract.conId] if contract else []
+    except Exception as e:
+        logging.debug(f"Error getting positions: {e}")
+    
+    # Get active orders
+    active_orders = []
+    try:
+        if is_connected:
+            for trade in ib.trades():
+                if contract and trade.contract.conId == contract.conId:
+                    if trade.isActive() or (trade.orderStatus and 
+                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                        order = trade.order
+                        order_type = type(order).__name__
+                        if 'Market' in order_type:
+                            order_type = "MKT"
+                        elif 'Stop' in order_type:
+                            order_type = "STP"
+                        elif 'Limit' in order_type:
+                            order_type = "LMT"
+                        active_orders.append({
+                            'orderId': order.orderId,
+                            'permId': order.permId,
+                            'type': order_type,
+                            'action': order.action,
+                            'qty': order.totalQuantity,
+                            'limit': getattr(order, 'lmtPrice', None),
+                            'stop': getattr(order, 'auxPrice', getattr(order, 'stopPrice', None)),
+                            'status': trade.orderStatus.status if trade.orderStatus else "Unknown"
+                        })
+    except Exception as e:
+        logging.debug(f"Error getting orders: {e}")
+    
+    # Get current market data
+    current_price = 0
+    try:
+        if len(data) > 0:
+            current_price = data['close'].iloc[-1]
+    except:
+        pass
+    
+    # Generate HTML
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>IB Deployment Live Dashboard</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 1600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }}
+        h2 {{ color: #555; margin-top: 30px; border-bottom: 2px solid #ddd; padding-bottom: 5px; }}
+        h3 {{ color: #666; margin-top: 20px; }}
+        .status-bar {{ background: {'#4CAF50' if ib.isConnected() else '#f44336'}; color: white; padding: 15px; border-radius: 5px; margin: 20px 0; }}
+        .status-bar.disconnected {{ background: #f44336; }}
+        .metric-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
+        .metric-box {{ background: #e3f2fd; border-left: 4px solid #2196F3; padding: 15px; border-radius: 4px; }}
+        .metric-box .label {{ font-size: 0.9em; color: #666; }}
+        .metric-box .value {{ font-size: 1.5em; font-weight: bold; color: #2196F3; margin-top: 5px; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+        th {{ background: #4CAF50; color: white; padding: 10px; text-align: left; }}
+        td {{ padding: 8px; border: 1px solid #ddd; }}
+        tr:nth-child(even) {{ background: #f9f9f9; }}
+        .positive {{ color: green; font-weight: bold; }}
+        .negative {{ color: red; font-weight: bold; }}
+        .live-tracker {{ max-height: 400px; overflow-y: auto; background: #f9f9f9; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }}
+        .live-tracker .entry {{ padding: 5px; margin: 2px 0; border-left: 3px solid #ddd; }}
+        .live-tracker .entry.info {{ border-left-color: #2196F3; }}
+        .live-tracker .entry.warning {{ border-left-color: #FF9800; }}
+        .live-tracker .entry.error {{ border-left-color: #f44336; }}
+        .live-tracker .entry.trade {{ border-left-color: #4CAF50; }}
+        .live-tracker .entry.order {{ border-left-color: #9C27B0; }}
+        .error-log {{ max-height: 300px; overflow-y: auto; background: #ffebee; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.85em; }}
+        .error-entry {{ padding: 5px; margin: 2px 0; color: #c62828; }}
+        .params-section {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }}
+        .params-group {{ background: #f9f9f9; padding: 15px; border-radius: 4px; }}
+        .params-group h3 {{ margin-top: 0; color: #555; border-bottom: 1px solid #ddd; padding-bottom: 5px; }}
+        .params-table {{ width: 100%; font-size: 0.9em; }}
+        .params-table td {{ padding: 5px; }}
+        .return-button {{ display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }}
+        .return-button:hover {{ background: #5568d3; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="index.html" class="return-button">← Back to Main Dashboard</a>
+        <h1>IB Deployment Live Trading Dashboard</h1>
+        <p><strong>Last Updated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        
+        <div class="status-bar {'disconnected' if not is_connected else ''}">
+            <h2 style="margin: 0; color: white;">Connection Status: {'CONNECTED' if is_connected else 'DISCONNECTED'}</h2>
+            <p style="margin: 5px 0 0 0;">
+                <strong>Total Uptime:</strong> {format_duration(total_uptime)} | 
+                <strong>Current Session:</strong> {format_duration(current_uptime) if connection_start_time and ib.isConnected() else 'N/A'} |
+                <strong>Reconnections:</strong> {dashboard_stats['reconnections']}
+            </p>
+        </div>
+        
+        <h2>Account Summary</h2>
+        <div class="metric-grid">
+            <div class="metric-box">
+                <div class="label">Net Liquidation</div>
+                <div class="value">${account.get('NetLiquidation', 0):,.2f}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Total Cash</div>
+                <div class="value">${account.get('TotalCashValue', 0):,.2f}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Buying Power</div>
+                <div class="value">${account.get('BuyingPower', 0):,.2f}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Unrealized PNL</div>
+                <div class="value {'positive' if account.get('UnrealizedPNL', 0) >= 0 else 'negative'}">
+                    ${account.get('UnrealizedPNL', 0):,.2f}
+                </div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Realized PNL</div>
+                <div class="value {'positive' if account.get('RealizedPNL', 0) >= 0 else 'negative'}">
+                    ${account.get('RealizedPNL', 0):,.2f}
+                </div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Open ES Positions</div>
+                <div class="value">{len(es_positions)}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Current Price</div>
+                <div class="value">${current_price:.2f}</div>
+            </div>
+        </div>
+        
+        <h2>Active Positions</h2>
+"""
+    
+    if es_positions:
+        html += """        <table>
+            <thead>
+                <tr>
+                    <th>Direction</th>
+                    <th>Size</th>
+                    <th>Avg Price</th>
+                    <th>Current Price</th>
+                    <th>Unrealized PNL</th>
+                    <th>Realized PNL</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        for pos in es_positions:
+            direction = 'LONG' if pos.position > 0 else 'SHORT'
+            # Try to get average cost - Position object may have different attribute names
+            avg_price = 0
+            try:
+                # Try common attribute names
+                avg_price = getattr(pos, 'averageCost', None)
+                if avg_price is None:
+                    avg_price = getattr(pos, 'avgCost', None)
+                if avg_price is None:
+                    avg_price = getattr(pos, 'averagePrice', None)
+                if avg_price is None:
+                    # Calculate from market value if available
+                    if hasattr(pos, 'marketValue') and hasattr(pos, 'position') and pos.position != 0:
+                        avg_price = abs(pos.marketValue / pos.position)
+                if avg_price is None or avg_price == 0:
+                    avg_price = current_price  # Fallback to current price
+            except:
+                avg_price = current_price  # Fallback to current price
+            
+            # Get PNL values with fallbacks
+            unrealized_pnl = getattr(pos, 'unrealizedPNL', None)
+            if unrealized_pnl is None:
+                unrealized_pnl = getattr(pos, 'unrealizedPnl', None)
+            if unrealized_pnl is None:
+                unrealized_pnl = getattr(pos, 'unrealized_pnl', None)
+            if unrealized_pnl is None:
+                unrealized_pnl = 0
+            
+            realized_pnl = getattr(pos, 'realizedPNL', None)
+            if realized_pnl is None:
+                realized_pnl = getattr(pos, 'realizedPnl', None)
+            if realized_pnl is None:
+                realized_pnl = getattr(pos, 'realized_pnl', None)
+            if realized_pnl is None:
+                realized_pnl = 0
+            
+            html += f"""                <tr>
+                    <td>{direction}</td>
+                    <td>{abs(pos.position)}</td>
+                    <td>${avg_price:.2f}</td>
+                    <td>${current_price:.2f}</td>
+                    <td class="{'positive' if unrealized_pnl >= 0 else 'negative'}">${unrealized_pnl:,.2f}</td>
+                    <td class="{'positive' if realized_pnl >= 0 else 'negative'}">${realized_pnl:,.2f}</td>
+                </tr>
+"""
+        html += """            </tbody>
+        </table>
+"""
+    else:
+        html += """        <p><em>No open positions</em></p>
+"""
+    
+    html += f"""
+        <h2>Active Orders</h2>
+"""
+    if active_orders:
+        html += """        <table>
+            <thead>
+                <tr>
+                    <th>Order ID</th>
+                    <th>Type</th>
+                    <th>Action</th>
+                    <th>Quantity</th>
+                    <th>Limit Price</th>
+                    <th>Stop Price</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        for order in active_orders:
+            limit_str = f"${order['limit']:.2f}" if order['limit'] else "N/A"
+            stop_str = f"${order['stop']:.2f}" if order['stop'] else "N/A"
+            html += f"""                <tr>
+                    <td>{order['orderId']}</td>
+                    <td>{order['type']}</td>
+                    <td>{order['action']}</td>
+                    <td>{order['qty']}</td>
+                    <td>{limit_str}</td>
+                    <td>{stop_str}</td>
+                    <td>{order['status']}</td>
+                </tr>
+"""
+        html += """            </tbody>
+        </table>
+"""
+    else:
+        html += """        <p><em>No active orders</em></p>
+"""
+    
+    html += f"""
+        <h2>Statistics</h2>
+        <div class="metric-grid">
+            <div class="metric-box">
+                <div class="label">Trades Opened</div>
+                <div class="value">{dashboard_stats['trades_opened']}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Trades Closed</div>
+                <div class="value">{dashboard_stats['trades_closed']}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Orders Placed</div>
+                <div class="value">{dashboard_stats['orders_placed']}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Orders Filled</div>
+                <div class="value">{dashboard_stats['orders_filled']}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Orders Cancelled</div>
+                <div class="value">{dashboard_stats['orders_cancelled']}</div>
+            </div>
+        </div>
+        
+        <h2>Recent Errors</h2>
+"""
+    if error_log:
+        html += """        <div class="error-log">
+"""
+        for error in error_log[-20:]:  # Show last 20 errors
+            html += f"""            <div class="error-entry">
+                <strong>{error['timestamp']}</strong>: {error['error']}
+            </div>
+"""
+        html += """        </div>
+"""
+    else:
+        html += """        <p><em>No errors recorded</em></p>
+"""
+    
+    html += f"""
+        <h2>Strategy Parameters</h2>
+        <div class="params-section">
+"""
+    
+    # Group parameters for display
+    grouped_params = group_params_for_display(params_dict)
+    for group_name, params in grouped_params.items():
+        if params:
+            html += f"""            <div class="params-group">
+                <h3>{group_name}</h3>
+                <table class="params-table">
+"""
+            for name in sorted(params.keys()):
+                value_dict = params[name]
+                value = value_dict['value']
+                # Format value based on type
+                if value_dict.get('type') == 'bool':
+                    value_str = 'True' if value else 'False'
+                elif value_dict.get('type') == 'float':
+                    value_str = f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
+                elif value_dict.get('type') == 'int':
+                    value_str = str(int(value)) if isinstance(value, (int, float)) else str(value)
+                else:
+                    value_str = str(value)
+                
+                html += f"""                    <tr>
+                        <td><strong>{name}</strong></td>
+                        <td>{value_str}</td>
+                    </tr>
+"""
+            html += """                </table>
+            </div>
+"""
+    
+    html += """        </div>
+        
+        <h2>Live Event Tracker</h2>
+        <div class="live-tracker">
+"""
+    
+    # Show last 100 events
+    for event in live_tracker[-100:]:
+        html += f"""            <div class="entry {event['type']}">
+                <strong>{event['timestamp']}</strong> [{event['type'].upper()}] {event['message']}
+            </div>
+"""
+    
+    html += """        </div>
+    </div>
+</body>
+</html>
+"""
+    
+    return html
+
+def update_dashboard():
+    """Update the dashboard HTML file."""
+    try:
+        html = generate_dashboard_html()
+        # Write directly to web directory as primary location
+        os.makedirs(WEB_DIR, exist_ok=True)
+        with open(WEB_DASHBOARD, 'w', encoding='utf-8') as f:
+            f.write(html)
+        logging.info(f"Dashboard saved to web directory: {WEB_DASHBOARD}")
+        
+        dashboard_stats['last_update'] = datetime.now()
+    except Exception as e:
+        logging.error(f"Failed to update dashboard: {e}")
 
 def get_front_es_contract():
     for attempt in range(3):
@@ -801,6 +1252,9 @@ def check_entries(idx, latest_row):
     msg = "\n".join(msg_lines)
     send_email("BB Strategy - Trade OPEN", msg)
     logging.info(msg.replace('\n', ' | '))
+    dashboard_stats['trades_opened'] += 1
+    dashboard_stats['orders_placed'] += 3 if tp is not None else 2  # Entry + SL + TP (if exists)
+    add_to_live_tracker('trade', f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} {qty} @ ${entry_price:.2f}, SL: ${stop_price:.2f}, TP: ${tp:.2f}" if tp else f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} {qty} @ ${entry_price:.2f}, SL: ${stop_price:.2f}")
     
     if len(positions) == 1:
         status_timer.start()
@@ -947,6 +1401,9 @@ def check_exits(idx, latest_row):
                             msg = "\n".join(msg_lines)
                             send_email("BB Strategy - Trade CLOSE", msg)
                             logging.info(msg.replace('\n', ' | '))
+                            dashboard_stats['trades_closed'] += 1
+                            dashboard_stats['orders_filled'] += 1
+                            add_to_live_tracker('trade', f"TRADE CLOSE (Manual): {'LONG' if actual_direction==1 else 'SHORT'} {actual_qty} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
                         except Exception as e:
                             logging.warning(f"Error sending close email: {e}")
                         
@@ -1120,6 +1577,8 @@ def check_exits(idx, latest_row):
                                 ib.cancelOrder(stop_order)
                                 ib.sleep(0.5)
                                 logging.info(f"Cancelled old stop order at {current_stop:.2f}")
+                                dashboard_stats['orders_cancelled'] += 1
+                                add_to_live_tracker('order', f"Trailing stop updated: cancelled old stop @ ${current_stop:.2f}, placed new stop @ ${new_stop:.2f}")
                             except Exception as e:
                                 logging.warning(f"Error cancelling old stop order (new one is active): {e}")
                                 # Check if old order was auto-cancelled by IB
@@ -1563,6 +2022,9 @@ def check_exits(idx, latest_row):
             msg = "\n".join(msg_lines)
             send_email("BB Strategy - Trade CLOSE", msg)
             logging.info(msg.replace('\n', ' | '))
+            dashboard_stats['trades_closed'] += 1
+            dashboard_stats['orders_filled'] += 1  # Exit order filled
+            add_to_live_tracker('trade', f"TRADE CLOSE: {'LONG' if dir_==1 else 'SHORT'} {qty} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}, Reason: {reason}")
             
             # Cancel any orphaned orders from this bracket (e.g., standalone stop orders from trailing updates)
             try:
@@ -1889,8 +2351,11 @@ def check_and_recreate_tp_orders():
     """
     global positions, contract, strategy, data
     
-    if contract is None or not positions:
+    if contract is None:
         return
+    
+    # Note: We allow checking even if positions list is empty, because we might need
+    # to create a bracket for an existing position that wasn't tracked
     
     # First, check if we have an actual open position
     es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
@@ -1902,10 +2367,63 @@ def check_and_recreate_tp_orders():
         positions.clear()
         return
     
-    # Check if we're at max positions
-    if len(positions) >= strategy.max_open_trades:
-        logging.warning(f"Already at max positions ({strategy.max_open_trades}). Skipping TP recreation.")
-        return
+    # Note: We don't check max_open_trades here because we're just adding TP orders
+    # to existing positions, not opening new ones. The max_open_trades limit only
+    # applies to opening new positions, not to adding protective orders.
+    
+    # If we have an open position but no tracked brackets, we need to create a bracket
+    # This handles cases where the position exists but wasn't tracked (e.g., from a previous run)
+    if has_open_position and len(positions) == 0:
+        logging.warning("Open position found but no tracked brackets. Creating bracket for existing position...")
+        # Get the position details
+        for pos in es_positions:
+            if abs(pos.position) > 0:
+                direction = 1 if pos.position > 0 else -1
+                qty = abs(pos.position)
+                
+                # Try to get entry price
+                entry_price = getattr(pos, 'averageCost', None)
+                if entry_price is None:
+                    entry_price = getattr(pos, 'avgCost', None)
+                if entry_price is None:
+                    entry_price = getattr(pos, 'averagePrice', None)
+                if entry_price is None or entry_price == 0:
+                    if len(data) > 0:
+                        entry_price = data['close'].iloc[-1]
+                    else:
+                        logging.error("Cannot create bracket - no entry price available")
+                        continue
+                
+                # Create a dummy bracket for tracking
+                dummy_entry = MarketOrder(action='BUY' if direction == 1 else 'SELL', totalQuantity=qty)
+                dummy_entry.orderId = 0
+                dummy_entry.permId = 0
+                
+                # Find the stop order if it exists
+                stop_order = None
+                for trade in ib.trades():
+                    if (trade.contract.conId == contract.conId and trade.isActive()):
+                        order = trade.order
+                        is_stop = (isinstance(order, StopOrder) or 
+                                  (hasattr(order, 'auxPrice') and order.auxPrice > 0 and 
+                                   hasattr(order, 'lmtPrice') and order.lmtPrice == 0))
+                        if is_stop and abs(order.totalQuantity) == qty:
+                            order_dir = 1 if order.action == 'SELL' else -1
+                            if order_dir == direction:
+                                stop_order = order
+                                break
+                
+                bracket = {
+                    'entry': dummy_entry,
+                    'stopLoss': stop_order,
+                    'takeProfit': None,  # Will be created below
+                    'direction': direction,
+                    'entry_price': entry_price,
+                    'entry_time': datetime.now()  # Approximate
+                }
+                positions.append(bracket)
+                logging.info(f"Created tracking bracket for existing position: {direction} {qty} @ ${entry_price:.2f}")
+                break
     
     for bracket in positions[:]:  # Use slice to allow safe removal
         tp_order = bracket.get('takeProfit')
@@ -1931,8 +2449,8 @@ def check_and_recreate_tp_orders():
             continue
         
         # Check if TP should exist (based on strategy - if TP is enabled)
-        # TP is enabled if fixed_atr_tp or fixed_bb_entry_tp is True
-        if not (strategy.fixed_atr_tp or strategy.fixed_bb_entry_tp):
+        # TP is enabled if fixed_atr_tp, fixed_bb_entry_tp, or opposite_bb_tp is True
+        if not (strategy.fixed_atr_tp or strategy.fixed_bb_entry_tp or strategy.opposite_bb_tp):
             continue  # Strategy doesn't use TP
         
         # Check if TP order exists and is active
@@ -1945,11 +2463,13 @@ def check_and_recreate_tp_orders():
                     if trade.isActive() or (trade.orderStatus and 
                         trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
                         tp_active = True
+                        logging.debug(f"TP order found active: PermID={tp_order.permId}, Status={trade.orderStatus.status if trade.orderStatus else 'Unknown'}")
                     break
         
         if not tp_active:
             # TP is missing - need to recreate it
-            logging.warning(f"TP order missing for {'LONG' if direction == 1 else 'SHORT'} position. Attempting to recreate...")
+            logging.warning(f"TP order missing for {'LONG' if direction == 1 else 'SHORT'} position (size={position_size}). Attempting to recreate...")
+            logging.info(f"TP enabled check: fixed_atr_tp={strategy.fixed_atr_tp}, fixed_bb_entry_tp={strategy.fixed_bb_entry_tp}, opposite_bb_tp={strategy.opposite_bb_tp}")
             
             # Get entry price from position or bracket
             entry_order = bracket.get('entry')
@@ -1964,11 +2484,21 @@ def check_and_recreate_tp_orders():
                             entry_price = trade.fills[0].execution.price
                             break
             
-            # Fallback: get from position average cost
-            if entry_price is None:
-                es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
-                if es_positions:
-                    entry_price = es_positions[0].averageCost
+                        # Fallback: get from position average cost
+                        if entry_price is None:
+                            es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                            if es_positions:
+                                pos = es_positions[0]
+                                # Try to get average cost with fallbacks
+                                entry_price = getattr(pos, 'averageCost', None)
+                                if entry_price is None:
+                                    entry_price = getattr(pos, 'avgCost', None)
+                                if entry_price is None:
+                                    entry_price = getattr(pos, 'averagePrice', None)
+                                if entry_price is None or entry_price == 0:
+                                    # Use current market price as last resort
+                                    if len(data) > 0:
+                                        entry_price = data['close'].iloc[-1]
             
             # Fallback: use current market price (less ideal)
             if entry_price is None or entry_price == 0:
@@ -2034,10 +2564,8 @@ def check_and_recreate_tp_orders():
                 if stop_order and hasattr(stop_order, 'totalQuantity'):
                     qty = abs(stop_order.totalQuantity)
                 
-                # Double-check we're not exceeding max positions
-                if len(positions) >= strategy.max_open_trades:
-                    logging.warning(f"At max positions ({strategy.max_open_trades}). Skipping TP recreation.")
-                    continue
+                            # Note: We're just adding a TP order to an existing position,
+                            # not opening a new position, so max_open_trades doesn't apply here
                 
                 tp_action = 'SELL' if direction == 1 else 'BUY'
                 new_tp_order = LimitOrder(
@@ -2197,9 +2725,15 @@ async def main():
     global contract
     protection_task = None
     
+    global connection_start_time, total_uptime_seconds, dashboard_stats
+    
     try:
         # Connect with retry logic
         await connect_with_retry('127.0.0.1', 7497, base_client_id=100)
+        
+        # Track connection start
+        connection_start_time = datetime.now()
+        add_to_live_tracker('info', 'Connected to Interactive Brokers API')
         
         contract = get_front_es_contract()
         cancel_all_pending()
@@ -2217,18 +2751,46 @@ async def main():
         check_and_recreate_tp_orders()  # Check and recreate missing TP orders
         log_all_open_orders("On startup (after protection check)")
         
+        # Generate initial dashboard
+        update_dashboard()
+        add_to_live_tracker('info', 'Dashboard initialized')
+        
+        # Try to open dashboard in browser (only once on startup)
+        try:
+            import webbrowser
+            import os
+            dashboard_path = os.path.abspath(WEB_DASHBOARD)
+            webbrowser.open(f'file://{dashboard_path}')
+            add_to_live_tracker('info', f'Dashboard opened in browser: {WEB_DASHBOARD}')
+        except Exception as e:
+            logging.warning(f"Could not open dashboard in browser: {e}")
+        
         # Start periodic protection check
         protection_task = asyncio.create_task(periodic_protection_check())
         
         # Main loop
+        loop_count = 0
         while True:
             try:
                 # Check disconnect status and send email alerts if needed
                 check_disconnect_status()
                 
                 if not ib.isConnected():
+                    # Track disconnect
+                    if connection_start_time:
+                        session_uptime = (datetime.now() - connection_start_time).total_seconds()
+                        total_uptime_seconds += session_uptime
+                        connection_start_time = None
+                    add_to_live_tracker('warning', 'Connection lost - attempting reconnection')
+                    dashboard_stats['reconnections'] += 1
+                    
                     logging.warning("Connection lost, reconnecting...")
                     await connect_with_retry('127.0.0.1', 7497, base_client_id=100)
+                    
+                    # Track reconnection
+                    connection_start_time = datetime.now()
+                    add_to_live_tracker('info', 'Reconnected to Interactive Brokers API')
+                    
                     ensure_connected_and_subscribed()
                     # CRITICAL: After reconnection, immediately check for orphaned orders
                     # This handles cases where TP/SL filled while disconnected, leaving
@@ -2241,18 +2803,30 @@ async def main():
                     check_and_recreate_tp_orders()  # Check and recreate missing TP orders
                     log_all_open_orders("After reconnection cleanup")
                     # Note: check_disconnect_status() will send reconnection email on next iteration
+                
+                # Update dashboard every 5 seconds (every other loop iteration)
+                loop_count += 1
+                if loop_count % 1 == 0:  # Update every 10 seconds (every iteration)
+                    update_dashboard()
+                
                 await asyncio.sleep(10)
             except KeyboardInterrupt:
                 logging.info("Keyboard interrupt received...")
                 break
             except Exception as e:
-                logging.error(f"Error in main loop: {e}")
+                error_msg = f"Error in main loop: {e}"
+                logging.error(error_msg)
+                add_error(error_msg)
+                add_to_live_tracker('error', error_msg)
                 await asyncio.sleep(5)
                 
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received, shutting down...")
     except Exception as e:
-        logging.error(f"Fatal error: {e}")
+        error_msg = f"Fatal error: {e}"
+        logging.error(error_msg)
+        add_error(error_msg)
+        add_to_live_tracker('error', error_msg)
         import traceback
         traceback.print_exc()
     finally:

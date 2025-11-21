@@ -89,6 +89,10 @@ class BollingerBandStrategy:
             self.bb_length = max(1, int(params['Bollinger Band Length']))
         if 'Bollinger Band StdDev' in params:
             self.bb_stddev = float(params['Bollinger Band StdDev'])
+        if 'Long Trigger (% From Lower Band)' in params:
+            self.long_trigger_pct = float(params['Long Trigger (% From Lower Band)'])
+        if 'Short Trigger (% From Upper Band)' in params:
+            self.short_trigger_pct = float(params['Short Trigger (% From Upper Band)'])
         if 'ATR Multiplier for Trailing Stop' in params:
             self.atr_mult_ts_opt = float(params['ATR Multiplier for Trailing Stop'])
         if 'Min Volume Multiplier' in params:
@@ -277,6 +281,16 @@ class BollingerBandStrategy:
                 stop = min(stop, trail)
                 stop = max(stop, entry_price)  # Cap at entry price for shorts
         
+        # SAFETY CHECK: Ensure stop is not too close to entry (minimum 0.1% away)
+        # This prevents immediate exits when trigger percentages are very low
+        min_stop_distance = entry_price * 0.001  # 0.1% minimum
+        if direction == 1:
+            # For longs, stop must be at least 0.1% below entry
+            stop = min(stop, entry_price - min_stop_distance)
+        else:
+            # For shorts, stop must be at least 0.1% above entry
+            stop = max(stop, entry_price + min_stop_distance)
+        
         # Create position
         position = {
             'entry_time': idx,
@@ -324,19 +338,33 @@ class BollingerBandStrategy:
         # Increment bars held
         position['bars_held'] = position.get('bars_held', 0) + 1
         
+        dir_ = position['direction']
+        
         # Update trailing stop if enabled and delay met
         stop_updated = False
         if self.enable_trailing and position['bars_held'] >= self.trailing_delay:
-            # Update peak tracking
-            dir_ = position['direction']
+            # Support-based trailing stop: tracks recent lows (for longs) or recent highs (for shorts)
+            # This follows price action more closely, trailing the bottom of wicks on longs
+            # The stop is placed below the current bar's low (for longs) or above the current bar's high (for shorts)
+            # This creates a "higher lows" pattern where the stop follows support levels
             if dir_ == 1:
-                position['max_high'] = max(position['max_high'], high)
-                new_stop = position['max_high'] - atr_ts * self.atr_mult_ts_opt
+                # LONG: Place stop below the current bar's low by ATR distance
+                # This trails the bottom of wicks, following support levels
+                # As price makes higher lows, the stop moves up; if price makes lower lows, stop stays put
+                new_stop = low - atr_ts * self.atr_mult_ts_opt
+                # Stop can only move UP (tighten), never down - protects against pullbacks
+                # This means if price makes a higher low, stop moves up; if lower low, stop stays
                 position['stop'] = max(position['stop'], new_stop)
+                # Note: Stop can move above entry price once trailing starts (to protect profits)
             else:
-                position['min_low'] = min(position['min_low'], low)
-                new_stop = position['min_low'] + atr_ts * self.atr_mult_ts_opt
+                # SHORT: Place stop above the current bar's high by ATR distance
+                # This trails the top of wicks, following resistance levels
+                # As price makes lower highs, the stop moves down; if price makes higher highs, stop stays put
+                new_stop = high + atr_ts * self.atr_mult_ts_opt
+                # Stop can only move DOWN (tighten), never up - protects against bounces
+                # This means if price makes a lower high, stop moves down; if higher high, stop stays
                 position['stop'] = min(position['stop'], new_stop)
+                # Note: Stop can move below entry price once trailing starts (to protect profits)
             stop_updated = True
         
         # Always record current stop in history (for visualization)

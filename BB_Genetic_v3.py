@@ -58,6 +58,8 @@ CHECKPOINT_FILE = os.path.join(DIAG_DIR, 'ga_checkpoint_v3.pkl')
 START_TIME_FILE = os.path.join(DIAG_DIR, 'ga_start_time.txt')
 HTML_DIR = os.path.join(DIAG_DIR, 'html')
 HTML_DASHBOARD = os.path.join(HTML_DIR, 'ga_dashboard_v3.html')
+WEB_DIR = os.path.join(os.getcwd(), 'web')  # Common web directory
+WEB_DASHBOARD = os.path.join(WEB_DIR, 'ga_dashboard_v3.html')
 os.makedirs(DIAG_DIR, exist_ok=True)
 os.makedirs(HTML_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(TRADES_IS_CSV), exist_ok=True)
@@ -320,6 +322,37 @@ def evaluate_multi_objective(ind_and_df):
     sortino = metrics['sortino']
     max_dd = metrics['max_drawdown']
     pf = metrics['profit_factor']
+    trades_df = metrics.get('trades_df', pd.DataFrame())
+    
+    # VALIDATION: Detect unrealistic results and heavily penalize them
+    unrealistic = False
+    
+    # Check for unrealistic win rate (>95% is suspicious)
+    if not trades_df.empty:
+        win_rate = (trades_df['pnl'] > 0).sum() / len(trades_df)
+        if win_rate > 0.95:
+            unrealistic = True
+    
+    # Check for very short average trade duration (< 2 minutes is suspicious for 1-min bars)
+    if not trades_df.empty and 'entry_time' in trades_df.columns and 'exit_time' in trades_df.columns:
+        durations = (trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds() / 60
+        avg_duration = durations.mean()
+        if avg_duration < 2.0:  # Less than 2 minutes average
+            unrealistic = True
+    
+    # Check for infinite profit factor (no losses)
+    if pf == float('inf') or pf > 100:
+        unrealistic = True
+    
+    # Check for zero drawdown (unrealistic)
+    if max_dd == 0.0 and not trades_df.empty and len(trades_df) > 10:
+        unrealistic = True
+    
+    # Heavy penalty for unrealistic results
+    if unrealistic:
+        sortino = -1000.0  # Very poor fitness
+        max_dd = 1000000.0  # Very poor fitness
+        pf = 0.0
     
     # Cap Sortino at 100 to prevent unrealistic values
     sortino = min(sortino, 100.0)
@@ -469,7 +502,7 @@ def parallel_evaluate(individuals, df, param_dict_local, param_keys_local):
 def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict,
                             logbook, is_res, oos_res, trades_is, trades_oos,
                             html_path, diag_dir, current_gen=None, total_gen=None, 
-                            is_final=False, auto_launch=False):
+                            is_final=False, auto_launch=False, is_periods=None, oos_periods=None):
     """
     Generate comprehensive interactive HTML dashboard for GA results.
     
@@ -959,8 +992,11 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
     font-size: 0.9em;
     line-height: 1.5;
 }}
+.return-button {{ display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }}
+.return-button:hover {{ background: #5568d3; }}
 </style></head><body>
 <div class="container">
+<a href="index.html" class="return-button">← Back to Main Dashboard</a>
 <h1>GA Optimization Dashboard - v3.0</h1>
 <p><strong>Generated:</strong> {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 {progress_html}
@@ -1028,13 +1064,102 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
     <strong>Pareto Size Interpretation:</strong> Early generations typically have few Pareto solutions. As optimization progresses, more non-dominated solutions are discovered. If the size plateaus early, the GA may have converged. If it keeps growing, the solution space is rich with trade-offs.
 </div>
 {paretosize_div}
-<h2>All Solutions<span class="tooltip-icon">?</span>
-    <span class="tooltip">Complete list of all Pareto-optimal solutions ranked by Sortino Ratio. The selected solution is marked with ★. You can compare different solutions to see parameter variations. Higher-ranked solutions have better risk-adjusted returns, but may have different drawdown or profit factor characteristics.</span>
+<h2>Data Split Information<span class="tooltip-icon">?</span>
+    <span class="tooltip">Shows the date ranges for all In-Sample (training) and Out-of-Sample (validation) periods. This helps understand which time periods were used for optimization vs validation.</span>
 </h2>
 <div class="info-section">
-    <strong>Solution Selection:</strong> While the highest Sortino solution is automatically selected, you may want to manually review other solutions. For example, if Solution #2 has similar Sortino but much lower drawdown, it might be a better choice for risk-averse trading. All solutions in this table are Pareto-optimal.
+    <strong>Period Information:</strong> The data was split into multiple periods for training and validation. IS periods were used for optimization, OOS periods for validation.
 </div>
-{pareto_table_html}
+"""
+    
+    # Add IS and OOS period dates
+    if is_periods is not None and oos_periods is not None:
+        periods_html = """<table class='periods-table'><thead><tr>
+        <th>Period Type</th>
+        <th>Period #</th>
+        <th>Start Date</th>
+        <th>End Date</th>
+        <th>Rows</th>
+    </tr></thead><tbody>"""
+        
+        for i, period in enumerate(is_periods, 1):
+            periods_html += f"<tr><td>In-Sample</td><td>{i}</td><td>{period.index[0]}</td><td>{period.index[-1]}</td><td>{len(period):,}</td></tr>"
+        
+        for i, period in enumerate(oos_periods, 1):
+            periods_html += f"<tr><td>Out-of-Sample</td><td>{i}</td><td>{period.index[0]}</td><td>{period.index[-1]}</td><td>{len(period):,}</td></tr>"
+        
+        periods_html += "</tbody></table>"
+        html_content += periods_html
+        
+        # Add individual OOS period statistics if we have best_params
+        if best_params and len(oos_periods) > 0:
+            html_content += """
+<h2>Individual OOS Period Statistics<span class="tooltip-icon">?</span>
+    <span class="tooltip">Performance statistics for each individual Out-of-Sample period. This helps identify if the strategy performs consistently across different time periods or if it's overfitted to specific market conditions.</span>
+</h2>
+<div class="info-section">
+    <strong>Period-by-Period Analysis:</strong> If performance varies significantly across OOS periods, the strategy may be overfitted to specific market conditions. Consistent performance across periods is a good sign of robustness.
+</div>
+"""
+            
+            oos_period_stats_html = """<table class='oos-periods-table'><thead><tr>
+        <th>Period #</th>
+        <th>Date Range</th>
+        <th>Total PNL</th>
+        <th>Trades</th>
+        <th>Win Rate</th>
+        <th>Profit Factor</th>
+        <th>Sortino</th>
+        <th>Max DD</th>
+        <th>Avg Trades/Day</th>
+    </tr></thead><tbody>"""
+            
+            for i, oos_period in enumerate(oos_periods, 1):
+                try:
+                    # Run backtest on this individual OOS period
+                    period_res = run_backtest(best_params, oos_period, param_dict, suppress_output=True)
+                    period_trades = period_res.pop('trades_df')
+                    
+                    if not period_trades.empty:
+                        total_pnl = period_trades['pnl'].sum()
+                        num_trades = len(period_trades)
+                        win_rate = (period_trades['pnl'] > 0).mean() * 100
+                        avg_win = period_trades[period_trades['pnl'] > 0]['pnl'].mean() if (period_trades['pnl'] > 0).any() else 0
+                        avg_loss = period_trades[period_trades['pnl'] < 0]['pnl'].mean() if (period_trades['pnl'] < 0).any() else 0
+                        pf = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
+                        sortino = period_res.get('sortino', 0)
+                        max_dd = period_res.get('max_drawdown', 0)
+                        days = (period_trades['exit_time'].max() - period_trades['entry_time'].min()).days or 1
+                        avg_trades_day = num_trades / days
+                        
+                        oos_period_stats_html += f"""<tr>
+        <td>{i}</td>
+        <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td>
+        <td class="{'positive' if total_pnl > 0 else 'negative'}">${total_pnl:,.2f}</td>
+        <td>{num_trades}</td>
+        <td>{win_rate:.1f}%</td>
+        <td>{pf:.2f}</td>
+        <td>{sortino:.2f}</td>
+        <td>${max_dd:,.2f}</td>
+        <td>{avg_trades_day:.2f}</td>
+    </tr>"""
+                    else:
+                        oos_period_stats_html += f"""<tr>
+        <td>{i}</td>
+        <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td>
+        <td colspan="7" style="text-align: center; color: #999;">No trades</td>
+    </tr>"""
+                except Exception as e:
+                    oos_period_stats_html += f"""<tr>
+        <td>{i}</td>
+        <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td>
+        <td colspan="7" style="text-align: center; color: #f00;">Error: {str(e)}</td>
+    </tr>"""
+            
+            oos_period_stats_html += "</tbody></table>"
+            html_content += oos_period_stats_html
+    
+    html_content += """
 <h2>In-Sample vs OOS Comparison<span class="tooltip-icon">?</span>
     <span class="tooltip">Comparison of strategy performance between in-sample (training) and out-of-sample (validation) data. This is critical for detecting overfitting. Good generalization: IS and OOS metrics are similar. Overfitting: IS is much better than OOS. Green differences indicate OOS is better (good sign), red indicates OOS is worse (potential overfitting).</span>
 </h2>
@@ -1043,6 +1168,13 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
 </div>
 {comparison_html}
 {summary_html}
+<h2>All Solutions<span class="tooltip-icon">?</span>
+    <span class="tooltip">Complete list of all Pareto-optimal solutions ranked by Sortino Ratio. The selected solution is marked with ★. You can compare different solutions to see parameter variations. Higher-ranked solutions have better risk-adjusted returns, but may have different drawdown or profit factor characteristics.</span>
+</h2>
+<div class="info-section">
+    <strong>Solution Selection:</strong> While the highest Sortino solution is automatically selected, you may want to manually review other solutions. For example, if Solution #2 has similar Sortino but much lower drawdown, it might be a better choice for risk-averse trading. All solutions in this table are Pareto-optimal.
+</div>
+{pareto_table_html}
 </div>
 {conv_script}
 {pareto3d_script}
@@ -1509,17 +1641,29 @@ def main():
             auto_launch_now = (gen == start_gen)
             
             try:
+                # Write directly to web directory
+                os.makedirs(WEB_DIR, exist_ok=True)
                 generate_html_dashboard(
                     hof, best_for_display, best_params_display, best_fitness_display,
                     param_keys, param_dict, logbook,
                     is_res_display, oos_res_display, trades_is_display, trades_oos_display,
-                    HTML_DASHBOARD, DIAG_DIR,
-                    current_gen=gen + 1, total_gen=NUM_GEN, is_final=False, auto_launch=auto_launch_now
+                    WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
+                    current_gen=gen + 1, total_gen=NUM_GEN, is_final=False, auto_launch=auto_launch_now,
+                    is_periods=is_periods if 'is_periods' in locals() else None, 
+                    oos_periods=oos_periods if 'oos_periods' in locals() else None
                 )
+                # Also copy to diagnostics directory for backup
+                try:
+                    import shutil
+                    if os.path.exists(WEB_DASHBOARD):
+                        shutil.copy2(WEB_DASHBOARD, HTML_DASHBOARD)
+                except Exception as e:
+                    pass  # Silent fail for backup copy
+                
                 if auto_launch_now:
-                    print(f"  HTML Dashboard updated and opened → {HTML_DASHBOARD}")
+                    print(f"  HTML Dashboard updated and opened → {WEB_DASHBOARD}")
                 else:
-                    print(f"  HTML Dashboard updated → {HTML_DASHBOARD}")
+                    print(f"  HTML Dashboard updated → {WEB_DASHBOARD}")
             except Exception as e:
                 print(f"  WARNING: Failed to update HTML dashboard: {e}")
                 import traceback
@@ -1815,12 +1959,22 @@ def main():
     # Generate Interactive HTML Dashboard
     # ------------------------------------------------------------------
     print("\n=== Generating Interactive HTML Dashboard ===")
-    # Generate final HTML dashboard with complete results
+    # Generate final HTML dashboard with complete results - write directly to web directory
+    os.makedirs(WEB_DIR, exist_ok=True)
     generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict, 
                             logbook, is_res, oos_res, trades_is, trades_oos,
-                            HTML_DASHBOARD, DIAG_DIR,
+                            WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
                             current_gen=NUM_GEN, total_gen=NUM_GEN, is_final=True, auto_launch=True)
-    print(f"HTML Dashboard (FINAL) → {HTML_DASHBOARD}")
+    print(f"HTML Dashboard (FINAL) → {WEB_DASHBOARD}")
+    
+    # Also copy to diagnostics directory for backup
+    try:
+        import shutil
+        if os.path.exists(WEB_DASHBOARD):
+            shutil.copy2(WEB_DASHBOARD, HTML_DASHBOARD)
+            print(f"Dashboard backup copied to diagnostics directory: {HTML_DASHBOARD}")
+    except Exception as e:
+        print(f"Warning: Could not copy to diagnostics directory: {e}")
     
     # Clean up start time file after completion
     if os.path.exists(START_TIME_FILE):

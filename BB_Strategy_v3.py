@@ -32,6 +32,7 @@ LOG_DIR = os.path.join(DRIVE_PATH, 'logs')
 PLOTS_DIR = os.path.join(DRIVE_PATH, 'plots')
 SUMMARY_PLOT_DIR = os.path.join(PLOTS_DIR, 'summary')
 HTML_DIR = os.path.join(PLOTS_DIR, 'html_v3')
+WEB_DIR = os.path.join(NOTEBOOK_DIR, 'web')  # Common web directory
 
 os.makedirs(os.path.dirname(PARAMS_CSV), exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -41,8 +42,8 @@ os.makedirs(HTML_DIR, exist_ok=True)
 
 # === Config ===
 VERSION = '3.0'
-FROM_DATE = '2025-04-01'
-TO_DATE = '2025-08-01'
+FROM_DATE = '2025-03-07'
+TO_DATE = '2025-07-19'
 multiplier = 50
 initial_capital = 50000
 candles_before_after = 50
@@ -128,12 +129,80 @@ log(f"After resampling: {len(df)} bars")
 
 # === Apply Filters ===
 log("Applying filters...")
+df_before_filters = len(df)
 df = strategy.apply_filters(df)
-log(f"After filters: {len(df)} bars")
+log(f"After filters: {len(df)} bars (removed {df_before_filters - len(df)} bars)")
 
 if len(df) == 0:
     log("ERROR: No data after filtering!")
+    log("This could be due to:")
+    log(f"  - RTH filter: {strategy.enable_rth_filter} ({strategy.rth_start_str} to {strategy.rth_end_str})")
+    log(f"  - Min ATR filter: {strategy.min_atr_points} points")
+    log(f"  - Min Volume multiplier: {strategy.min_volume_multiplier}")
+    log(f"  - Data quality issues (missing bars, gaps)")
     sys.exit(1)
+
+# Diagnostic: Check how many bars pass each filter
+if 'in_rth' in df.columns:
+    rth_count = df['in_rth'].sum()
+    log(f"  Bars in RTH: {rth_count} / {len(df)} ({rth_count/len(df)*100:.1f}%)")
+if 'atr_filter' in df.columns:
+    atr_count = df['atr_filter'].sum()
+    log(f"  Bars passing ATR filter: {atr_count} / {len(df)} ({atr_count/len(df)*100:.1f}%)")
+if 'volume_filter' in df.columns:
+    vol_count = df['volume_filter'].sum()
+    log(f"  Bars passing volume filter: {vol_count} / {len(df)} ({vol_count/len(df)*100:.1f}%)")
+
+    # Diagnostic: Check entry condition statistics
+    if len(df) > 0 and 'upper' in df.columns and 'lower' in df.columns:
+        long_trig = df['lower'] * (1 - strategy.long_trigger_pct / 100)
+        short_trig = df['upper'] * (1 + strategy.short_trigger_pct / 100)
+        
+        long_condition = df['close'] <= long_trig if strategy.long_body_zone else df['low'] <= long_trig
+        short_condition = df['close'] >= short_trig if strategy.short_body_zone else df['high'] >= short_trig
+        
+        long_potential = long_condition.sum()
+        short_potential = short_condition.sum()
+        
+        log(f"  Bars meeting LONG entry condition: {long_potential} / {len(df)} ({long_potential/len(df)*100:.1f}%)")
+        log(f"  Bars meeting SHORT entry condition: {short_potential} / {len(df)} ({short_potential/len(df)*100:.1f}%)")
+        
+        # Additional diagnostics: Show how close we are to triggering
+        if long_potential == 0:
+            # Find the closest approach to long trigger
+            long_distances = long_trig - df['close']
+            closest_long = long_distances.min()
+            closest_long_idx = long_distances.idxmin()
+            closest_long_close = df.loc[closest_long_idx, 'close']
+            closest_long_lower = df.loc[closest_long_idx, 'lower']
+            closest_long_trig = long_trig.loc[closest_long_idx]
+            log(f"  LONG: Closest approach was {closest_long:.2f} points away from trigger")
+            log(f"        At {closest_long_idx}: close=${closest_long_close:.2f}, lower=${closest_long_lower:.2f}, trigger=${closest_long_trig:.2f}")
+            log(f"        Price needs to be ${abs(closest_long):.2f} lower to trigger")
+            log(f"        Lower band is ${closest_long_close - closest_long_lower:.2f} below close")
+            log(f"        Trigger requires price to be {strategy.long_trigger_pct:.2f}% below lower band")
+        
+        if short_potential == 0:
+            # Find the closest approach to short trigger
+            short_distances = df['close'] - short_trig
+            closest_short = short_distances.min()
+            closest_short_idx = short_distances.idxmin()
+            closest_short_close = df.loc[closest_short_idx, 'close']
+            closest_short_upper = df.loc[closest_short_idx, 'upper']
+            closest_short_trig = short_trig.loc[closest_short_idx]
+            log(f"  SHORT: Closest approach was {abs(closest_short):.2f} points away from trigger")
+            log(f"         At {closest_short_idx}: close=${closest_short_close:.2f}, upper=${closest_short_upper:.2f}, trigger=${closest_short_trig:.2f}")
+            log(f"         Price needs to be ${abs(closest_short):.2f} higher to trigger")
+            log(f"         Upper band is ${closest_short_upper - closest_short_close:.2f} above close")
+            log(f"         Trigger requires price to be {strategy.short_trigger_pct:.2f}% above upper band")
+        
+        # Check combined (entry condition AND filters)
+        if 'in_rth' in df.columns and 'atr_filter' in df.columns and 'volume_filter' in df.columns:
+            combined_filter = df['in_rth'] & df['atr_filter'] & df['volume_filter']
+            long_with_filters = (long_condition & combined_filter).sum()
+            short_with_filters = (short_condition & combined_filter).sum()
+            log(f"  Bars meeting LONG entry + all filters: {long_with_filters} / {len(df)}")
+            log(f"  Bars meeting SHORT entry + all filters: {short_with_filters} / {len(df)}")
 
 # === Simulation ===
 log("Running simulation...")
@@ -194,6 +263,37 @@ for pos in positions:
 
 # === Convert trades to DataFrame for analysis ===
 trades_df = pd.DataFrame(trades)
+
+# Initialize default values for zero-trade case
+total_pnl = 0
+num_trades = 0
+win_rate = 0.0
+profit_factor = 0.0
+sharpe = 0.0
+sortino = 0.0
+max_drawdown = 0.0
+max_runup = 0.0
+long_count = 0
+short_count = 0
+long_pnl = 0
+short_pnl = 0
+long_win_rate = 0.0
+short_win_rate = 0.0
+avg_win = 0.0
+avg_loss = 0.0
+long_avg_win = 0.0
+long_avg_loss = 0.0
+short_avg_win = 0.0
+short_avg_loss = 0.0
+avg_trade_pnl = 0.0
+best_trade = 0.0
+worst_trade = 0.0
+max_consecutive_wins = 0
+max_consecutive_losses = 0
+monthly_pnl = pd.DataFrame()
+exit_reasons = pd.Series()
+hourly_perf = pd.DataFrame()
+dow_perf = pd.DataFrame()
 
 if not trades_df.empty:
     trades_df['entry_date'] = trades_df['entry_time'].dt.date
@@ -713,8 +813,11 @@ if not trades_df.empty:
         })
     
     # Create comprehensive dashboard HTML (combines all elements)
-    dashboard_html = os.path.join(HTML_DIR, f'comprehensive_dashboard_v{VERSION}.html')
-    with open(dashboard_html, 'w', encoding='utf-8') as f:
+    # Write directly to web directory as primary location
+    os.makedirs(WEB_DIR, exist_ok=True)
+    web_dashboard = os.path.join(WEB_DIR, f'comprehensive_dashboard_v{VERSION}.html')
+    dashboard_html = os.path.join(HTML_DIR, f'comprehensive_dashboard_v{VERSION}.html')  # Backup location
+    with open(web_dashboard, 'w', encoding='utf-8') as f:
         f.write(f"""
 <!DOCTYPE html>
 <html>
@@ -734,10 +837,13 @@ if not trades_df.empty:
         .metric-box {{ display: inline-block; margin: 10px; padding: 15px; background: #f0f0f0; border-radius: 5px; min-width: 200px; }}
         .metric-label {{ font-size: 12px; color: #666; }}
         .metric-value {{ font-size: 24px; font-weight: bold; color: #333; }}
+        .return-button {{ display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }}
+        .return-button:hover {{ background: #5568d3; }}
     </style>
 </head>
 <body>
     <div class="container">
+        <a href="index.html" class="return-button">← Back to Main Dashboard</a>
         <h1>BB Strategy Backtest Statistics - v{VERSION}</h1>
         <p><strong>Period:</strong> {FROM_DATE} to {TO_DATE}</p>
         
@@ -1038,14 +1144,23 @@ if not trades_df.empty:
 </body>
 </html>
 """)
-    log(f"Comprehensive dashboard saved: {dashboard_html}")
+    log(f"Comprehensive dashboard saved: {web_dashboard}")
+    
+    # Also copy to original location for backup
+    try:
+        import shutil
+        if os.path.exists(web_dashboard):
+            shutil.copy2(web_dashboard, dashboard_html)
+            log(f"Dashboard backup copied to: {dashboard_html}")
+    except Exception as e:
+        log(f"Warning: Could not copy dashboard to backup location: {e}")
     
     # Open comprehensive dashboard in browser
     try:
-        webbrowser.open(f'file://{os.path.abspath(dashboard_html)}')
+        webbrowser.open(f'file://{os.path.abspath(web_dashboard)}')
         log(f"Opened comprehensive dashboard in browser")
     except:
-        log(f"Could not auto-open browser. Please open manually: {dashboard_html}")
+        log(f"Could not auto-open browser. Please open manually: {web_dashboard}")
     
     log(f"\n{'='*80}")
     log(f"Backtest v{VERSION} completed successfully!")
@@ -1060,4 +1175,157 @@ else:
     total_pnl = 0
     num_trades = 0
     log(f"Backtest v{VERSION} completed with no trades.")
+    log("")
+    log("="*80)
+    log("WARNING: Zero trades detected!")
+    log("="*80)
+    log("Possible reasons:")
+    log(f"1. The GA used INTERLEAVED data splitting (multiple scattered OOS periods)")
+    log(f"   - Your test period ({FROM_DATE} to {TO_DATE}) may not match any OOS period")
+    log(f"   - GA OOS periods are scattered across different time ranges")
+    log("2. Entry conditions may be too restrictive for this time period")
+    log("3. Data quality issues (missing bars, gaps, etc.)")
+    log("")
+    log("To verify GA OOS periods, check the GA console output for:")
+    log("  'Period X: OOS (rows, date_range)'")
+    log("")
+    log("NOTE: If you tested on the exact OOS periods and still got 0 trades,")
+    log("      there may be a bug in how parameters are applied. Check that")
+    log("      'Long Trigger (% From Lower Band)' and 'Short Trigger (% From Upper Band)'")
+    log("      are being updated correctly in the strategy.")
+    log("="*80)
+    log("")
+    
+    # Still generate HTML even with zero trades
+    # Create a minimal overview chart with just price data
+    fig_main = make_subplots(
+        rows=1, cols=1,
+        subplot_titles=('Price Chart (No Trades)',),
+        vertical_spacing=0.1
+    )
+    
+    # Add candlestick chart
+    fig_main.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        name='Price'
+    ), row=1, col=1)
+    
+    fig_main.update_layout(
+        title=f'BB Strategy Backtest Overview - v{VERSION} | Period: {FROM_DATE} to {TO_DATE} | NO TRADES',
+        height=600,
+        hovermode='x unified',
+        showlegend=True
+    )
+    
+    # Create comprehensive dashboard HTML even with zero trades
+    dashboard_html = os.path.join(HTML_DIR, f'comprehensive_dashboard_v{VERSION}.html')
+    # Also copy to web directory for web server
+    web_dashboard = os.path.join(WEB_DIR, f'comprehensive_dashboard_v{VERSION}.html')
+    with open(dashboard_html, 'w', encoding='utf-8') as f:
+        f.write(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Trade Statistics - BB Strategy v{VERSION}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }}
+        h1 {{ color: #333; border-bottom: 3px solid #f44336; padding-bottom: 10px; }}
+        h2 {{ color: #555; margin-top: 30px; border-bottom: 2px solid #ddd; }}
+        .warning {{ background: #fff3cd; border: 2px solid #ffc107; padding: 15px; border-radius: 5px; margin: 20px 0; }}
+        .warning h3 {{ color: #856404; margin-top: 0; }}
+        .metric-box {{ display: inline-block; margin: 10px; padding: 15px; background: #f0f0f0; border-radius: 5px; min-width: 200px; }}
+        .metric-label {{ font-size: 12px; color: #666; }}
+        .metric-value {{ font-size: 24px; font-weight: bold; color: #333; }}
+        .return-button {{ display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }}
+        .return-button:hover {{ background: #5568d3; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="index.html" class="return-button">← Back to Main Dashboard</a>
+        <h1>BB Strategy Backtest Statistics - v{VERSION}</h1>
+        <p><strong>Period:</strong> {FROM_DATE} to {TO_DATE}</p>
+        
+        <div class="warning">
+            <h3>⚠️ NO TRADES EXECUTED</h3>
+            <p><strong>Possible reasons:</strong></p>
+            <ul>
+                <li><strong>Data Split Mismatch:</strong> The GA used INTERLEAVED data splitting, which means OOS periods are scattered across different time ranges. Your test period ({FROM_DATE} to {TO_DATE}) may not match any of the GA's OOS periods.</li>
+                <li><strong>Entry Conditions Too Restrictive:</strong> The optimized parameters may be too restrictive for this specific time period.</li>
+                <li><strong>Data Quality Issues:</strong> Missing bars, gaps, or data quality problems.</li>
+            </ul>
+            <p><strong>To verify GA OOS periods:</strong> Check the GA console output for lines like:</p>
+            <pre>Period X: OOS (rows, date_range)</pre>
+        </div>
+        
+        <h2>Overall Performance</h2>
+        <div class="metric-box">
+            <div class="metric-label">Total PNL</div>
+            <div class="metric-value">$0.00</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-label">Total Trades</div>
+            <div class="metric-value">0</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-label">Win Rate</div>
+            <div class="metric-value">N/A</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-label">Profit Factor</div>
+            <div class="metric-value">N/A</div>
+        </div>
+        
+        <h2>Price Chart</h2>
+        <div id="main_overview_chart"></div>
+    </div>
+</body>
+</html>
+""")
+        
+        # Embed the main overview chart
+        main_html_str = fig_main.to_html(include_plotlyjs='cdn', div_id='main_overview_chart')
+        import re
+        div_pattern = r'<div id="main_overview_chart"[^>]*>.*?</div>'
+        div_match = re.search(div_pattern, main_html_str, re.DOTALL)
+        if div_match:
+            main_div = div_match.group(0)
+            f.write(main_div)
+        
+        script_pattern = r'<script type="text/javascript">(.*?)</script>'
+        script_matches = re.findall(script_pattern, main_html_str, re.DOTALL)
+        if script_matches:
+            for script_content in script_matches:
+                if 'Plotly.newPlot' in script_content or 'main_overview_chart' in script_content:
+                    f.write(f'<script type="text/javascript">{script_content}</script>')
+                    break
+        else:
+            # Fallback: extract script tag
+            script_start = main_html_str.find('<script')
+            if script_start != -1:
+                script_end = main_html_str.find('</script>', script_start) + 9
+                main_script = main_html_str[script_start:script_end]
+                f.write(main_script)
+    
+    log(f"Comprehensive dashboard saved: {web_dashboard}")
+    
+    # Also copy to original location for backup
+    try:
+        import shutil
+        if os.path.exists(web_dashboard):
+            shutil.copy2(web_dashboard, dashboard_html)
+            log(f"Dashboard backup copied to: {dashboard_html}")
+    except Exception as e:
+        log(f"Warning: Could not copy dashboard to backup location: {e}")
+    
+    try:
+        webbrowser.open(f'file://{os.path.abspath(web_dashboard)}')
+        log("Dashboard opened in browser.")
+    except:
+        log(f"Could not auto-open browser. Please open manually: {web_dashboard}")
 
