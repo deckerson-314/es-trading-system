@@ -47,7 +47,7 @@ TO_DATE = '2025-07-19'
 multiplier = 50
 initial_capital = 50000
 candles_before_after = 50
-max_individual_plots = 20  # Limit individual trade plots to last N
+max_individual_plots = 50  # Limit individual trade plots to last N
 volume_window = 50  # Rolling window for avg volume
 
 # === Logging ===
@@ -342,6 +342,27 @@ if not trades_df.empty:
     short_avg_duration = short_trades['duration'].mean() if len(short_trades) > 0 else 0
     short_max_duration = short_trades['duration'].max() if len(short_trades) > 0 else 0
     short_min_duration = short_trades['duration'].min() if len(short_trades) > 0 else 0
+    
+    # Trades per day calculation
+    if not trades_df.empty:
+        # Calculate number of trading days (unique dates with trades)
+        unique_trade_dates = pd.concat([trades_df['entry_time'].dt.date, trades_df['exit_time'].dt.date]).unique()
+        trading_days = len(unique_trade_dates) if len(unique_trade_dates) > 0 else 1
+        avg_trades_per_day = num_trades / trading_days if trading_days > 0 else 0
+        
+        # Long trades per day
+        long_unique_dates = pd.concat([long_trades['entry_time'].dt.date, long_trades['exit_time'].dt.date]).unique() if len(long_trades) > 0 else []
+        long_trading_days = len(long_unique_dates) if len(long_unique_dates) > 0 else 1
+        long_trades_per_day = long_count / long_trading_days if long_trading_days > 0 else 0
+        
+        # Short trades per day
+        short_unique_dates = pd.concat([short_trades['entry_time'].dt.date, short_trades['exit_time'].dt.date]).unique() if len(short_trades) > 0 else []
+        short_trading_days = len(short_unique_dates) if len(short_unique_dates) > 0 else 1
+        short_trades_per_day = short_count / short_trading_days if short_trading_days > 0 else 0
+    else:
+        avg_trades_per_day = 0
+        long_trades_per_day = 0
+        short_trades_per_day = 0
     
     # Equity curve, drawdown, run-up
     trades_df = trades_df.sort_values('exit_time')
@@ -782,9 +803,12 @@ if not trades_df.empty:
         trade_type = trade.direction_str
         result = 'Win' if trade.pnl > 0 else 'Loss'
         pnl_str = f"{'+$' if trade.pnl > 0 else '-$'}{abs(trade.pnl):,.0f}"
+        # Calculate duration for this trade
+        duration_min = (trade.exit_time - trade.entry_time).total_seconds() / 60
+        duration_str = f"{duration_min:.1f} min" if duration_min < 60 else f"{duration_min/60:.1f} hr"
         
         fig_trade.update_layout(
-            title=f"Trade {i} | {trade_type} | {result} | PNL: {pnl_str} | {trade.reason}",
+            title=f"Trade {i} | {trade_type} | {result} | PNL: {pnl_str} | Duration: {duration_str} | {trade.reason}",
             xaxis_title="Time",
             yaxis_title="Price ($)",
             height=600,
@@ -796,9 +820,14 @@ if not trades_df.empty:
         )
         
         filename = f"trade_last_{i:03d}_{trade_type}_{result}_{pnl_str.replace('$', '').replace(',', '')}_v{VERSION}.html"
-        trade_html = os.path.join(HTML_DIR, filename)
-        fig_trade.write_html(trade_html, include_plotlyjs='cdn')
-        log(f"Individual trade plot saved: {filename}")
+        # Save to web directory (primary location for dashboard access)
+        os.makedirs(WEB_DIR, exist_ok=True)
+        trade_html_web = os.path.join(WEB_DIR, filename)
+        fig_trade.write_html(trade_html_web, include_plotlyjs='cdn')
+        # Also save backup copy to original location
+        trade_html_backup = os.path.join(HTML_DIR, filename)
+        fig_trade.write_html(trade_html_backup, include_plotlyjs='cdn')
+        log(f"Individual trade plot saved: {filename} (web + backup)")
         
         trade_files.append({
             'filename': filename,
@@ -809,7 +838,9 @@ if not trades_df.empty:
             'pnl_str': pnl_str,
             'reason': trade.reason,
             'entry_time': trade.entry_time,
-            'exit_time': trade.exit_time
+            'exit_time': trade.exit_time,
+            'duration': duration_min,
+            'duration_str': duration_str
         })
     
     # Create comprehensive dashboard HTML (combines all elements)
@@ -894,6 +925,12 @@ if not trades_df.empty:
                 <td>{num_trades}</td>
                 <td>{long_count}</td>
                 <td>{short_count}</td>
+            </tr>
+            <tr>
+                <td>Trades per Day</td>
+                <td>{avg_trades_per_day:.2f}</td>
+                <td>{long_trades_per_day:.2f}</td>
+                <td>{short_trades_per_day:.2f}</td>
             </tr>
             <tr>
                 <td>Total PNL</td>
@@ -1068,6 +1105,7 @@ if not trades_df.empty:
                 <p style="margin: 5px 0; font-size: 18px; font-weight: bold;" class="{result_class}">{trade_info['pnl_str']}</p>
                 <p style="margin: 5px 0; color: #666; font-size: 12px;">{trade_info['reason']}</p>
                 <p style="margin: 5px 0; color: #666; font-size: 11px;">Entry: {trade_info['entry_time'].strftime('%Y-%m-%d %H:%M')}</p>
+                <p style="margin: 5px 0; color: #666; font-size: 11px;">Duration: {trade_info.get('duration_str', 'N/A')}</p>
                 <a href="{trade_info['filename']}" target="_blank" style="display: inline-block; margin-top: 10px; padding: 8px 16px; background: #4CAF50; color: white; text-decoration: none; border-radius: 4px;">View Chart</a>
             </div>
 """)

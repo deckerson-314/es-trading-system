@@ -1,26 +1,33 @@
 """
 Filter Logic
 ============
-RTH (Regular Trading Hours), Volume, and ATR filters.
+RTH (Regular Trading Hours), Volume, ATR, and Maintenance Period filters.
 All implementations use identical logic.
 """
 
 import pandas as pd
-from datetime import time
+from datetime import time, timedelta
 
 
-def apply_rth_filter(df, enable_rth_filter, rth_start, rth_end):
+def apply_rth_filter(df, enable_rth_filter, rth_start, rth_end, rth_exit_buffer_minutes=0):
     """
     Apply Regular Trading Hours filter.
+    
+    Blocks trading outside RTH and marks periods when positions should be closed.
+    - Blocks new entries when outside RTH
+    - Marks periods when positions should be closed (buffer minutes before RTH end)
     
     Args:
         df: DataFrame with datetime index
         enable_rth_filter: Boolean to enable/disable filter
         rth_start: Start time (time object or string 'HH:MM')
         rth_end: End time (time object or string 'HH:MM')
+        rth_exit_buffer_minutes: Minutes before RTH end to start closing positions (default: 0)
         
     Returns:
-        DataFrame with added 'in_rth' column
+        DataFrame with added 'in_rth' and 'force_exit_rth' columns
+        - 'in_rth': True during RTH (blocks entries when False)
+        - 'force_exit_rth': True during buffer before RTH end (should close positions)
     """
     df = df.copy()
     
@@ -34,17 +41,41 @@ def apply_rth_filter(df, enable_rth_filter, rth_start, rth_end):
         # Get time series from index
         time_series = pd.Series([t.time() for t in df.index], index=df.index)
         
+        # Calculate RTH end minus buffer (use a reference date for calculation)
+        # Convert time to datetime, subtract buffer, then convert back to time
+        ref_date = pd.Timestamp('2000-01-01')  # Arbitrary reference date
+        rth_end_dt = pd.Timestamp.combine(ref_date.date(), rth_end)
+        rth_end_buffer_dt = rth_end_dt - timedelta(minutes=rth_exit_buffer_minutes)
+        rth_end_buffer = rth_end_buffer_dt.time()
+        
         # Handle trading hours that span midnight (e.g., 18:00 to 17:00 for ES futures)
         if rth_start <= rth_end:
             # Normal case: trading hours don't span midnight (e.g., 09:30 to 16:00)
             df['in_rth'] = time_series.between(rth_start, rth_end, inclusive='both')
+            
+            # Force exit during buffer period before RTH end
+            # Include buffer start time, exclude RTH end time (positions should close before RTH ends)
+            if rth_exit_buffer_minutes > 0:
+                df['force_exit_rth'] = time_series.between(rth_end_buffer, rth_end, inclusive='left')
+            else:
+                # If no buffer, force exit at RTH end time (exact moment)
+                df['force_exit_rth'] = (time_series == rth_end)
         else:
             # Trading hours span midnight (e.g., 18:00 to 17:00)
             # Time is in RTH if it's >= start OR <= end
             # Example: 18:00-17:00 means trade from 6pm to midnight, then midnight to 5pm
             df['in_rth'] = (time_series >= rth_start) | (time_series <= rth_end)
+            
+            # For midnight-spanning RTH, force exit is more complex
+            # Force exit during buffer before RTH end (which is before midnight)
+            if rth_exit_buffer_minutes > 0:
+                # Buffer period is before rth_end (which is before midnight)
+                df['force_exit_rth'] = (time_series >= rth_end_buffer) & (time_series <= rth_end)
+            else:
+                df['force_exit_rth'] = (time_series == rth_end)
     else:
         df['in_rth'] = True
+        df['force_exit_rth'] = False
     
     return df
 
@@ -80,5 +111,151 @@ def apply_atr_filter(df, min_atr_points):
     """
     df = df.copy()
     df['atr_filter'] = df['atr_ts'] >= min_atr_points
+    return df
+
+
+def apply_maintenance_filter(df, enable_maintenance_filter, 
+                             daily_start_str, daily_end_str,
+                             weekend_start_day, weekend_start_time_str,
+                             weekend_end_day, weekend_end_time_str,
+                             buffer_minutes=5):
+    """
+    Apply maintenance period filter.
+    
+    Blocks trading during maintenance periods and adds buffer time before/after.
+    - Blocks new entries during maintenance + buffer
+    - Marks periods when positions should be closed (5 min before maintenance)
+    
+    NOTE: All times should be in Eastern Time (ET) to match data timezone.
+    ES futures maintenance periods (CME):
+    - Daily: 4:00-4:30 PM CT = 5:00-5:30 PM ET
+    - Weekend: Fri 4:00 PM CT - Sun 5:00 PM CT = Fri 5:00 PM ET - Sun 6:00 PM ET
+    
+    Args:
+        df: DataFrame with datetime index (should be in Eastern Time)
+        enable_maintenance_filter: Boolean to enable/disable filter
+        daily_start_str: Daily maintenance start time 'HH:MM' (Eastern Time)
+        daily_end_str: Daily maintenance end time 'HH:MM' (Eastern Time)
+        weekend_start_day: Weekend maintenance start day (0=Monday, 4=Friday)
+        weekend_start_time_str: Weekend maintenance start time 'HH:MM' (Eastern Time)
+        weekend_end_day: Weekend maintenance end day (0=Monday, 6=Sunday)
+        weekend_end_time_str: Weekend maintenance end time 'HH:MM' (Eastern Time)
+        buffer_minutes: Minutes before/after maintenance to block trading
+        
+    Returns:
+        DataFrame with added 'in_maintenance' and 'force_exit' columns
+        - 'in_maintenance': True during maintenance + buffer (blocks entries)
+        - 'force_exit': True during buffer before maintenance (should close positions)
+    """
+    df = df.copy()
+    
+    if not enable_maintenance_filter:
+        df['in_maintenance'] = False
+        df['force_exit'] = False
+        return df
+    
+    # Parse time strings
+    if isinstance(daily_start_str, str):
+        daily_start = pd.to_datetime(daily_start_str, format='%H:%M').time()
+    else:
+        daily_start = daily_start_str
+    
+    if isinstance(daily_end_str, str):
+        daily_end = pd.to_datetime(daily_end_str, format='%H:%M').time()
+    else:
+        daily_end = daily_end_str
+    
+    if isinstance(weekend_start_time_str, str):
+        weekend_start_time = pd.to_datetime(weekend_start_time_str, format='%H:%M').time()
+    else:
+        weekend_start_time = weekend_start_time_str
+    
+    if isinstance(weekend_end_time_str, str):
+        weekend_end_time = pd.to_datetime(weekend_end_time_str, format='%H:%M').time()
+    else:
+        weekend_end_time = weekend_end_time_str
+    
+    # Initialize columns
+    df['in_maintenance'] = False
+    df['force_exit'] = False
+    
+    # Get day of week (0=Monday, 6=Sunday) and time
+    df['day_of_week'] = df.index.dayofweek
+    df['time_of_day'] = pd.Series([t.time() for t in df.index], index=df.index)
+    
+    # Helper function to subtract/add minutes from time
+    def time_add_minutes(t, minutes):
+        """Add or subtract minutes from a time object."""
+        dt = pd.Timestamp.combine(pd.Timestamp.now().date(), t)
+        dt = dt + timedelta(minutes=minutes)
+        return dt.time()
+    
+    # Daily maintenance periods
+    # Maintenance period: daily_start to daily_end
+    # Block entries: (daily_start - buffer) to (daily_end + buffer)
+    # Force exit: (daily_start - buffer) to daily_start
+    
+    daily_start_with_buffer = time_add_minutes(daily_start, -buffer_minutes)
+    daily_end_with_buffer = time_add_minutes(daily_end, buffer_minutes)
+    
+    # Check daily maintenance
+    if daily_start <= daily_end:
+        # Normal case: maintenance doesn't span midnight
+        in_daily_maintenance = df['time_of_day'].between(daily_start, daily_end, inclusive='both')
+        in_daily_block = df['time_of_day'].between(daily_start_with_buffer, daily_end_with_buffer, inclusive='both')
+        force_daily_exit = df['time_of_day'].between(daily_start_with_buffer, daily_start, inclusive='left')
+    else:
+        # Maintenance spans midnight
+        in_daily_maintenance = (df['time_of_day'] >= daily_start) | (df['time_of_day'] <= daily_end)
+        in_daily_block = (df['time_of_day'] >= daily_start_with_buffer) | (df['time_of_day'] <= daily_end_with_buffer)
+        force_daily_exit = df['time_of_day'] >= daily_start_with_buffer
+    
+    # Weekend maintenance periods
+    # Weekend maintenance: Friday weekend_start_time to Sunday weekend_end_time
+    # Block entries: (Friday weekend_start_time - buffer) to (Sunday weekend_end_time + buffer)
+    # Force exit: (Friday weekend_start_time - buffer) to Friday weekend_start_time
+    
+    weekend_start_time_with_buffer = time_add_minutes(weekend_start_time, -buffer_minutes)
+    weekend_end_time_with_buffer = time_add_minutes(weekend_end_time, buffer_minutes)
+    
+    # Check if in weekend maintenance period
+    in_weekend_maintenance = False
+    in_weekend_block = False
+    force_weekend_exit = False
+    
+    if weekend_start_day == 4 and weekend_end_day == 6:  # Friday to Sunday
+        # Friday: from weekend_start_time to end of day
+        # Saturday: all day
+        # Sunday: from start of day to weekend_end_time
+        is_friday = df['day_of_week'] == 4
+        is_saturday = df['day_of_week'] == 5
+        is_sunday = df['day_of_week'] == 6
+        
+        # Friday: maintenance starts at weekend_start_time
+        friday_in_maintenance = is_friday & (df['time_of_day'] >= weekend_start_time)
+        friday_in_block = is_friday & (df['time_of_day'] >= weekend_start_time_with_buffer)
+        friday_force_exit = is_friday & df['time_of_day'].between(weekend_start_time_with_buffer, weekend_start_time, inclusive='left')
+        
+        # Saturday: all day in maintenance
+        saturday_in_maintenance = is_saturday
+        saturday_in_block = is_saturday
+        saturday_force_exit = False  # No exit needed on Saturday (already closed)
+        
+        # Sunday: maintenance until weekend_end_time
+        sunday_in_maintenance = is_sunday & (df['time_of_day'] <= weekend_end_time)
+        sunday_in_block = is_sunday & (df['time_of_day'] <= weekend_end_time_with_buffer)
+        sunday_force_exit = False  # No exit needed on Sunday (already closed)
+        
+        in_weekend_maintenance = friday_in_maintenance | saturday_in_maintenance | sunday_in_maintenance
+        in_weekend_block = friday_in_block | saturday_in_block | sunday_in_block
+        force_weekend_exit = friday_force_exit
+    
+    # Combine daily and weekend
+    df['in_maintenance'] = in_daily_block | in_weekend_block
+    df['force_exit'] = force_daily_exit | force_weekend_exit
+    
+    # Clean up temporary columns
+    df = df.drop(columns=['day_of_week', 'time_of_day'])
+    
     return df
 

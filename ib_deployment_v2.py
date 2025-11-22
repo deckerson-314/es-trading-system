@@ -1082,8 +1082,8 @@ def update_indicators():
     # Apply filters
     data_with_filters = strategy.apply_filters(data_with_indicators)
     
-    # Copy filter columns back
-    for col in ['volume_filter', 'atr_filter', 'in_rth']:
+    # Copy filter columns back (including maintenance and RTH filters)
+    for col in ['volume_filter', 'atr_filter', 'in_rth', 'in_maintenance', 'force_exit', 'force_exit_rth']:
         if col in data_with_filters.columns:
             data[col] = data_with_filters[col]
 
@@ -1095,8 +1095,10 @@ def check_entries(idx, latest_row):
     if len(data) < 2:
         return
     
-    # Check filters
-    if not (latest_row.get('in_rth', True) and latest_row.get('atr_filter', False) and latest_row.get('volume_filter', False)):
+    # Check filters (including maintenance - blocks entries during maintenance + buffer)
+    in_maintenance = latest_row.get('in_maintenance', False)
+    if not (latest_row.get('in_rth', True) and latest_row.get('atr_filter', False) and 
+            latest_row.get('volume_filter', False) and not in_maintenance):
         return
     
     # Use strategy module to check entry (latest_row should have all indicators)
@@ -1261,6 +1263,174 @@ def check_entries(idx, latest_row):
 
 # Exit Logic (for manual closes or trailing updates)
 def check_exits(idx, latest_row):
+    # Check for RTH force exit (close all positions before RTH ends)
+    if strategy.enable_rth_filter and strategy.rth_exit_buffer_minutes > 0:
+        force_exit_rth = latest_row.get('force_exit_rth', False) if isinstance(latest_row, dict) else getattr(latest_row, 'force_exit_rth', False)
+        if force_exit_rth:
+            logging.warning(f"⚠️ RTH ENDING - Closing all positions ({strategy.rth_exit_buffer_minutes} min buffer)")
+            add_to_live_tracker('warning', f'RTH: Closing all positions {strategy.rth_exit_buffer_minutes} minutes before RTH end')
+            
+            # Close all open positions
+            for bracket in positions[:]:
+                try:
+                    entry_order = bracket['entry']
+                    entry_trade = None
+                    for trade in ib.trades():
+                        if trade.order.permId == entry_order.permId:
+                            entry_trade = trade
+                            break
+                    
+                    if not entry_trade or entry_trade.isActive():
+                        continue
+                    
+                    # Get actual position from IB
+                    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                    if not es_positions or es_positions[0].position == 0:
+                        positions.remove(bracket)
+                        continue
+                    
+                    actual_position = es_positions[0].position
+                    actual_qty = abs(actual_position)
+                    close_action = 'SELL' if actual_position > 0 else 'BUY'
+                    
+                    logging.info(f"Closing position for RTH end: {close_action} {actual_qty} @ market")
+                    
+                    # Cancel all orders first
+                    stop_order = bracket.get('stopLoss')
+                    tp_order = bracket.get('takeProfit')
+                    
+                    for order in [stop_order, tp_order]:
+                        if order:
+                            try:
+                                ib.cancelOrder(order)
+                            except:
+                                pass
+                    
+                    # Close position with market order
+                    close_order = MarketOrder(action=close_action, totalQuantity=actual_qty, transmit=True)
+                    close_trade = ib.placeOrder(contract, close_order)
+                    ib.sleep(2)  # Wait for execution
+                    
+                    # Get exit price and PNL
+                    if close_trade.orderStatus and close_trade.orderStatus.filled > 0:
+                        exit_price = close_trade.orderStatus.avgFillPrice
+                        direction = bracket.get('direction', 0)
+                        entry_price = bracket.get('entry_price', 0)
+                        pnl = (exit_price - entry_price) * direction * 50  # ES multiplier
+                        
+                        logging.info(f"Position closed for RTH: Exit @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
+                        add_to_live_tracker('trade', f"RTH EXIT: {'LONG' if direction==1 else 'SHORT'} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
+                    
+                    # Remove from tracking
+                    positions.remove(bracket)
+                    
+                except Exception as e:
+                    logging.error(f"Error closing position for RTH end: {e}")
+                    import traceback
+                    logging.error(traceback.format_exc())
+            
+            # Send email notification
+            try:
+                account = get_account_summary()
+                msg_lines = [
+                    f"RTH END - All Positions Closed",
+                    f"{'='*50}",
+                    f"All open positions have been closed {strategy.rth_exit_buffer_minutes} minutes before RTH end.",
+                    f"RTH End Time: {strategy.rth_end_str} ET",
+                    f"",
+                    f"Account Information:",
+                    f"  Net Liquidation: ${account.get('NetLiquidation', 0):,.2f}",
+                    f"  Total Cash: ${account.get('TotalCashValue', 0):,.2f}",
+                    f"  Total Realized PNL: ${account.get('RealizedPNL', 0):,.2f}",
+                    f"",
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                ]
+                msg = "\n".join(msg_lines)
+                send_email("BB Strategy - RTH End - Positions Closed", msg)
+            except Exception as e:
+                logging.error(f"Error sending RTH exit email: {e}")
+            
+            return  # Exit early after closing all positions
+    
+    # Check for maintenance force exit (close all positions 5 min before maintenance)
+    if strategy.enable_maintenance_filter:
+        force_exit = latest_row.get('force_exit', False) if isinstance(latest_row, dict) else getattr(latest_row, 'force_exit', False)
+        if force_exit:
+            logging.warning("⚠️ MAINTENANCE PERIOD APPROACHING - Closing all positions")
+            add_to_live_tracker('warning', 'MAINTENANCE: Closing all positions 5 minutes before maintenance period')
+            
+            # Close all open positions
+            for bracket in positions[:]:
+                try:
+                    entry_order = bracket['entry']
+                    entry_trade = None
+                    for trade in ib.trades():
+                        if trade.order.permId == entry_order.permId:
+                            entry_trade = trade
+                            break
+                    
+                    if not entry_trade or entry_trade.isActive():
+                        continue
+                    
+                    # Get actual position from IB
+                    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                    if not es_positions or es_positions[0].position == 0:
+                        positions.remove(bracket)
+                        continue
+                    
+                    actual_position = es_positions[0].position
+                    actual_qty = abs(actual_position)
+                    close_action = 'SELL' if actual_position > 0 else 'BUY'
+                    
+                    logging.info(f"Closing position for maintenance: {close_action} {actual_qty} @ market")
+                    
+                    # Cancel all orders first
+                    stop_order = bracket.get('stopLoss')
+                    tp_order = bracket.get('takeProfit')
+                    
+                    for order in [stop_order, tp_order]:
+                        if order:
+                            try:
+                                ib.cancelOrder(order)
+                            except:
+                                pass
+                    
+                    # Close position with market order
+                    close_order = MarketOrder(action=close_action, totalQuantity=actual_qty, transmit=True)
+                    close_trade = ib.placeOrder(contract, close_order)
+                    ib.sleep(2)  # Wait for execution
+                    
+                    # Get exit price and PNL
+                    if close_trade.fills:
+                        exit_price = close_trade.fills[0].execution.price
+                        fill = entry_trade.fills[0].execution if entry_trade.fills else None
+                        if fill:
+                            entry_price = fill.price
+                            dir_ = 1 if fill.side == 'BOT' else -1
+                            qty = fill.shares
+                            pnl = (exit_price - entry_price) * dir_ * qty * multiplier
+                            
+                            add_to_live_tracker('trade', 
+                                f"TRADE CLOSE (Maintenance): {'LONG' if dir_==1 else 'SHORT'} {qty} @ ${exit_price:.2f}, "
+                                f"PNL: ${pnl:,.2f}")
+                            
+                            msg = (f"TRADE CLOSE (Maintenance) - {'LONG' if dir_==1 else 'SHORT'}\n"
+                                   f"Entry: {entry_price:.2f}\n"
+                                   f"Exit: {exit_price:.2f}\n"
+                                   f"PNL: {pnl:,.2f}")
+                            send_email("BB Strategy - Trade CLOSE (Maintenance)", msg)
+                    
+                    positions.remove(bracket)
+                except Exception as e:
+                    logging.error(f"Error closing position for maintenance: {e}")
+                    # Remove bracket anyway to prevent retry loops
+                    if bracket in positions:
+                        positions.remove(bracket)
+            
+            if not positions:
+                status_timer.stop()
+            return  # Exit early after closing all positions
+    
     for bracket in positions[:]:
         entry_order = bracket['entry']
         stop_order = bracket['stopLoss']

@@ -7,14 +7,23 @@ Bollinger Band Length,30,20,100,int,Lookback period for BB
 Bollinger Band StdDev,2.0,1.5,3.0,float,StdDev multiplier for BB width
 Long Entry on Wick Touch,false,false,true,bool,Enter if low touches lower band
 Long Entry on Body in Zone,true,false,true,bool,Enter if close ≤ lower band
-Long Trigger (% From Lower Band),0.0,0.1,2.0,float,% below lower band to trigger (min 0.1% to avoid band extremes)
+Long Trigger (% From Lower Band),0.0,0.0,2.0,float,% below lower band to trigger (min 0.1% to avoid band extremes)
 Short Entry on Wick Touch,false,false,true,bool,Enter if high touches upper band
 Short Entry on Body in Zone,true,false,true,bool,Enter if close ≥ upper band
-Short Trigger (% From Upper Band),0.0,0.1,2.0,float,% above upper band to trigger (min 0.1% to avoid band extremes)
-Min ATR Filter (Points),0.5,0,10,float,Minimum ATR value to allow entries - lower default for more opportunities
-RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
-RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end
+Short Trigger (% From Upper Band),0.0,0.0,2.0,float,% above upper band to trigger (min 0.1% to avoid band extremes)
+Min ATR Filter (Points),2.0,2.0,10,float,Minimum ATR value to allow entries (min 2.0 to avoid low volatility trades)
+RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start (Eastern Time)
+RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end (Eastern Time)
 Enable RTH Filter,true,false,true,bool,Restrict entries to RTH only
+RTH Exit Buffer (minutes),0,0,60,int,Minutes before RTH end to start closing positions (0 = no auto-close)
+Enable Maintenance Filter,true,false,true,bool,Exit positions before maintenance periods
+Daily Maintenance Start (HH:MM),17:00,00:00,23:59,str,Daily maintenance period start in Eastern Time (ES: 4:00 PM CT = 5:00 PM ET)
+Daily Maintenance End (HH:MM),17:30,00:00,23:59,str,Daily maintenance period end in Eastern Time (ES: 4:30 PM CT = 5:30 PM ET)
+Weekend Maintenance Start Day,4,0,6,int,"Weekend maintenance start day (0=Mon, 4=Fri, 6=Sun)"
+Weekend Maintenance Start Time (HH:MM),17:00,00:00,23:59,str,Weekend maintenance start time in Eastern Time (ES: Fri 4:00 PM CT = 5:00 PM ET)
+Weekend Maintenance End Day,6,0,6,int,"Weekend maintenance end day (0=Mon, 4=Fri, 6=Sun)"
+Weekend Maintenance End Time (HH:MM),18:00,00:00,23:59,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET)
+Maintenance Buffer Minutes,5,1,30,int,Minutes before/after maintenance to exit/block trading
 Min Volume Multiplier,1.2,0.5,1.8,float,Volume filter - reduced to be less restrictive (1.0 = no filter)
 Timeframe (minutes),15,1,15,int,Resample timeframe in minutes
 Max Open Trades,1,1,1,int,Maximum concurrent positions

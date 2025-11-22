@@ -208,13 +208,13 @@ def run_backtest(params, df, param_dict_local, suppress_output=True):
             min_downside_std = 0.001  # 0.1% daily downside volatility floor
             annualized_return = rets.mean() * 252
             sortino = (annualized_return / min_downside_std) if rets.mean() > 0 else 0.0
-            # Cap Sortino at 100 to prevent extreme values (even best strategies rarely exceed 10-20)
-            sortino = min(sortino, 100.0)
+            # Cap Sortino at 30 to prevent extreme values (even best strategies rarely exceed 10-20)
+            sortino = min(sortino, 30.0)
         else:
             downside_std = downside_rets.std()
             sortino = (rets.mean() / downside_std * np.sqrt(252)) if downside_std != 0 else 0.0
-            # Cap Sortino at 100 to prevent extreme values
-            sortino = min(sortino, 100.0)
+            # Cap Sortino at 30 to prevent extreme values
+            sortino = min(sortino, 30.0)
     
     # Max drawdown
     peak = 50000
@@ -354,8 +354,25 @@ def evaluate_multi_objective(ind_and_df):
         max_dd = 1000000.0  # Very poor fitness
         pf = 0.0
     
-    # Cap Sortino at 100 to prevent unrealistic values
-    sortino = min(sortino, 100.0)
+    # Additional validation: Check if no TP is enabled (all TP options false)
+    no_tp = (not params.get('Opposite Bollinger Band TP', False) and 
+             not params.get('Fixed ATR TP', False) and 
+             not params.get('Fixed BB at Entry TP', False))
+    if no_tp:
+        # Heavy penalty for no TP - strategy can't capture profits
+        sortino = -500.0
+        max_dd = 500000.0
+        pf = 0.0
+    
+    # Additional validation: Check if Min ATR Filter is too low
+    min_atr = params.get('Min ATR Filter (Points)', 0.0)
+    if min_atr < 2.0:
+        # Penalty for allowing entries in very low volatility
+        sortino *= 0.5  # Reduce sortino by 50%
+        pf *= 0.5  # Reduce profit factor by 50%
+    
+    # Cap Sortino at 30 to prevent unrealistic values
+    sortino = min(sortino, 30.0)
     
     # Heavy penalty for too few trades (violates minimum constraint)
     if low_pen > 0:
@@ -443,8 +460,8 @@ def _evaluate_worker(args):
     max_dd = metrics['max_drawdown']
     pf = metrics['profit_factor']
     
-    # Cap Sortino at 100 to prevent unrealistic values
-    sortino = min(sortino, 100.0)
+    # Cap Sortino at 30 to prevent unrealistic values
+    sortino = min(sortino, 30.0)
     
     # Heavy penalty for too few trades (violates minimum constraint)
     # BUT: Use a gradient penalty instead of hard cutoff to allow some diversity
@@ -502,7 +519,8 @@ def parallel_evaluate(individuals, df, param_dict_local, param_keys_local):
 def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict,
                             logbook, is_res, oos_res, trades_is, trades_oos,
                             html_path, diag_dir, current_gen=None, total_gen=None, 
-                            is_final=False, auto_launch=False, is_periods=None, oos_periods=None):
+                            is_final=False, auto_launch=False, is_periods=None, oos_periods=None,
+                            in_sample=None):
     """
     Generate comprehensive interactive HTML dashboard for GA results.
     
@@ -543,15 +561,31 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     
     # Extract Pareto front data with clamped parameters
     pareto_data = []
+    
+    # Only calculate avg_trades_day for final generation (too expensive for intermediate)
+    # For intermediate generations, we'll use 0.0 as placeholder
+    calculate_trades_day = is_final and in_sample is not None
+    
     for i, ind in enumerate(hof):
         raw_params = dict(zip(param_keys, ind))
         clamped_params = clamp_params(raw_params, param_dict)
         fitness = ind.fitness.values
+        
+        # Calculate avg_trades_day by re-running backtest (only for final generation)
+        avg_trades_day = 0.0
+        if calculate_trades_day:
+            try:
+                sol_metrics = run_backtest(clamped_params, in_sample, param_dict, suppress_output=True)
+                avg_trades_day = sol_metrics.get('avg_trades_day', 0.0)
+            except Exception:
+                avg_trades_day = 0.0
+        
         pareto_data.append({
             'index': i,
             'sortino': fitness[0],
             'max_dd': fitness[1],
             'profit_factor': fitness[2],
+            'avg_trades_day': avg_trades_day,
             'params': clamped_params,  # Use clamped parameters
             'is_selected': (ind == best)
         })
@@ -643,17 +677,20 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     fig_pareto_size.update_layout(title="Pareto Front Size", xaxis_title="Generation", yaxis_title="Solutions", height=300)
     
     # Generate HTML tables and content
+    # avg_trades_day is already calculated in pareto_data extraction above
     pareto_table_html = """<table class='pareto-table'><thead><tr>
         <th>Rank<span class="tooltip-icon">?</span><span class="tooltip">Ranking by Sortino Ratio (highest to lowest). Lower rank = better risk-adjusted returns.</span></th>
         <th>Sortino<span class="tooltip-icon">?</span><span class="tooltip">Sortino Ratio - risk-adjusted return focusing on downside volatility. Higher is better.</span></th>
         <th>Max DD<span class="tooltip-icon">?</span><span class="tooltip">Maximum Drawdown in dollars. Lower is better for risk management.</span></th>
         <th>PF<span class="tooltip-icon">?</span><span class="tooltip">Profit Factor (Gross Profit / Gross Loss). Values >1.0 are profitable, >2.0 are excellent.</span></th>
+        <th>Avg Trades/Day<span class="tooltip-icon">?</span><span class="tooltip">Average number of trades executed per day. Helps assess strategy activity level.</span></th>
         <th>Selected<span class="tooltip-icon">?</span><span class="tooltip">★ indicates the solution selected for use (highest Sortino Ratio).</span></th>
     </tr></thead><tbody>"""
     pareto_sorted = sorted(pareto_data, key=lambda x: x['sortino'], reverse=True)
     for rank, sol in enumerate(pareto_sorted, 1):
         mark = "★" if sol['is_selected'] else ""
-        pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{sol['sortino']:.4f}</td><td>{sol['max_dd']:.2f}</td><td>{sol['profit_factor']:.4f}</td><td>{mark}</td></tr>"
+        avg_trades = sol.get('avg_trades_day', 0.0)
+        pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{sol['sortino']:.4f}</td><td>{sol['max_dd']:.2f}</td><td>{sol['profit_factor']:.4f}</td><td>{avg_trades:.3f}</td><td>{mark}</td></tr>"
     pareto_table_html += "</tbody></table>"
     
     # Best params table - grouped by category
@@ -800,12 +837,52 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     
     # Extract div and script from each chart
     def extract_chart_html(html_snippet):
+        """Extract div and script tags from Plotly HTML output."""
+        if not html_snippet or len(html_snippet) == 0:
+            return "", ""
+        
+        # Find div - look for the main chart div (usually has id attribute)
         div_start = html_snippet.find('<div')
-        div_end = html_snippet.find('</div>') + 6
+        if div_start == -1:
+            return "", ""
+        
+        # Find the matching closing </div> tag by counting nested divs
+        div_end_pos = div_start
+        depth = 0
+        i = div_start
+        while i < len(html_snippet):
+            # Check for opening div tag (not self-closing)
+            if html_snippet[i:i+4] == '<div':
+                # Check if self-closing (ends with />)
+                tag_end = html_snippet.find('>', i)
+                if tag_end != -1:
+                    if html_snippet[tag_end-1] != '/':
+                        depth += 1
+                    i = tag_end + 1
+                else:
+                    i += 1
+            # Check for closing div tag
+            elif html_snippet[i:i+6] == '</div>':
+                depth -= 1
+                if depth == 0:
+                    div_end_pos = i + 6
+                    break
+                i += 6
+            else:
+                i += 1
+        
+        div_part = html_snippet[div_start:div_end_pos] if div_end_pos > div_start else ""
+        
+        # Find script tag - get the main script with chart data
         script_start = html_snippet.find('<script')
-        script_end = html_snippet.find('</script>') + 9
-        div_part = html_snippet[div_start:div_end]
-        script_part = html_snippet[script_start:script_end]
+        if script_start == -1:
+            return div_part, ""
+        
+        script_end = html_snippet.find('</script>', script_start)
+        if script_end == -1:
+            return div_part, ""
+        
+        script_part = html_snippet[script_start:script_end + 9]
         return div_part, script_part
     
     conv_div, conv_script = extract_chart_html(conv_html)
@@ -1159,7 +1236,7 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
             oos_period_stats_html += "</tbody></table>"
             html_content += oos_period_stats_html
     
-    html_content += """
+    html_content += f"""
 <h2>In-Sample vs OOS Comparison<span class="tooltip-icon">?</span>
     <span class="tooltip">Comparison of strategy performance between in-sample (training) and out-of-sample (validation) data. This is critical for detecting overfitting. Good generalization: IS and OOS metrics are similar. Overfitting: IS is much better than OOS. Green differences indicate OOS is better (good sign), red indicates OOS is worse (potential overfitting).</span>
 </h2>
@@ -1464,7 +1541,7 @@ def main():
             pop = toolbox.population(n=POP_SIZE)
             hof = tools.ParetoFront()  # Store Pareto-optimal solutions
             logbook = tools.Logbook()
-            logbook.header = "gen", "evals", "avg_sortino", "avg_dd", "avg_pf", "pareto_size"
+            logbook.header = "gen", "evals", "avg_sortino", "avg_dd", "avg_pf", "pareto_size", "avg_trades_day", "max_trades_day"
             start_gen = 0
         elif not verify_config_compatibility(saved_config, current_config):
             print("\nWARNING: Config mismatch detected!")
@@ -1475,7 +1552,7 @@ def main():
         pop = toolbox.population(n=POP_SIZE)
         hof = tools.ParetoFront()  # Store Pareto-optimal solutions
         logbook = tools.Logbook()
-        logbook.header = "gen", "evals", "avg_sortino", "avg_dd", "avg_pf", "pareto_size"
+        logbook.header = "gen", "evals", "avg_sortino", "avg_dd", "avg_pf", "pareto_size", "avg_trades_day", "max_trades_day"
         start_gen = 0
         print("\nStarting fresh run...")
     
@@ -1487,6 +1564,10 @@ def main():
     stats.register("min_dd", lambda x: np.min([f[1] for f in x]))
     stats.register("max_sortino", lambda x: np.max([f[0] for f in x]))
     stats.register("max_pf", lambda x: np.max([f[2] for f in x]))
+    
+    # Track avg_trades_day separately (not in fitness tuple, but needed for analysis)
+    # We'll calculate it during evaluation and store it in a custom attribute
+    # For now, we'll track it by re-running backtests on best individuals each generation
     
     if start_gen == 0:
         print(logbook.header)
@@ -1595,10 +1676,36 @@ def main():
             # Record statistics
             record = stats.compile(pop)
             record['pareto_size'] = len(hof)
+            
+            # Calculate avg_trades_day for best individual (for tracking)
+            best_ind = max(pop, key=lambda ind: ind.fitness.values[0]) if pop else None
+            if best_ind:
+                try:
+                    best_params_temp = dict(zip(param_keys, best_ind))
+                    # Clamp parameters
+                    for n, v in best_params_temp.items():
+                        mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
+                        v = max(mn, min(v, mx))
+                        if typ == 'int':
+                            best_params_temp[n] = int(round(v))
+                        else:
+                            best_params_temp[n] = float(v)
+                    best_metrics = run_backtest(best_params_temp, in_sample, param_dict, suppress_output=True)
+                    record['avg_trades_day'] = best_metrics.get('avg_trades_day', 0.0)
+                    record['max_trades_day'] = best_metrics.get('avg_trades_day', 0.0)  # For best individual, same as avg
+                except Exception as e:
+                    record['avg_trades_day'] = 0.0
+                    record['max_trades_day'] = 0.0
+            else:
+                record['avg_trades_day'] = 0.0
+                record['max_trades_day'] = 0.0
+            
             logbook.record(gen=gen, evals=len(pop), **record)
             
             print(f"{gen}\t{len(pop)}\t{round(record['avg_sortino'], 4)}\t{round(record['avg_dd'], 2)}\t{round(record['avg_pf'], 4)}\t{len(hof)}")
             print(f"  Best: Sortino={round(record['max_sortino'], 4)}, DD={round(record['min_dd'], 2)}, PF={round(record['max_pf'], 4)}")
+            if 'avg_trades_day' in record:
+                print(f"  Avg Trades/Day: {record['avg_trades_day']:.3f}")
             
             # Diagnostic: If all solutions are penalized, show more info
             if record['max_sortino'] < 0 and gen % 5 == 0:  # Only print every 5 generations
@@ -1610,9 +1717,14 @@ def main():
             save_checkpoint(pop, hof, logbook, gen, current_config)
             
             # Update HTML dashboard after each generation (with progress info)
-            # Select best solution for display (highest Sortino)
+            # Select best solution for display (highest Sortino, with tie-breaker if capped)
             if len(hof) > 0:
-                best_for_display = max(hof, key=lambda ind: ind.fitness.values[0])
+                max_sortino = max(ind.fitness.values[0] for ind in hof)
+                if max_sortino >= 30.0:  # Sortino is capped, need tie-breaker
+                    candidates = [ind for ind in hof if abs(ind.fitness.values[0] - max_sortino) < 0.01]
+                    best_for_display = min(candidates, key=lambda ind: (ind.fitness.values[1], -ind.fitness.values[2]))
+                else:
+                    best_for_display = max(hof, key=lambda ind: ind.fitness.values[0])
                 best_params_display = dict(zip(param_keys, best_for_display))
                 # Clamp parameters
                 for n, v in best_params_display.items():
@@ -1650,7 +1762,8 @@ def main():
                     WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
                     current_gen=gen + 1, total_gen=NUM_GEN, is_final=False, auto_launch=auto_launch_now,
                     is_periods=is_periods if 'is_periods' in locals() else None, 
-                    oos_periods=oos_periods if 'oos_periods' in locals() else None
+                    oos_periods=oos_periods if 'oos_periods' in locals() else None,
+                    in_sample=in_sample
                 )
                 # Also copy to diagnostics directory for backup
                 try:
@@ -1697,7 +1810,16 @@ def main():
     
     # Select best solution from Pareto front
     # Strategy: Choose solution with highest Sortino Ratio (primary objective)
-    best = max(hof, key=lambda ind: ind.fitness.values[0])
+    # If multiple solutions have capped Sortino (30.0), use tie-breaker: lower drawdown, then higher PF
+    max_sortino = max(ind.fitness.values[0] for ind in hof)
+    if max_sortino >= 30.0:  # Sortino is capped, need tie-breaker
+        # Find all solutions with max Sortino
+        candidates = [ind for ind in hof if abs(ind.fitness.values[0] - max_sortino) < 0.01]
+        # Among candidates, prefer: lower drawdown (fitness[1]), then higher PF (fitness[2])
+        best = min(candidates, key=lambda ind: (ind.fitness.values[1], -ind.fitness.values[2]))
+        print(f"  Note: Multiple solutions have capped Sortino ({max_sortino:.2f}). Selected based on lower drawdown.")
+    else:
+        best = max(hof, key=lambda ind: ind.fitness.values[0])
     
     # Clamp and format best parameters properly
     best_params_raw = dict(zip(param_keys, best))

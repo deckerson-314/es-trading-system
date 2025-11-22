@@ -10,7 +10,7 @@ import numpy as np
 from datetime import time
 from .parameters import get_param_value
 from .indicators import calculate_bollinger_bands, calculate_atr
-from .filters import apply_rth_filter, apply_volume_filter, apply_atr_filter
+from .filters import apply_rth_filter, apply_volume_filter, apply_atr_filter, apply_maintenance_filter
 
 
 class BollingerBandStrategy:
@@ -57,7 +57,18 @@ class BollingerBandStrategy:
         self.enable_rth_filter = get_param_value(self.params_dict, 'Enable RTH Filter', True)
         self.rth_start_str = get_param_value(self.params_dict, 'RTH Start (HH:MM)', '09:30')
         self.rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
+        self.rth_exit_buffer_minutes = int(get_param_value(self.params_dict, 'RTH Exit Buffer (minutes)', 0))
         self.min_volume_multiplier = float(get_param_value(self.params_dict, 'Min Volume Multiplier', 1.5))
+        
+        # Maintenance period filter parameters
+        self.enable_maintenance_filter = get_param_value(self.params_dict, 'Enable Maintenance Filter', False)
+        self.daily_maintenance_start_str = get_param_value(self.params_dict, 'Daily Maintenance Start (HH:MM)', '16:00')
+        self.daily_maintenance_end_str = get_param_value(self.params_dict, 'Daily Maintenance End (HH:MM)', '16:30')
+        self.weekend_maintenance_start_day = int(get_param_value(self.params_dict, 'Weekend Maintenance Start Day', 4))
+        self.weekend_maintenance_start_time_str = get_param_value(self.params_dict, 'Weekend Maintenance Start Time (HH:MM)', '16:00')
+        self.weekend_maintenance_end_day = int(get_param_value(self.params_dict, 'Weekend Maintenance End Day', 6))
+        self.weekend_maintenance_end_time_str = get_param_value(self.params_dict, 'Weekend Maintenance End Time (HH:MM)', '17:00')
+        self.maintenance_buffer_minutes = int(get_param_value(self.params_dict, 'Maintenance Buffer Minutes', 5))
         
         # Optimizable parameters (can be overridden)
         self.bb_length = max(1, int(get_param_value(self.params_dict, 'Bollinger Band Length', 30)))
@@ -138,7 +149,7 @@ class BollingerBandStrategy:
     
     def apply_filters(self, df):
         """
-        Apply all filters (RTH, volume, ATR).
+        Apply all filters (RTH, volume, ATR, maintenance).
         
         Args:
             df: DataFrame with indicators calculated
@@ -149,7 +160,16 @@ class BollingerBandStrategy:
         df = df.copy()
         
         # RTH filter
-        df = apply_rth_filter(df, self.enable_rth_filter, self.rth_start, self.rth_end)
+        df = apply_rth_filter(df, self.enable_rth_filter, self.rth_start, self.rth_end, self.rth_exit_buffer_minutes)
+        
+        # Maintenance period filter
+        df = apply_maintenance_filter(
+            df, self.enable_maintenance_filter,
+            self.daily_maintenance_start_str, self.daily_maintenance_end_str,
+            self.weekend_maintenance_start_day, self.weekend_maintenance_start_time_str,
+            self.weekend_maintenance_end_day, self.weekend_maintenance_end_time_str,
+            self.maintenance_buffer_minutes
+        )
         
         # Volume filter
         df = apply_volume_filter(df, self.min_volume_multiplier_opt, volume_window=50)
@@ -173,6 +193,9 @@ class BollingerBandStrategy:
         Returns:
             tuple: (enter_long: bool, enter_short: bool)
         """
+        # Initialize variables to avoid UnboundLocalError
+        in_maintenance = False
+        
         # Get current values
         if hasattr(row, 'Index'):
             # From itertuples
@@ -185,6 +208,11 @@ class BollingerBandStrategy:
             in_rth = row.in_rth
             atr_filter = row.atr_filter
             vol_filter = row.volume_filter
+            # itertuples converts column names - pandas may add underscore if name conflicts
+            # Try both 'in_maintenance' and 'in_maintenance_' (pandas adds _ for reserved names)
+            in_maintenance = getattr(row, 'in_maintenance', False)
+            if not in_maintenance and hasattr(row, 'in_maintenance_'):
+                in_maintenance = getattr(row, 'in_maintenance_', False)
         else:
             # From iterrows or direct access
             idx = row.name if hasattr(row, 'name') else df.index[-1]
@@ -196,9 +224,10 @@ class BollingerBandStrategy:
             in_rth = row['in_rth']
             atr_filter = row['atr_filter']
             vol_filter = row['volume_filter']
+            in_maintenance = row.get('in_maintenance', False) if hasattr(row, 'get') else (row['in_maintenance'] if 'in_maintenance' in row else False)
         
-        # Check filters
-        if not (in_rth and atr_filter and vol_filter):
+        # Check filters (including maintenance - blocks entries during maintenance + buffer)
+        if not (in_rth and atr_filter and vol_filter and not in_maintenance):
             return False, False
         
         enter_long = enter_short = False
@@ -400,6 +429,30 @@ class BollingerBandStrategy:
         
         dir_ = position['direction']
         candidates = []
+        
+        # Check for maintenance force exit (5 minutes before maintenance)
+        force_exit = False
+        if hasattr(row, 'force_exit'):
+            force_exit = row.force_exit
+        elif isinstance(row, dict) or hasattr(row, 'get'):
+            force_exit = row.get('force_exit', False) if hasattr(row, 'get') else (row['force_exit'] if 'force_exit' in row else False)
+        
+        if force_exit:
+            # Force exit at current price due to maintenance period approaching
+            exit_price = row.close if hasattr(row, 'close') else row['close']
+            return True, 'Maintenance Exit', exit_price
+        
+        # Check for RTH force exit (buffer minutes before RTH end)
+        force_exit_rth = False
+        if hasattr(row, 'force_exit_rth'):
+            force_exit_rth = row.force_exit_rth
+        elif isinstance(row, dict) or hasattr(row, 'get'):
+            force_exit_rth = row.get('force_exit_rth', False) if hasattr(row, 'get') else (row['force_exit_rth'] if 'force_exit_rth' in row else False)
+        
+        if force_exit_rth:
+            # Force exit at current price due to RTH ending
+            exit_price = row.close if hasattr(row, 'close') else row['close']
+            return True, 'RTH Exit', exit_price
         
         # Stop loss
         if dir_ == 1 and low <= position['stop']:

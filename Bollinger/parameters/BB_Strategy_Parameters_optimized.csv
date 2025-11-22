@@ -1,48 +1,42 @@
 Name,Value,Min,Max,Type,Description
 __indicatorName,BB Strategy,,,,Strategy identifier
-=== ENTRY CRITERIA ===,,,,,
+Max Open Trades,1,1,5,int,Maximum concurrent positions
 Enable Long Trades,true,false,true,bool,Allow long entries
 Enable Short Trades,true,false,true,bool,Allow short entries
-Bollinger Band Length,94,20,100,int,Lookback period for BB
-Bollinger Band StdDev,1.6838,1.5,3.0,float,StdDev multiplier for BB width
+Bollinger Band Length,15,10,100,int,Lookback period for BB
+Bollinger Band StdDev,2.9917,1.0,3.0,float,StdDev multiplier for BB width
 Long Entry on Wick Touch,false,false,true,bool,Enter if low touches lower band
 Long Entry on Body in Zone,true,false,true,bool,Enter if close ≤ lower band
-Long Trigger (% From Lower Band),0.1,0.1,2.0,float,% below lower band to trigger (min 0.1% to avoid band extremes)
+Long Trigger (% From Lower Band),1.2197,0.0,2.0,float,% below lower band to trigger
 Short Entry on Wick Touch,false,false,true,bool,Enter if high touches upper band
 Short Entry on Body in Zone,true,false,true,bool,Enter if close ≥ upper band
-Short Trigger (% From Upper Band),0.1358,0.1,2.0,float,% above upper band to trigger (min 0.1% to avoid band extremes)
-Min ATR Filter (Points),5.1917,0,10,float,Minimum ATR value to allow entries - lower default for more opportunities
-RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
-RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end
-Enable RTH Filter,true,false,true,bool,Restrict entries to RTH only
-Min Volume Multiplier,0.5401,0.5,1.8,float,Volume filter - reduced to be less restrictive (1.0 = no filter)
-Timeframe (minutes),10,1,15,int,Resample timeframe in minutes
-Max Open Trades,1,1,1,int,Maximum concurrent positions
-=== TAKE PROFIT CRITERIA ===,,,,,
+Short Trigger (% From Upper Band),0.6466,0.0,2.0,float,% above upper band to trigger
+Initial Stop Loss (%),0.7167,0.1,2.0,float,Fixed stop loss %
+Enable Trailing Stop,true,false,true,bool,Use ATR trailing stop
+ATR Length for Trailing Stop,41,10,100,int,ATR period for trailing
+ATR Multiplier for Trailing Stop,1.8054,1.0,5.0,float,Trailing stop ATR multiplier
+Trailing Delay (bars),11,0,20,int,Bars before trailing stop begins tightening (0 = immediate)
 Opposite Bollinger Band TP,false,false,true,bool,DYNAMIC: Exit at current opposite BB
 Fixed ATR TP,false,false,true,bool,FIXED: Entry ± (ATR × Multiplier)
 Fixed BB at Entry TP,true,false,true,bool,FIXED: Upper BB at entry (long)
-ATR Length for TP,76,15,80,int,ATR period for fixed TP
-ATR Multiplier for TP,3.3224,1.0,5.0,float,Fixed TP ATR multiplier - reduced max to prevent overfitting
-=== STOP LOSS CRITERIA ===,,,,,
-Initial Stop Loss (%),1.7493,0.5,2,float,Fixed stop loss % - wider range for better generalization
-Enable Trailing Stop,true,false,true,bool,Use ATR trailing stop
-ATR Length for Trailing Stop,20,10,100,int,ATR period for trailing
-ATR Multiplier for Trailing Stop,0.6197,0.5,4.5,float,Trailing stop ATR multiplier - reduced max to prevent overfitting
-Trailing Delay (bars),9,0,20,int,Bars before trailing stop begins tightening (0 = immediate)
-=== GA CRITERIA ===,,,,,
-POP_SIZE,106,100,150,int,Population size - reduced to prevent overfitting
-NUM_GEN,64,50,75,int,Number of generations - reduced to prevent overfitting
-CX_PB,0.7288,0.5,0.9,float,Crossover probability
-MUT_PB,0.3381,0.2,0.5,float,Mutation probability
-MUT_MU,0.4649,-1.0,1.0,float,Mutation mean
-MUT_SIGMA,0.3059,0.1,0.4,float,Mutation std dev
-TARGET_TRADES_DAY,1,1,4,int,Ideal trades/day - reduced to be more realistic
-TRADES_PENALTY_WEIGHT,0.6888,0.1,0.8,float,Penalty for excess trades - reduced to be less restrictive
-DD_WEIGHT,0.517,0.2,0.8,float,Drawdown penalty weight - increased to prioritize risk management
-DATA_SPLITS,0.7,0.60,0.70,float,In-sample fraction per period - 60-70% for better generalization (30-40% OOS)
-DATA_SIZE,4640055,0,10000000,int,Rows to subsample (0 = full dataset)
-USE_INTERLEAVED_SPLIT,true,false,true,bool,Use interleaved IS/OOS periods instead of single split
-NUM_SPLIT_PERIODS,4,3,7,int,Number of alternating periods (IS-OOS-IS-OOS-IS) - odd number recommended
-MIN_TRADES_DAY,1.0741,0.5,2.0,float,MUST have at least 0.3 trades/day - further relaxed due to interleaved split reducing effective trading days
-MIN_TRADES_PEN_WEIGHT,-194.6444,-200.0,-50.0,float,Scalar penalty — zero trades = -100
+ATR Length for TP,29,10,80,int,ATR period for fixed TP
+ATR Multiplier for TP,1.4537,1.0,6.0,float,Fixed TP ATR multiplier
+Min ATR Filter (Points),6.578,0,10,float,Minimum ATR value to allow entries
+RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
+RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end
+Enable RTH Filter,true,false,true,bool,Restrict entries to RTH only
+Min Volume Multiplier,1.4181,1.0,1.5,float,Volume filter (1.0 = no filter)
+Timeframe (minutes),1,1,8,int,Resample timeframe in minutes
+POP_SIZE,109,100,300,int,Population size
+NUM_GEN,89,50,150,int,Number of generations
+CX_PB,0.9,0.5,0.9,float,Crossover probability
+MUT_PB,0.2,0.2,0.5,float,Mutation probability
+MUT_MU,-0.2931,-1.0,1.0,float,Mutation mean
+MUT_SIGMA,0.2241,0.1,0.4,float,Mutation std dev
+TARGET_TRADES_DAY,2,1,5,int,Ideal trades/day
+TRADES_PENALTY_WEIGHT,0.3478,0.1,1.0,float,Penalty for excess trades
+DD_WEIGHT,0.1,0.1,1.0,float,Drawdown penalty weight
+DATA_SPLITS,0.9,0.5,0.9,float,In-sample fraction
+DATA_SIZE,627094,0,1000000,int,Rows to subsample (0 = full)
+MIN_TRADES_DAY,0.6317,0.5,2.0,float,MUST have at least 2 trades/day
+MIN_TRADES_PEN_WEIGHT,-146.8195,-200.0,-50.0,float,Scalar penalty — zero trades = -100
