@@ -84,8 +84,8 @@ def group_params_for_display(params_dict_local):
                           'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                           'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                           'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                          'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                          'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                          'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                          'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                           'Max Open Trades'],
         'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
                                 'ATR Length for TP', 'ATR Multiplier for TP'],
@@ -137,8 +137,8 @@ if len(df) == 0:
     log("ERROR: No data after filtering!")
     log("This could be due to:")
     log(f"  - RTH filter: {strategy.enable_rth_filter} ({strategy.rth_start_str} to {strategy.rth_end_str})")
-    log(f"  - Min ATR filter: {strategy.min_atr_points} points")
-    log(f"  - Min Volume multiplier: {strategy.min_volume_multiplier}")
+    log(f"  - Max ATR filter: {strategy.max_atr_points} points (min floor: {strategy.min_atr_points})")
+    log(f"  - Max Volume multiplier: {strategy.max_volume_multiplier}")
     log(f"  - Data quality issues (missing bars, gaps)")
     sys.exit(1)
 

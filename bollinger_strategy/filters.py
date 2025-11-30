@@ -80,37 +80,50 @@ def apply_rth_filter(df, enable_rth_filter, rth_start, rth_end, rth_exit_buffer_
     return df
 
 
-def apply_volume_filter(df, min_volume_multiplier, volume_window=50):
+def apply_volume_filter(df, max_volume_multiplier, volume_window=50):
     """
-    Apply volume filter.
+    Apply volume filter for mean reversion strategy.
+    
+    For mean reversion, we want LOW volume (exhausted moves ready to reverse),
+    not HIGH volume (strong momentum/trend continuation).
     
     Args:
         df: DataFrame with 'volume' column
-        min_volume_multiplier: Minimum volume multiplier vs rolling average
+        max_volume_multiplier: Maximum volume multiplier vs rolling average
+                              (volume must be <= avg_volume * max_volume_multiplier)
         volume_window: Rolling window for average volume calculation
         
     Returns:
-        DataFrame with added 'volume_filter' column
+        DataFrame with added 'volume_filter' column (True when volume is below threshold)
     """
     df = df.copy()
     df['avg_volume'] = df['volume'].rolling(volume_window).mean()
-    df['volume_filter'] = df['volume'] >= df['avg_volume'] * min_volume_multiplier
+    # For mean reversion: filter allows LOW volume (volume <= avg * multiplier)
+    # High volume suggests strong momentum (bad for mean reversion)
+    df['volume_filter'] = df['volume'] <= df['avg_volume'] * max_volume_multiplier
     return df
 
 
-def apply_atr_filter(df, min_atr_points):
+def apply_atr_filter(df, max_atr_points, min_atr_points=0.5):
     """
-    Apply ATR filter.
+    Apply ATR filter for mean reversion strategy.
+    
+    For mean reversion, we want LOW ATR (exhausted moves ready to reverse),
+    not HIGH ATR (strong momentum/trend continuation).
     
     Args:
         df: DataFrame with 'atr_ts' column
-        min_atr_points: Minimum ATR value in points
+        max_atr_points: Maximum ATR value in points (ATR must be <= this to allow trades)
+        min_atr_points: Minimum ATR floor (optional, default 0.5) to ensure stops aren't too tight
         
     Returns:
-        DataFrame with added 'atr_filter' column
+        DataFrame with added 'atr_filter' column (True when ATR is within range)
     """
     df = df.copy()
-    df['atr_filter'] = df['atr_ts'] >= min_atr_points
+    # For mean reversion: filter allows LOW ATR (atr <= max_atr_points)
+    # High ATR suggests strong momentum (bad for mean reversion)
+    # But keep a minimum floor to ensure stops aren't unreasonably tight
+    df['atr_filter'] = (df['atr_ts'] >= min_atr_points) & (df['atr_ts'] <= max_atr_points)
     return df
 
 

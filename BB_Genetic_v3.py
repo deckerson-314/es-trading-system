@@ -638,23 +638,24 @@ def evaluate_multi_objective(ind_and_df):
         # Reduce fitness but don't eliminate
         penalty_factor *= 0.3  # Reduce by 70%
     
-    # 5. Min ATR Filter too low (gradual penalty)
-    min_atr = params.get('Min ATR Filter (Points)', 0.0)
-    if min_atr < 2.0:
-        # Gradual penalty based on how low
-        penalty = (2.0 - min_atr) / 2.0  # 0 to 1 scale
-        penalty_factor *= (1.0 - penalty * 0.3)  # Reduce by up to 30%
-    
-    # 6. Min ATR Filter too high (conservative - reduces trade frequency)
+    # 5. Max ATR Filter too high (allows high volatility - bad for mean reversion)
+    max_atr = params.get('Max ATR Filter (Points)', 10.0)
     # Get ATR filter range from param_dict
-    atr_min = param_dict.get('Min ATR Filter (Points)', {}).get('min', 2.0)
-    atr_max = param_dict.get('Min ATR Filter (Points)', {}).get('max', 4.0)
-    if min_atr > atr_min + (atr_max - atr_min) * 0.7:  # Above 70% of range
-        # Penalty increases as ATR gets more conservative
+    atr_min = param_dict.get('Max ATR Filter (Points)', {}).get('min', 1.0)
+    atr_max = param_dict.get('Max ATR Filter (Points)', {}).get('max', 6.0)
+    if max_atr > atr_min + (atr_max - atr_min) * 0.7:  # Above 70% of range
+        # Penalty increases as Max ATR gets higher (allows more high volatility)
         # At 70% of range: no penalty, at 100% of range: 50% penalty
-        conservative_pct = (min_atr - (atr_min + (atr_max - atr_min) * 0.7)) / ((atr_max - atr_min) * 0.3)
-        conservative_pct = min(1.0, max(0.0, conservative_pct))  # Clamp 0-1
-        penalty_factor *= (1.0 - conservative_pct * 0.5)  # Reduce by up to 50% for very conservative ATR
+        high_vol_pct = (max_atr - (atr_min + (atr_max - atr_min) * 0.7)) / ((atr_max - atr_min) * 0.3)
+        high_vol_pct = min(1.0, max(0.0, high_vol_pct))  # Clamp 0-1
+        penalty_factor *= (1.0 - high_vol_pct * 0.5)  # Reduce by up to 50%
+    
+    # 6. Max ATR Filter too low (very restrictive - may reduce trade frequency too much)
+    if max_atr < atr_min + (atr_max - atr_min) * 0.2:  # Below 20% of range
+        # Gradual penalty based on how low
+        restrictive_pct = ((atr_min + (atr_max - atr_min) * 0.2) - max_atr) / ((atr_max - atr_min) * 0.2)
+        restrictive_pct = min(1.0, max(0.0, restrictive_pct))  # Clamp 0-1
+        penalty_factor *= (1.0 - restrictive_pct * 0.2)  # Reduce by up to 20% for very conservative ATR
     
     # Apply penalty factor to metrics
     sortino *= penalty_factor
@@ -934,19 +935,24 @@ def _evaluate_worker(args):
     if no_tp:
         penalty_factor *= 0.3
     
-    # 5. Min ATR Filter too low
-    min_atr = params.get('Min ATR Filter (Points)', 0.0)
-    if min_atr < 2.0:
-        penalty = (2.0 - min_atr) / 2.0
-        penalty_factor *= (1.0 - penalty * 0.3)
+    # 5. Max ATR Filter too high (allows high volatility - bad for mean reversion)
+    max_atr = params.get('Max ATR Filter (Points)', 10.0)
+    # Get ATR filter range from param_dict
+    atr_min = param_dict_local.get('Max ATR Filter (Points)', {}).get('min', 1.0)
+    atr_max = param_dict_local.get('Max ATR Filter (Points)', {}).get('max', 6.0)
+    if max_atr > atr_min + (atr_max - atr_min) * 0.7:  # Above 70% of range
+        # Penalty increases as Max ATR gets higher (allows more high volatility)
+        # At 70% of range: no penalty, at 100% of range: 50% penalty
+        high_vol_pct = (max_atr - (atr_min + (atr_max - atr_min) * 0.7)) / ((atr_max - atr_min) * 0.3)
+        high_vol_pct = min(1.0, max(0.0, high_vol_pct))  # Clamp 0-1
+        penalty_factor *= (1.0 - high_vol_pct * 0.5)  # Reduce by up to 50%
     
-    # 6. Min ATR Filter too high (conservative - reduces trade frequency)
-    atr_min = param_dict_local.get('Min ATR Filter (Points)', {}).get('min', 2.0)
-    atr_max = param_dict_local.get('Min ATR Filter (Points)', {}).get('max', 4.0)
-    if min_atr > atr_min + (atr_max - atr_min) * 0.7:  # Above 70% of range
-        conservative_pct = (min_atr - (atr_min + (atr_max - atr_min) * 0.7)) / ((atr_max - atr_min) * 0.3)
-        conservative_pct = min(1.0, max(0.0, conservative_pct))  # Clamp 0-1
-        penalty_factor *= (1.0 - conservative_pct * 0.5)  # Reduce by up to 50% for very conservative ATR
+    # 6. Max ATR Filter too low (very restrictive - may reduce trade frequency too much)
+    if max_atr < atr_min + (atr_max - atr_min) * 0.2:  # Below 20% of range
+        # Gradual penalty based on how low
+        restrictive_pct = ((atr_min + (atr_max - atr_min) * 0.2) - max_atr) / ((atr_max - atr_min) * 0.2)
+        restrictive_pct = min(1.0, max(0.0, restrictive_pct))  # Clamp 0-1
+        penalty_factor *= (1.0 - restrictive_pct * 0.2)  # Reduce by up to 20%
     
     # Apply penalty factor
     sortino *= penalty_factor
@@ -2270,8 +2276,8 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                         'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                         'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                        'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                        'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                        'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                        'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                         'Max Open Trades', 'RTH Exit Buffer (minutes)', 'Enable Maintenance Filter',
                         'Daily Maintenance Start (HH:MM)', 'Daily Maintenance End (HH:MM)',
                         'Weekend Maintenance Start Day', 'Weekend Maintenance Start Time (HH:MM)',
@@ -3215,8 +3221,8 @@ def main():
                               'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                               'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                               'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                              'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                              'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                              'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                               'Max Open Trades'],
             'Take Profit Criteria': ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
                                     'ATR Length for TP', 'ATR Multiplier for TP'],
@@ -3938,8 +3944,8 @@ def main():
                               'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                               'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                               'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                              'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                              'Enable RTH Filter', 'Min Volume Multiplier', 'Timeframe (minutes)',
+                              'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                               'Max Open Trades'],
             'Take Profit Criteria': ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
                                     'ATR Length for TP', 'ATR Multiplier for TP'],

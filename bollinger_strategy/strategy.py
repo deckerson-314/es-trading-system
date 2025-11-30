@@ -53,12 +53,14 @@ class BollingerBandStrategy:
         self.fixed_bb_entry_tp = get_param_value(self.params_dict, 'Fixed BB at Entry TP', True)
         self.atr_length_tp = int(get_param_value(self.params_dict, 'ATR Length for TP', 26))
         self.atr_mult_tp = float(get_param_value(self.params_dict, 'ATR Multiplier for TP', 2.0))
-        self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 10.0))
+        self.max_atr_points = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
+        self.max_atr_points_opt = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
+        self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))  # Optional floor
         self.enable_rth_filter = get_param_value(self.params_dict, 'Enable RTH Filter', True)
         self.rth_start_str = get_param_value(self.params_dict, 'RTH Start (HH:MM)', '09:30')
         self.rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
         self.rth_exit_buffer_minutes = int(get_param_value(self.params_dict, 'RTH Exit Buffer (minutes)', 0))
-        self.min_volume_multiplier = float(get_param_value(self.params_dict, 'Min Volume Multiplier', 1.5))
+        self.max_volume_multiplier = float(get_param_value(self.params_dict, 'Max Volume Multiplier', 1.5))
         
         # Maintenance period filter parameters
         self.enable_maintenance_filter = get_param_value(self.params_dict, 'Enable Maintenance Filter', False)
@@ -74,7 +76,8 @@ class BollingerBandStrategy:
         self.bb_length = max(1, int(get_param_value(self.params_dict, 'Bollinger Band Length', 30)))
         self.bb_stddev = float(get_param_value(self.params_dict, 'Bollinger Band StdDev', 2.0))
         self.atr_mult_ts_opt = float(get_param_value(self.params_dict, 'ATR Multiplier for Trailing Stop', 3.0))
-        self.min_volume_multiplier_opt = float(get_param_value(self.params_dict, 'Min Volume Multiplier', 1.5))
+        self.max_volume_multiplier_opt = float(get_param_value(self.params_dict, 'Max Volume Multiplier', 1.5))
+        self.max_atr_points_opt = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
         self.timeframe = max(1, int(get_param_value(self.params_dict, 'Timeframe (minutes)', 1)))
         self.trailing_delay = max(0, int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5)))
         
@@ -106,8 +109,10 @@ class BollingerBandStrategy:
             self.short_trigger_pct = float(params['Short Trigger (% From Upper Band)'])
         if 'ATR Multiplier for Trailing Stop' in params:
             self.atr_mult_ts_opt = float(params['ATR Multiplier for Trailing Stop'])
-        if 'Min Volume Multiplier' in params:
-            self.min_volume_multiplier_opt = float(params['Min Volume Multiplier'])
+        if 'Max Volume Multiplier' in params:
+            self.max_volume_multiplier_opt = float(params['Max Volume Multiplier'])
+        if 'Max ATR Filter (Points)' in params:
+            self.max_atr_points_opt = float(params['Max ATR Filter (Points)'])
         if 'Timeframe (minutes)' in params:
             self.timeframe = max(1, int(params['Timeframe (minutes)']))
         if 'Trailing Delay (bars)' in params:
@@ -171,11 +176,11 @@ class BollingerBandStrategy:
             self.maintenance_buffer_minutes
         )
         
-        # Volume filter
-        df = apply_volume_filter(df, self.min_volume_multiplier_opt, volume_window=50)
+        # Volume filter (for mean reversion: allows LOW volume, filters out HIGH volume)
+        df = apply_volume_filter(df, self.max_volume_multiplier_opt, volume_window=50)
         
-        # ATR filter
-        df = apply_atr_filter(df, self.min_atr_points)
+        # ATR filter (for mean reversion: allows LOW ATR, filters out HIGH ATR)
+        df = apply_atr_filter(df, self.max_atr_points_opt, min_atr_points=self.min_atr_points)
         
         # Drop rows with NaN (from rolling calculations)
         df.dropna(inplace=True)

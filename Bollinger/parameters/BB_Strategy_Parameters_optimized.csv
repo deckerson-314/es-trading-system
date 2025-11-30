@@ -11,7 +11,8 @@ Long Trigger (% From Lower Band),0.0174,0,2,float,% below lower band to trigger 
 Short Entry on Wick Touch,1,0,1,int,"Enter if high touches upper band (0=false, 1=true) - OPTIMIZABLE"
 Short Entry on Body in Zone,1,0,1,int,"Enter if close ≥ upper band (0=false, 1=true) - OPTIMIZABLE"
 Short Trigger (% From Upper Band),0,0,2,float,% above upper band to trigger (min 0.1% to avoid band extremes)
-Min ATR Filter (Points),2.1806,1,10,float,Minimum ATR value to allow entries (min 2.0 to avoid low volatility trades)
+Max ATR Filter (Points),4.0,1.0,6.0,float,"Maximum ATR value to allow entries for mean reversion (ATR <= max). Low ATR = exhausted move ready to reverse (good). High ATR = strong momentum (bad for mean reversion). Range 1.0-6.0 points"
+Min ATR Filter (Points),0.5,0.5,1.0,float,"Minimum ATR floor (optional) to ensure stops aren't too tight. Default 0.5 points. ATR must be >= this AND <= Max ATR Filter"
 RTH Start (HH:MM),09:30,09:30,09:30,str,Regular trading hours start (Eastern Time)
 RTH End (HH:MM),16:00,16:00,16:00,str,Regular trading hours end (Eastern Time)
 Enable RTH Filter,1,0,1,int,"Restrict entries to RTH only (0=false, 1=true) - OPTIMIZABLE"
@@ -24,7 +25,7 @@ Weekend Maintenance Start Time (HH:MM),17:00,17:00,17:00,str,Weekend maintenance
 Weekend Maintenance End Day,6,6,6,int,"Weekend maintenance end day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 6 (Sunday)"
 Weekend Maintenance End Time (HH:MM),18:00,18:00,18:00,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET)
 Maintenance Buffer Minutes,29,1,30,int,Minutes before/after maintenance to exit/block trading
-Min Volume Multiplier,0.6181,0.5,1.8,float,Volume filter - reduced to be less restrictive (1.0 = no filter)
+Max Volume Multiplier,0.3,0.5,3.0,float,"Volume filter for mean reversion - MAX volume allowed (volume <= avg * multiplier). Low volume = exhausted move ready to reverse. High volume = strong momentum (bad for mean reversion). Range 0.5-3.0 (1.0 = no filter, lower = more restrictive)"
 Timeframe (minutes),15,1,15,int,Resample timeframe in minutes
 Max Open Trades,1,1,1,int,Maximum concurrent positions
 === TAKE PROFIT CRITERIA ===,,,,,
