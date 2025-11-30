@@ -1,55 +1,42 @@
 Name,Value,Min,Max,Type,Description
 __indicatorName,BB Strategy,,,,Strategy identifier
-=== ENTRY CRITERIA ===
+Max Open Trades,1,1,5,int,Maximum concurrent positions
 Enable Long Trades,true,false,true,bool,Allow long entries
 Enable Short Trades,true,false,true,bool,Allow short entries
-Bollinger Band Length,10,10,100,int,Lookback period for BB
-Bollinger Band StdDev,1,1.0,3.0,float,StdDev multiplier for BB width
-Long Entry on Wick Touch,true,false,true,bool,Enter if low touches lower band
+Bollinger Band Length,15,10,100,int,Lookback period for BB
+Bollinger Band StdDev,2.9917,1.0,3.0,float,StdDev multiplier for BB width
+Long Entry on Wick Touch,false,false,true,bool,Enter if low touches lower band
 Long Entry on Body in Zone,true,false,true,bool,Enter if close ≤ lower band
-Long Trigger (% From Lower Band),0,0.0,2.0,float,% below lower band to trigger
-Short Entry on Wick Touch,true,false,true,bool,Enter if high touches upper band
+Long Trigger (% From Lower Band),1.2197,0.0,2.0,float,% below lower band to trigger
+Short Entry on Wick Touch,false,false,true,bool,Enter if high touches upper band
 Short Entry on Body in Zone,true,false,true,bool,Enter if close ≥ upper band
-Short Trigger (% From Upper Band),0,0.0,2.0,float,% above upper band to trigger
-Min ATR Filter (Points),0,0,10,float,Minimum ATR value to allow entries
-RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start (Eastern Time)
-RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end (Eastern Time)
-Enable RTH Filter,false,false,true,bool,Restrict entries to RTH only
-RTH Exit Buffer (minutes),0,0,60,int,Minutes before RTH end to start closing positions (0 = no auto-close)
-Enable Maintenance Filter,true,false,true,bool,Exit positions before maintenance periods
-Daily Maintenance Start (HH:MM),17:00,00:00,23:59,str,Daily maintenance period start in Eastern Time (ES: 4:00 PM CT = 5:00 PM ET)
-Daily Maintenance End (HH:MM),17:30,00:00,23:59,str,Daily maintenance period end in Eastern Time (ES: 4:30 PM CT = 5:30 PM ET)
-Weekend Maintenance Start Day,4,0,6,int,"Weekend maintenance start day (0=Mon, 4=Fri, 6=Sun)"
-Weekend Maintenance Start Time (HH:MM),17:00,00:00,23:59,str,Weekend maintenance start time in Eastern Time (ES: Fri 4:00 PM CT = 5:00 PM ET)
-Weekend Maintenance End Day,6,0,6,int,"Weekend maintenance end day (0=Mon, 4=Fri, 6=Sun)"
-Weekend Maintenance End Time (HH:MM),18:00,00:00,23:59,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET)
-Maintenance Buffer Minutes,5,1,30,int,Minutes before/after maintenance to exit/block trading
-Min Volume Multiplier,1.0,1.0,1.5,float,Volume filter (1.0 = no filter)
-Timeframe (minutes),1,1,8,int,Resample timeframe in minutes
-Max Open Trades,1,1,5,int,Maximum concurrent positions
-=== TAKE PROFIT CRITERIA ===
+Short Trigger (% From Upper Band),0.6466,0.0,2.0,float,% above upper band to trigger
+Initial Stop Loss (%),0.7167,0.1,2.0,float,Fixed stop loss %
+Enable Trailing Stop,true,false,true,bool,Use ATR trailing stop
+ATR Length for Trailing Stop,41,10,100,int,ATR period for trailing
+ATR Multiplier for Trailing Stop,1.8054,1.0,5.0,float,Trailing stop ATR multiplier
+Trailing Delay (bars),11,0,20,int,Bars before trailing stop begins tightening (0 = immediate)
 Opposite Bollinger Band TP,false,false,true,bool,DYNAMIC: Exit at current opposite BB
 Fixed ATR TP,false,false,true,bool,FIXED: Entry ± (ATR × Multiplier)
 Fixed BB at Entry TP,true,false,true,bool,FIXED: Upper BB at entry (long)
-ATR Length for TP,43,10,80,int,ATR period for fixed TP
-ATR Multiplier for TP,6,1.0,6.0,float,Fixed TP ATR multiplier
-=== STOP LOSS CRITERIA ===
-Initial Stop Loss (%),1.8586,0.1,2.0,float,Fixed stop loss %
-Enable Trailing Stop,true,false,true,bool,Use ATR trailing stop
-ATR Length for Trailing Stop,55,10,100,int,ATR period for trailing
-ATR Multiplier for Trailing Stop,4,1.0,5.0,float,Trailing stop ATR multiplier
-Trailing Delay (bars),5,0,20,int,Bars before trailing stop begins tightening (0 = immediate)
-=== GA CRITERIA ===
-POP_SIZE,151,100,300,int,Population size
-NUM_GEN,52,50,150,int,Number of generations
-CX_PB,0.585,0.5,0.9,float,Crossover probability
-MUT_PB,0.3649,0.2,0.5,float,Mutation probability
-MUT_MU,-0.5082,-1.0,1.0,float,Mutation mean
-MUT_SIGMA,0.2471,0.1,0.4,float,Mutation std dev
-TARGET_TRADES_DAY,1,1,5,int,Ideal trades/day
-TRADES_PENALTY_WEIGHT,0.1207,0.1,1.0,float,Penalty for excess trades
-DD_WEIGHT,0.9041,0.1,1.0,float,Drawdown penalty weight
-DATA_SPLITS,0.6823,0.5,0.9,float,In-sample fraction
-DATA_SIZE,20299,0,1000000,int,Rows to subsample (0 = full)
-MIN_TRADES_DAY,0.9643,0.5,2.0,float,MUST have at least 2 trades/day
-MIN_TRADES_PEN_WEIGHT,-123.9553,-200.0,-50.0,float,Scalar penalty — zero trades = -100
+ATR Length for TP,29,10,80,int,ATR period for fixed TP
+ATR Multiplier for TP,1.4537,1.0,6.0,float,Fixed TP ATR multiplier
+Min ATR Filter (Points),6.578,0,10,float,Minimum ATR value to allow entries
+RTH Start (HH:MM),09:30,00:00,23:59,str,Regular trading hours start
+RTH End (HH:MM),16:00,00:00,23:59,str,Regular trading hours end
+Enable RTH Filter,true,false,true,bool,Restrict entries to RTH only
+Min Volume Multiplier,1.4181,1.0,1.5,float,Volume filter (1.0 = no filter)
+Timeframe (minutes),1,1,8,int,Resample timeframe in minutes
+POP_SIZE,109,100,300,int,Population size
+NUM_GEN,89,50,150,int,Number of generations
+CX_PB,0.9,0.5,0.9,float,Crossover probability
+MUT_PB,0.2,0.2,0.5,float,Mutation probability
+MUT_MU,-0.2931,-1.0,1.0,float,Mutation mean
+MUT_SIGMA,0.2241,0.1,0.4,float,Mutation std dev
+TARGET_TRADES_DAY,2,1,5,int,Ideal trades/day
+TRADES_PENALTY_WEIGHT,0.3478,0.1,1.0,float,Penalty for excess trades
+DD_WEIGHT,0.1,0.1,1.0,float,Drawdown penalty weight
+DATA_SPLITS,0.9,0.5,0.9,float,In-sample fraction
+DATA_SIZE,627094,0,1000000,int,Rows to subsample (0 = full)
+MIN_TRADES_DAY,0.6317,0.5,2.0,float,MUST have at least 2 trades/day
+MIN_TRADES_PEN_WEIGHT,-146.8195,-200.0,-50.0,float,Scalar penalty — zero trades = -100

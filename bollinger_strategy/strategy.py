@@ -283,7 +283,10 @@ class BollingerBandStrategy:
             else:
                 atr_tp = None
         
-        # Initial stop loss
+        # Initial stop loss - based solely on Initial Stop Loss (%) parameter
+        # Formula: stop = entry_price * (1 - direction * initial_sl_pct / 100)
+        # For LONG (direction=1): stop = entry_price * (1 - initial_sl_pct/100) = entry_price * (1 - 0.01) for 1%
+        # For SHORT (direction=-1): stop = entry_price * (1 + initial_sl_pct/100) = entry_price * (1 + 0.01) for 1%
         stop = entry_price * (1 - direction * self.initial_sl_pct / 100)
         
         # Take profit
@@ -298,17 +301,9 @@ class BollingerBandStrategy:
             # For SHORT: exit at lower BB (opposite is lower)
             tp = upper if direction == 1 else lower
         
-        # Initial trailing stop (if enabled)
-        if self.enable_trailing:
-            peak = high if direction == 1 else low
-            trail = peak - direction * atr_ts * self.atr_mult_ts_opt
-            # Update stop, but ensure it doesn't go above entry for longs or below entry for shorts
-            if direction == 1:
-                stop = max(stop, trail)
-                stop = min(stop, entry_price)  # Cap at entry price for longs
-            else:
-                stop = min(stop, trail)
-                stop = max(stop, entry_price)  # Cap at entry price for shorts
+        # NOTE: Trailing stop is NOT applied on entry - it only activates after trailing_delay bars
+        # via the update_trailing_stop() method. This ensures the Initial Stop Loss (%) parameter
+        # always sets the initial stop price correctly.
         
         # SAFETY CHECK: Ensure stop is not too close to entry (minimum 0.1% away)
         # This prevents immediate exits when trigger percentages are very low

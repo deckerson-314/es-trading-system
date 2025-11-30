@@ -42,8 +42,8 @@ os.makedirs(HTML_DIR, exist_ok=True)
 
 # === Config ===
 VERSION = '3.0'
-FROM_DATE = '2025-03-07'
-TO_DATE = '2025-07-19'
+FROM_DATE = '2024-03-07'
+TO_DATE = '2024-07-19'
 multiplier = 50
 initial_capital = 50000
 candles_before_after = 50
@@ -449,6 +449,27 @@ if not trades_df.empty:
     # Exit reason breakdown
     exit_reasons = trades_df['reason'].value_counts()
     log(f"\nExit reasons:\n{exit_reasons}")
+    
+    # Calculate detailed statistics for each exit reason
+    exit_reason_stats = {}
+    for reason in exit_reasons.index:
+        reason_trades = trades_df[trades_df['reason'] == reason]
+        reason_pnl = reason_trades['pnl'].sum()
+        reason_wins = reason_trades[reason_trades['pnl'] > 0]
+        reason_losses = reason_trades[reason_trades['pnl'] < 0]
+        reason_avg_win = reason_wins['pnl'].mean() if len(reason_wins) > 0 else 0
+        reason_avg_loss = reason_losses['pnl'].mean() if len(reason_losses) > 0 else 0
+        reason_pf = abs(reason_avg_win / reason_avg_loss) if reason_avg_loss != 0 else (float('inf') if reason_avg_win > 0 else 0)
+        reason_avg_duration = reason_trades['duration'].mean() if len(reason_trades) > 0 else 0
+        
+        exit_reason_stats[reason] = {
+            'pnl': reason_pnl,
+            'profit_factor': reason_pf,
+            'avg_duration': reason_avg_duration,
+            'count': len(reason_trades),
+            'win_count': len(reason_wins),
+            'loss_count': len(reason_losses)
+        }
     
     # Performance by hour
     hourly_perf = trades_df.groupby('entry_hour').agg({
@@ -1022,15 +1043,41 @@ if not trades_df.empty:
                 <th>Reason</th>
                 <th>Count</th>
                 <th>Percentage</th>
+                <th>Total PNL</th>
+                <th>Profit Factor</th>
+                <th>Avg Duration (min)</th>
+                <th>Wins</th>
+                <th>Losses</th>
             </tr>
 """)
         for reason, count in exit_reasons.items():
             pct = (count / num_trades * 100)
+            stats = exit_reason_stats.get(reason, {})
+            reason_pnl = stats.get('pnl', 0)
+            reason_pf = stats.get('profit_factor', 0)
+            reason_duration = stats.get('avg_duration', 0)
+            win_count = stats.get('win_count', 0)
+            loss_count = stats.get('loss_count', 0)
+            
+            # Format profit factor (handle infinity)
+            if reason_pf == float('inf'):
+                pf_str = "∞"
+            elif reason_pf == 0:
+                pf_str = "0.00"
+            else:
+                pf_str = f"{reason_pf:.2f}"
+            
+            pnl_class = 'positive' if reason_pnl > 0 else 'negative' if reason_pnl < 0 else ''
             f.write(f"""
             <tr>
-                <td>{reason}</td>
+                <td><strong>{reason}</strong></td>
                 <td>{count}</td>
                 <td>{pct:.1f}%</td>
+                <td class="{pnl_class}">${reason_pnl:,.2f}</td>
+                <td>{pf_str}</td>
+                <td>{reason_duration:.1f}</td>
+                <td>{win_count}</td>
+                <td>{loss_count}</td>
             </tr>
 """)
         f.write("""
