@@ -132,7 +132,7 @@ def run_backtest(params, df, param_dict_local, suppress_output=True, debug=False
     """
     # Default return value (used for errors or empty data)
     default_result = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0,
-                     'trades_df': pd.DataFrame()}
+                     'trades_df': pd.DataFrame(), 'monthly_profit_stats': {'max_monthly_profit': 0, 'min_monthly_profit': 0, 'avg_monthly_profit': 0}}
     
     if len(df) == 0:
         if not suppress_output:
@@ -348,6 +348,23 @@ def run_backtest(params, df, param_dict_local, suppress_output=True, debug=False
     # Total profit (sum of all PNL)
     total_profit = trades_df['pnl'].sum() if not trades_df.empty else 0
     
+    # Monthly profit statistics
+    monthly_profit_stats = {'max_monthly_profit': 0, 'min_monthly_profit': 0, 'avg_monthly_profit': 0}
+    if not trades_df.empty and 'exit_time' in trades_df.columns:
+        try:
+            # Group by year-month
+            trades_df['year_month'] = pd.to_datetime(trades_df['exit_time']).dt.to_period('M')
+            monthly_pnl = trades_df.groupby('year_month')['pnl'].sum()
+            if len(monthly_pnl) > 0:
+                monthly_profit_stats = {
+                    'max_monthly_profit': float(monthly_pnl.max()),
+                    'min_monthly_profit': float(monthly_pnl.min()),
+                    'avg_monthly_profit': float(monthly_pnl.mean())
+                }
+        except Exception as e:
+            if not suppress_output:
+                print(f"WARNING: Could not calculate monthly profit stats: {e}")
+    
     # Ensure all required keys are present
     result = {
         'sortino': sortino,
@@ -355,17 +372,20 @@ def run_backtest(params, df, param_dict_local, suppress_output=True, debug=False
         'avg_trades_day': avg_trades_day,
         'profit_factor': profit_factor,
         'total_profit': total_profit,
-        'trades_df': trades_df
+        'trades_df': trades_df,
+        'monthly_profit_stats': monthly_profit_stats
     }
     
     # Validate result has all required keys
-    required_keys = ['sortino', 'max_drawdown', 'avg_trades_day', 'profit_factor', 'total_profit', 'trades_df']
+    required_keys = ['sortino', 'max_drawdown', 'avg_trades_day', 'profit_factor', 'total_profit', 'trades_df', 'monthly_profit_stats']
     for key in required_keys:
         if key not in result:
             if not suppress_output:
                 print(f"WARNING: Missing key '{key}' in result, using default")
             if key == 'trades_df':
                 result[key] = pd.DataFrame()
+            elif key == 'monthly_profit_stats':
+                result[key] = {'max_monthly_profit': 0, 'min_monthly_profit': 0, 'avg_monthly_profit': 0}
             else:
                 result[key] = 0
     
@@ -614,6 +634,26 @@ def evaluate_multi_objective(ind_and_df):
         # Extra penalty for extremely low trade frequency
         extra_penalty = (0.5 - avg_trades_day) / 0.5  # 0 to 1 scale
         penalty_factor *= (1.0 - extra_penalty * 0.4)  # Additional 0-40% reduction
+    
+    # 1b. Penalty for EXCESS trades (above target) - discourage over-trading
+    # Target range: 2-5 trades/day (ideal: 3.5 trades/day)
+    if avg_trades_day > target_trades:
+        # Calculate excess above target
+        excess = avg_trades_day - target_trades
+        # Penalty increases with excess trades
+        # At 2x target (e.g., 7 trades/day when target is 3.5): 50% penalty
+        # At 3x target (e.g., 10.5 trades/day): 75% penalty
+        # At 4x target (e.g., 14 trades/day): 90% penalty
+        excess_ratio = excess / target_trades  # How many times over target
+        if excess_ratio >= 3.0:  # 4x target or more
+            penalty_factor *= 0.1  # 90% penalty (very severe)
+        elif excess_ratio >= 2.0:  # 3x target
+            penalty_factor *= 0.25  # 75% penalty
+        elif excess_ratio >= 1.0:  # 2x target
+            penalty_factor *= 0.5  # 50% penalty
+        else:  # Between target and 2x target
+            # Gradual penalty: 0% at target, 50% at 2x target
+            penalty_factor *= (1.0 - (excess_ratio - 1.0) * 0.5)
     
     # 2. Unrealistic high win rate (overfitting indicator)
     if not trades_df.empty and win_rate > 0.95:
@@ -915,6 +955,26 @@ def _evaluate_worker(args):
         extra_penalty = (0.5 - avg_trades_day) / 0.5
         penalty_factor *= (1.0 - extra_penalty * 0.4)
     
+    # 1b. Penalty for EXCESS trades (above target) - discourage over-trading
+    # Target range: 2-5 trades/day (ideal: 3.5 trades/day)
+    if avg_trades_day > target_trades:
+        # Calculate excess above target
+        excess = avg_trades_day - target_trades
+        # Penalty increases with excess trades
+        # At 2x target (e.g., 7 trades/day when target is 3.5): 50% penalty
+        # At 3x target (e.g., 10.5 trades/day): 75% penalty
+        # At 4x target (e.g., 14 trades/day): 90% penalty
+        excess_ratio = excess / target_trades  # How many times over target
+        if excess_ratio >= 3.0:  # 4x target or more
+            penalty_factor *= 0.1  # 90% penalty (very severe)
+        elif excess_ratio >= 2.0:  # 3x target
+            penalty_factor *= 0.25  # 75% penalty
+        elif excess_ratio >= 1.0:  # 2x target
+            penalty_factor *= 0.5  # 50% penalty
+        else:  # Between target and 2x target
+            # Gradual penalty: 0% at target, 50% at 2x target
+            penalty_factor *= (1.0 - (excess_ratio - 1.0) * 0.5)
+    
     # 2. Unrealistic high win rate
     if not trades_df.empty and win_rate > 0.95:
         excess_wr = (win_rate - 0.95) / 0.05
@@ -972,7 +1032,9 @@ def _evaluate_worker(args):
     normalized_sortino = min(1.0, max(0.0, sortino / SORTINO_MAX))
     normalized_dd = 1.0 - min(1.0, max(0.0, max_dd / DD_MAX))
     normalized_pf = min(1.0, max(0.0, pf / PF_MAX))
-    normalized_trades = min(1.0, max(0.0, avg_trades_day / TRADES_MAX))
+    # Use RAW Avg Trades/Day (no normalization) - must match evaluate_multi_objective
+    # CRITICAL: This must match evaluate_multi_objective which uses raw value
+    normalized_trades = avg_trades_day  # Use raw value directly (not normalized)
     normalized_pnl = min(1.0, max(0.0, total_pnl / PNL_MAX))
     
     # ====================================================================
@@ -1059,7 +1121,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                             logbook, is_res, oos_res, trades_is, trades_oos,
                             html_path, diag_dir, current_gen=None, total_gen=None, 
                             is_final=False, auto_launch=False, is_periods=None, oos_periods=None,
-                            in_sample=None):
+                            in_sample=None, best_gen_found=None):
     """
     Generate comprehensive interactive HTML dashboard for GA results.
     
@@ -1267,10 +1329,28 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     if is_res and isinstance(is_res, dict) and 'sortino' in is_res and is_res['sortino'] > 0:
         showing_actual = True
     
-    if showing_actual:
-        fig_convergence.update_yaxes(title_text="Sortino Ratio (Actual)", row=1, col=1)
+    # Calculate max Sortino value for y-axis upper bound
+    sortino_max = 1.0  # Default minimum upper bound
+    if 'actual_sortino_best' in logbook.header:
+        actual_vals = logbook.select("actual_sortino_best")
+        valid_vals = [v for v in actual_vals if isinstance(v, (int, float)) and not (np.isinf(v) or np.isnan(v)) and v > -500]
+        if valid_vals:
+            sortino_max = max(max(valid_vals), 1.0)  # At least show up to 1.0
     else:
-        fig_convergence.update_yaxes(title_text="Sortino (Normalized 0-1)", row=1, col=1)
+        # Use normalized values
+        max_vals = logbook.select("max_sortino")
+        valid_vals = [v for v in max_vals if isinstance(v, (int, float)) and v > -500 and not np.isinf(v)]
+        if valid_vals:
+            sortino_max = max(max(valid_vals), 1.0)
+    
+    # Add 20% padding to upper bound, but ensure minimum of 1.0
+    sortino_max = max(sortino_max * 1.2, 1.0)
+    
+    if showing_actual:
+        # Fix lower bound at -1 so negative Sortino values remain visible and scale doesn't zoom excessively
+        fig_convergence.update_yaxes(title_text="Sortino Ratio (Actual)", row=1, col=1, range=[-1, sortino_max])
+    else:
+        fig_convergence.update_yaxes(title_text="Sortino (Normalized 0-1)", row=1, col=1, range=[-1, sortino_max])
     
     if 'actual_dd_best' in logbook.header:
         fig_convergence.update_yaxes(title_text="Max Drawdown ($)", row=1, col=2)
@@ -2276,7 +2356,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                         'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                         'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                        'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                        'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
                         'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                         'Max Open Trades', 'RTH Exit Buffer (minutes)', 'Enable Maintenance Filter',
                         'Daily Maintenance Start (HH:MM)', 'Daily Maintenance End (HH:MM)',
@@ -2342,7 +2422,18 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         if ptype in ('int', 'float') and pmin is not None and pmax is not None and pmin != pmax:
             optimizable_params.add(pname)
     
-    best_params_html = ""
+    # Add generation info at the top of parameters section
+    gen_info_html = ""
+    if best_gen_found is not None:
+        gen_info_html = f"""
+<div class="info-section" style="background: #e8f4f8; padding: 10px; border-radius: 5px; margin-bottom: 20px;">
+    <strong>📊 Solution Information:</strong><br>
+    This solution was found in <strong>Generation {best_gen_found}</strong> (out of {total_gen if total_gen else "?"} total generations).<br>
+    <small>To see this solution's performance in the convergence plots, look at generation {best_gen_found} - the "Best" line at that generation shows the best individual from that specific generation. This Selected Solution is the overall best across ALL generations (Hall of Fame best).</small>
+</div>
+"""
+    
+    best_params_html = gen_info_html
     for group_name, params_list in param_groups.items():
         if params_list:  # Only show group if it has parameters
             # Add note for GA Criteria group
@@ -2496,6 +2587,9 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         <th>Win Rate<span class="tooltip-icon">?</span><span class="tooltip">Percentage of profitable trades. Higher is generally better, but not always (depends on risk/reward).</span></th>
         <th>Profit Factor<span class="tooltip-icon">?</span><span class="tooltip">Gross Profit / Gross Loss. >1.0 = profitable, >2.0 = excellent. Shows dollar efficiency.</span></th>
         <th>Calmar Ratio<span class="tooltip-icon">?</span><span class="tooltip">Total PNL / Max Drawdown. Higher is better. Measures return per unit of maximum risk.</span></th>
+        <th>Max Monthly<span class="tooltip-icon">?</span><span class="tooltip">Best performing month in dollars. Shows maximum profit achieved in any single month.</span></th>
+        <th>Min Monthly<span class="tooltip-icon">?</span><span class="tooltip">Worst performing month in dollars. Shows maximum loss (or minimum profit) in any single month.</span></th>
+        <th>Avg Monthly<span class="tooltip-icon">?</span><span class="tooltip">Average monthly profit in dollars. Mean of all monthly PNL values. Helps assess consistency.</span></th>
     </tr></thead><tbody>"""
     
     # is_res and oos_res are already validated at function start, so they're guaranteed to be dicts
@@ -2507,9 +2601,16 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             pf = abs(trades[trades['pnl'] > 0]['pnl'].sum() / trades[trades['pnl'] < 0]['pnl'].sum()) if (trades['pnl'] < 0).any() else np.inf
             max_dd = res.get('max_drawdown', 0)
             calmar = total_pnl / max_dd if max_dd > 0 else np.inf
-            summary_html += f"<tr><td>{label}</td><td>${total_pnl:,.0f}</td><td>{win_rate:.1f}%</td><td>{pf:.2f}</td><td>{calmar:.2f}</td></tr>"
+            
+            # Calculate monthly profit stats
+            monthly_stats = res.get('monthly_profit_stats', {})
+            max_monthly = monthly_stats.get('max_monthly_profit', 0) if isinstance(monthly_stats, dict) else 0
+            min_monthly = monthly_stats.get('min_monthly_profit', 0) if isinstance(monthly_stats, dict) else 0
+            avg_monthly = monthly_stats.get('avg_monthly_profit', 0) if isinstance(monthly_stats, dict) else 0
+            
+            summary_html += f"<tr><td>{label}</td><td>${total_pnl:,.0f}</td><td>{win_rate:.1f}%</td><td>{pf:.2f}</td><td>{calmar:.2f}</td><td>${max_monthly:,.0f}</td><td>${min_monthly:,.0f}</td><td>${avg_monthly:,.0f}</td></tr>"
         else:
-            summary_html += f"<tr><td>{label}</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td></tr>"
+            summary_html += f"<tr><td>{label}</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td></tr>"
     
     summary_html += "</tbody></table>"
     
@@ -2825,6 +2926,8 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
 </h2>
 <div class="info-section">
     <strong>Selection Criteria:</strong> The solution with the highest Sortino Ratio is selected as the "best" solution. This prioritizes risk-adjusted returns while still considering drawdown and profit factor through the Pareto front.
+    {f'<br><strong>📊 Generation Found:</strong> Generation {best_gen_found} (out of {total_gen if total_gen else "?"} total generations)' if best_gen_found is not None else ''}
+    <br><strong>🔗 Relationship to Convergence Plots:</strong> The convergence plots show the best individual from EACH generation (the "Best" line can go up/down as the population evolves). This Selected Solution shows the OVERALL best solution found across ALL generations (from the Hall of Fame). {f'To see this solution\'s performance in the convergence plot, look at generation {best_gen_found} - the "Best" line at that generation should match or be close to these values.' if best_gen_found is not None else 'The generation number will be shown once the GA completes.'}
 </div>
 <h3>Actual Backtest Results (In-Sample)</h3>
 <div class="metric-box">
@@ -2847,6 +2950,19 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
     Total Profit: ${(is_res.get('total_profit', 0) if isinstance(is_res, dict) else 0):,.2f}
     <span class="tooltip">Total Profit and Loss in dollars. Sum of all trade PNLs. This is the 5th optimization objective, directly optimizing for absolute profitability.</span>
 </div>
+<h4>Monthly Profit Statistics</h4>
+<div class="metric-box">
+    Max Monthly Profit: ${(is_res.get('monthly_profit_stats', {}).get('max_monthly_profit', 0) if isinstance(is_res, dict) and isinstance(is_res.get('monthly_profit_stats'), dict) else 0):,.2f}
+    <span class="tooltip">Best performing month in dollars. Shows the maximum profit achieved in any single month during the backtest period.</span>
+</div>
+<div class="metric-box">
+    Min Monthly Profit: ${(is_res.get('monthly_profit_stats', {}).get('min_monthly_profit', 0) if isinstance(is_res, dict) and isinstance(is_res.get('monthly_profit_stats'), dict) else 0):,.2f}
+    <span class="tooltip">Worst performing month in dollars. Shows the maximum loss (or minimum profit) in any single month during the backtest period.</span>
+</div>
+<div class="metric-box">
+    Avg Monthly Profit: ${(is_res.get('monthly_profit_stats', {}).get('avg_monthly_profit', 0) if isinstance(is_res, dict) and isinstance(is_res.get('monthly_profit_stats'), dict) else 0):,.2f}
+    <span class="tooltip">Average monthly profit in dollars. Calculated as the mean of all monthly PNL values. Helps assess consistency of strategy performance.</span>
+</div>
 <p><em>Note: GA fitness values (used for optimization) may differ from actual backtest results due to penalties for constraint violations. Total Profit shown here is from actual backtest, not normalized fitness value.</em></p>
 <h2>Parameters<span class="tooltip-icon">?</span>
     <span class="tooltip">Optimized parameter values for the selected solution. These are the actual values that will be used in live trading. Compare these to your initial parameter ranges to see how the GA adjusted them.</span>
@@ -2862,7 +2978,7 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
         <li><strong>Avg Trades/Day:</strong> RAW value (actual trades/day) - this is NOT normalized.</li>
         <li><strong>To see actual backtest results:</strong> Check "Actual Backtest Results (In-Sample)" section below, which runs real backtests.</li>
     </ul>
-    <strong>Interpreting Convergence:</strong> The "Best" line shows the best individual in each generation. The "Avg" line shows the population average. Convergence occurs when both lines plateau. If they're still improving, the GA may benefit from more generations. Divergence between Best and Avg indicates good diversity in the population. All five objectives (Sortino, Drawdown, Profit Factor, Avg Trades/Day, Total Profit) are optimized simultaneously.
+    <strong>Interpreting Convergence:</strong> The "Best" line shows the best individual from EACH generation (can change each generation as the population evolves). The "Avg" line shows the population average. Convergence occurs when both lines plateau. If they're still improving, the GA may benefit from more generations. Divergence between Best and Avg indicates good diversity in the population. All five objectives (Sortino, Drawdown, Profit Factor, Avg Trades/Day, Total Profit) are optimized simultaneously.
 </div>
 {conv_div}
 <h2>Pareto Front 3D<span class="tooltip-icon">?</span>
@@ -3221,7 +3337,7 @@ def main():
                               'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                               'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                               'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                              'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
                               'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                               'Max Open Trades'],
             'Take Profit Criteria': ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
@@ -3676,29 +3792,69 @@ def main():
             pop = toolbox.select(all_individuals, POP_SIZE)
             
             # Update Pareto front
+            # Track which generation each solution was found in
+            # CRITICAL: Set generation_found on ALL individuals in pop BEFORE updating Hall of Fame
+            # This ensures new solutions that enter the Hall of Fame have the correct generation
+            old_hof_individuals = set(id(ind) for ind in hof)  # Track which individuals were already in Hall of Fame
+            
+            for ind in pop:
+                ind.generation_found = gen  # Always set - individuals in pop are from current generation
+            
+            # Update Hall of Fame (may add new solutions or replace old ones)
             hof.update(pop)
+            
+            # After update, mark any NEW individuals that entered the Hall of Fame with current generation
+            # Old individuals that remain in Hall of Fame keep their original generation_found
+            for ind in hof:
+                ind_id = id(ind)
+                if ind_id not in old_hof_individuals:
+                    # This is a NEW individual that just entered the Hall of Fame
+                    ind.generation_found = gen
+                # If ind_id is in old_hof_individuals, it was already in Hall of Fame, so keep its original generation_found
             
             # Record statistics
             record = stats.compile(pop)
             record['pareto_size'] = len(hof)
             
             # Calculate avg_trades_day for best individual (for tracking)
+            # Use current generation best for convergence plots (shows progress per generation)
             best_ind = max(pop, key=lambda ind: ind.fitness.values[0]) if pop else None
             if best_ind:
                 try:
+                    # Get best individual's parameters for actual backtest
+                    # CRITICAL: Use the same parameter conversion logic as final backtest to ensure metrics match
                     best_params_temp = dict(zip(param_keys, best_ind))
-                    # Clamp parameters
+                    
+                    # Step 1: Clamp parameters to valid ranges
                     for n, v in best_params_temp.items():
-                        mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
-                        v = max(mn, min(v, mx))
-                        if typ == 'int':
-                            best_params_temp[n] = int(round(v))
-                        else:
-                            best_params_temp[n] = float(v)
+                        if n in param_dict:
+                            mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
+                            v = max(mn, min(v, mx))
+                            if typ == 'int':
+                                best_params_temp[n] = int(round(v))
+                            else:
+                                best_params_temp[n] = float(v)
+                    
+                    # Step 2: Convert TP Method to boolean flags (same as final backtest)
+                    if 'TP Method' in best_params_temp:
+                        tp_method = int(round(best_params_temp['TP Method']))
+                        best_params_temp['Fixed BB at Entry TP'] = (tp_method == 0)
+                        best_params_temp['Fixed ATR TP'] = (tp_method == 1)
+                        best_params_temp['Opposite Bollinger Band TP'] = (tp_method == 2)
+                        best_params_temp.pop('TP Method', None)
+                    
+                    # Step 3: Convert boolean parameters (0/1 int) to actual booleans (same as final backtest)
+                    for n in list(best_params_temp.keys()):
+                        if n in param_dict:
+                            original_type = param_dict[n].get('type', '')
+                            if original_type == 'bool' and isinstance(best_params_temp[n], (int, float)):
+                                best_params_temp[n] = bool(int(round(best_params_temp[n])))
+                    
+                    # Now run backtest with fully converted parameters (same logic as final backtest)
                     best_metrics = run_backtest(best_params_temp, in_sample, param_dict, suppress_output=True)
                     record['avg_trades_day'] = best_metrics.get('avg_trades_day', 0.0)
                     record['max_trades_day'] = best_metrics.get('avg_trades_day', 0.0)  # For best individual, same as avg
-                    # Store ACTUAL metrics (in real units) for the best individual
+                    # Store ACTUAL metrics (in real units) for the best individual from current generation
                     record['actual_dd_best'] = best_metrics.get('max_drawdown', 0.0)
                     record['actual_sortino_best'] = best_metrics.get('sortino', 0.0)
                     record['actual_pf_best'] = best_metrics.get('profit_factor', 0.0)
@@ -3754,12 +3910,37 @@ def main():
                             best_params_display[n] = int(round(v))
                         else:
                             best_params_display[n] = float(v)
+                
                 best_fitness_display = best_for_display.fitness.values
+                # Track which generation this solution was found in
+                best_gen_found = getattr(best_for_display, 'generation_found', None)
+                
+                # If generation_found is 0 or None (from old checkpoint), try to infer from logbook
+                if best_gen_found is None or best_gen_found == 0:
+                    # Find which generation had the best normalized Sortino that matches this solution
+                    best_sortino = best_for_display.fitness.values[0]
+                    if logbook is not None and 'max_sortino' in logbook.header:
+                        max_sortinos = logbook.select("max_sortino")
+                        gens = logbook.select("gen")
+                        # Find generation with Sortino closest to best solution's Sortino
+                        best_match_gen = None
+                        best_match_diff = float('inf')
+                        for g, s in zip(gens, max_sortinos):
+                            if isinstance(s, (int, float)) and s > -500 and not np.isinf(s):
+                                diff = abs(s - best_sortino)
+                                if diff < best_match_diff:
+                                    best_match_diff = diff
+                                    best_match_gen = g
+                        if best_match_gen is not None and best_match_diff < 0.01:  # Very close match
+                            best_gen_found = best_match_gen
+                            # Also update the solution's generation_found attribute for future reference
+                            best_for_display.generation_found = best_match_gen
             else:
                 # No solutions yet - use placeholder
                 best_for_display = None
                 best_params_display = {}
                 best_fitness_display = (0.0, 0.0, 0.0, 0.0, 0.0)  # 5 objectives
+                best_gen_found = None
             
             # For intermediate generations, run actual backtest to get real metrics (not normalized fitness)
             # This ensures HTML shows actual trades/day, not normalized values
@@ -3768,8 +3949,26 @@ def main():
             
             if best_for_display is not None and len(in_sample) > 0:
                 try:
+                    # Convert parameters the same way evaluation does (TP Method, booleans, etc.)
+                    is_params = best_params_display.copy()
+                    
+                    # Convert TP Method to boolean flags if needed
+                    if 'TP Method' in is_params:
+                        tp_method = int(round(is_params['TP Method']))
+                        is_params['Fixed BB at Entry TP'] = (tp_method == 0)
+                        is_params['Fixed ATR TP'] = (tp_method == 1)
+                        is_params['Opposite Bollinger Band TP'] = (tp_method == 2)
+                        is_params.pop('TP Method', None)
+                    
+                    # Convert boolean parameters (0/1 int) to actual booleans
+                    for n in list(is_params.keys()):
+                        if n in param_dict:
+                            original_type = param_dict[n].get('type', '')
+                            if original_type == 'bool' and isinstance(is_params[n], (int, float)):
+                                is_params[n] = bool(int(round(is_params[n])))
+                    
                     # Run actual backtest to get real metrics
-                    is_res_actual = run_backtest(best_params_display, in_sample, param_dict, suppress_output=True)
+                    is_res_actual = run_backtest(is_params, in_sample, param_dict, suppress_output=True)
                     if isinstance(is_res_actual, dict):
                         is_res_display = {
                             'sortino': is_res_actual.get('sortino', 0),
@@ -3845,7 +4044,8 @@ def main():
                     current_gen=gen + 1, total_gen=NUM_GEN, is_final=False, auto_launch=auto_launch_now,
                     is_periods=is_periods if 'is_periods' in locals() else None, 
                     oos_periods=oos_periods if 'oos_periods' in locals() else None,
-                    in_sample=in_sample
+                    in_sample=in_sample,
+                    best_gen_found=best_gen_found if 'best_gen_found' in locals() else None
                 )
                 # Also copy to diagnostics directory for backup
                 try:
@@ -3903,6 +4103,30 @@ def main():
     else:
         best = max(hof, key=lambda ind: ind.fitness.values[0])
     
+    # Track which generation this solution was found in
+    best_gen_found = getattr(best, 'generation_found', None)
+    
+    # If generation_found is 0 or None (from old checkpoint), try to infer from logbook
+    if best_gen_found is None or best_gen_found == 0:
+        # Find which generation had the best normalized Sortino that matches this solution
+        best_sortino = best.fitness.values[0]
+        if logbook is not None and 'max_sortino' in logbook.header:
+            max_sortinos = logbook.select("max_sortino")
+            gens = logbook.select("gen")
+            # Find generation with Sortino closest to best solution's Sortino
+            best_match_gen = None
+            best_match_diff = float('inf')
+            for g, s in zip(gens, max_sortinos):
+                if isinstance(s, (int, float)) and s > -500 and not np.isinf(s):
+                    diff = abs(s - best_sortino)
+                    if diff < best_match_diff:
+                        best_match_diff = diff
+                        best_match_gen = g
+            if best_match_gen is not None and best_match_diff < 0.01:  # Very close match
+                best_gen_found = best_match_gen
+                # Also update the solution's generation_found attribute for future reference
+                best.generation_found = best_match_gen
+    
     # Clamp and format best parameters properly
     best_params_raw = dict(zip(param_keys, best))
     best_params = {}
@@ -3917,6 +4141,7 @@ def main():
     # Ensure critical integer parameters are properly set
     if 'Bollinger Band Length' in best_params:
         best_params['Bollinger Band Length'] = max(1, int(round(best_params['Bollinger Band Length'])))
+    
     if 'ATR Length for Trailing Stop' in best_params:
         best_params['ATR Length for Trailing Stop'] = max(1, int(round(best_params['ATR Length for Trailing Stop'])))
     if 'ATR Length for TP' in best_params:
@@ -3944,7 +4169,7 @@ def main():
                               'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                               'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                               'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                              'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
                               'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                               'Max Open Trades'],
             'Take Profit Criteria': ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
@@ -3995,7 +4220,26 @@ def main():
     
     # Run IS backtest with error handling
     try:
-        is_res = run_backtest(best_params, in_sample, param_dict, suppress_output=False, debug=True)
+        # Convert parameters the same way evaluation does (TP Method, booleans, etc.)
+        # This ensures Selected Solution Performance matches the Optimized Values
+        is_params_final = best_params.copy()
+        
+        # Convert TP Method to boolean flags if needed
+        if 'TP Method' in is_params_final:
+            tp_method = int(round(is_params_final['TP Method']))
+            is_params_final['Fixed BB at Entry TP'] = (tp_method == 0)
+            is_params_final['Fixed ATR TP'] = (tp_method == 1)
+            is_params_final['Opposite Bollinger Band TP'] = (tp_method == 2)
+            is_params_final.pop('TP Method', None)
+        
+        # Convert boolean parameters (0/1 int) to actual booleans
+        for n in list(is_params_final.keys()):
+            if n in param_dict:
+                original_type = param_dict[n].get('type', '')
+                if original_type == 'bool' and isinstance(is_params_final[n], (int, float)):
+                    is_params_final[n] = bool(int(round(is_params_final[n])))
+        
+        is_res = run_backtest(is_params_final, in_sample, param_dict, suppress_output=False, debug=True)
         if not isinstance(is_res, dict):
             print("ERROR: is_res is not a dict!")
             is_res = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'trades_df': pd.DataFrame()}
@@ -4018,7 +4262,8 @@ def main():
             oos_res = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0}
             trades_oos = pd.DataFrame()
         else:
-            oos_res = run_backtest(best_params, oos, param_dict, suppress_output=False)
+            # Use the same converted parameters for OOS backtest (ensures consistency)
+            oos_res = run_backtest(is_params_final, oos, param_dict, suppress_output=False)
             if not isinstance(oos_res, dict):
                 print("ERROR: oos_res is not a dict!")
                 oos_res = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'trades_df': pd.DataFrame()}
@@ -4215,7 +4460,8 @@ def main():
     generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict, 
                             logbook, is_res, oos_res, trades_is, trades_oos,
                             WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
-                            current_gen=NUM_GEN, total_gen=NUM_GEN, is_final=True, auto_launch=True)
+                            current_gen=NUM_GEN, total_gen=NUM_GEN, is_final=True, auto_launch=True,
+                            best_gen_found=best_gen_found)
     print(f"HTML Dashboard (FINAL) → {WEB_DASHBOARD}")
     
     # Also copy to diagnostics directory for backup

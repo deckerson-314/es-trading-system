@@ -56,6 +56,7 @@ class BollingerBandStrategy:
         self.max_atr_points = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
         self.max_atr_points_opt = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
         self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))  # Optional floor
+        self.min_atr_points_opt = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))  # Initialize to default, will be updated by update_optimizable_params
         self.enable_rth_filter = get_param_value(self.params_dict, 'Enable RTH Filter', True)
         self.rth_start_str = get_param_value(self.params_dict, 'RTH Start (HH:MM)', '09:30')
         self.rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
@@ -107,16 +108,56 @@ class BollingerBandStrategy:
             self.long_trigger_pct = float(params['Long Trigger (% From Lower Band)'])
         if 'Short Trigger (% From Upper Band)' in params:
             self.short_trigger_pct = float(params['Short Trigger (% From Upper Band)'])
+        # CRITICAL FIX: Update entry method parameters (these were missing!)
+        if 'Long Entry on Body in Zone' in params:
+            self.long_body_zone = bool(int(round(params['Long Entry on Body in Zone'])))
+        if 'Long Entry on Wick Touch' in params:
+            self.long_wick_touch = bool(int(round(params['Long Entry on Wick Touch'])))
+        if 'Short Entry on Body in Zone' in params:
+            self.short_body_zone = bool(int(round(params['Short Entry on Body in Zone'])))
+        if 'Short Entry on Wick Touch' in params:
+            self.short_wick_touch = bool(int(round(params['Short Entry on Wick Touch'])))
         if 'ATR Multiplier for Trailing Stop' in params:
             self.atr_mult_ts_opt = float(params['ATR Multiplier for Trailing Stop'])
         if 'Max Volume Multiplier' in params:
             self.max_volume_multiplier_opt = float(params['Max Volume Multiplier'])
         if 'Max ATR Filter (Points)' in params:
             self.max_atr_points_opt = float(params['Max ATR Filter (Points)'])
+        if 'Min ATR Filter (Points)' in params:
+            self.min_atr_points_opt = float(params['Min ATR Filter (Points)'])
         if 'Timeframe (minutes)' in params:
             self.timeframe = max(1, int(params['Timeframe (minutes)']))
         if 'Trailing Delay (bars)' in params:
             self.trailing_delay = max(0, int(params['Trailing Delay (bars)']))
+        # CRITICAL FIX: Update ATR parameters (these were missing!)
+        if 'ATR Length for Trailing Stop' in params:
+            self.atr_length_ts = max(1, int(params['ATR Length for Trailing Stop']))
+        if 'ATR Length for TP' in params:
+            self.atr_length_tp = max(1, int(params['ATR Length for TP']))
+        if 'ATR Multiplier for TP' in params:
+            self.atr_mult_tp = float(params['ATR Multiplier for TP'])
+        # CRITICAL FIX: Update Initial Stop Loss (this was missing!)
+        if 'Initial Stop Loss (%)' in params:
+            self.initial_sl_pct = float(params['Initial Stop Loss (%)'])
+        # CRITICAL FIX: Update TP method flags (these were missing!)
+        # Note: TP Method is converted to these three booleans in BB_Genetic_v3.py
+        if 'Fixed BB at Entry TP' in params:
+            self.fixed_bb_entry_tp = bool(int(round(params['Fixed BB at Entry TP'])))
+        if 'Fixed ATR TP' in params:
+            self.fixed_atr_tp = bool(int(round(params['Fixed ATR TP'])))
+        if 'Opposite Bollinger Band TP' in params:
+            self.opposite_bb_tp = bool(int(round(params['Opposite Bollinger Band TP'])))
+        # CRITICAL FIX: Update Enable Trailing Stop (this was missing!)
+        if 'Enable Trailing Stop' in params:
+            self.enable_trailing = bool(int(round(params['Enable Trailing Stop'])))
+        # CRITICAL FIX: Update RTH filter parameters (these were missing!)
+        if 'Enable RTH Filter' in params:
+            self.enable_rth_filter = bool(int(round(params['Enable RTH Filter'])))
+        if 'RTH Exit Buffer (minutes)' in params:
+            self.rth_exit_buffer_minutes = int(params['RTH Exit Buffer (minutes)'])
+        # CRITICAL FIX: Update Maintenance Buffer (this was missing!)
+        if 'Maintenance Buffer Minutes' in params:
+            self.maintenance_buffer_minutes = int(params['Maintenance Buffer Minutes'])
     
     def calculate_indicators(self, df):
         """
@@ -132,13 +173,20 @@ class BollingerBandStrategy:
         
         # Resample if needed
         if self.timeframe > 1:
-            df = df.resample(f'{self.timeframe}T').agg({
+            # IB API bar.volume for real-time bars is per-bar volume
+            # Using 5-second bars provides more accurate volume aggregation than 1-minute bars
+            # When resampling to larger timeframes, we sum volumes from all smaller bars
+            # Use label='right' and closed='right' to match IB's bar alignment
+            df_resampled = df.resample(f'{self.timeframe}T', label='right', closed='right').agg({
                 'open': 'first',
                 'high': 'max',
                 'low': 'min',
                 'close': 'last',
-                'volume': 'sum'
-            }).dropna()
+                'volume': 'sum'  # Sum volumes from all smaller bars (5-sec) in the resampled period
+            })
+            # Drop only rows where all OHLCV values are NaN (partial data is OK)
+            df_resampled = df_resampled.dropna(subset=['open', 'high', 'low', 'close', 'volume'], how='all')
+            df = df_resampled
         
         # Bollinger Bands
         df = calculate_bollinger_bands(df, self.bb_length, self.bb_stddev)
@@ -180,7 +228,9 @@ class BollingerBandStrategy:
         df = apply_volume_filter(df, self.max_volume_multiplier_opt, volume_window=50)
         
         # ATR filter (for mean reversion: allows LOW ATR, filters out HIGH ATR)
-        df = apply_atr_filter(df, self.max_atr_points_opt, min_atr_points=self.min_atr_points)
+        # CRITICAL FIX: Use min_atr_points_opt if it was set by update_optimizable_params, otherwise use default
+        min_atr_to_use = getattr(self, 'min_atr_points_opt', self.min_atr_points)
+        df = apply_atr_filter(df, self.max_atr_points_opt, min_atr_points=min_atr_to_use)
         
         # Drop rows with NaN (from rolling calculations)
         df.dropna(inplace=True)

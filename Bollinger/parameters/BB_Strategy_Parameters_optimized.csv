@@ -3,20 +3,20 @@ __indicatorName,BB Strategy,,,,Strategy identifier
 === ENTRY CRITERIA ===,,,,,
 Enable Long Trades,true,false,true,bool,Allow long entries
 Enable Short Trades,true,false,true,bool,Allow short entries
-Bollinger Band Length,70,10,100,int,Lookback period for BB
-Bollinger Band StdDev,0.6016,1,3,float,StdDev multiplier for BB width
-Long Entry on Wick Touch,0,0,1,int,"Enter if low touches lower band (0=false, 1=true) - OPTIMIZABLE"
+Bollinger Band Length,15,10,100,int,Lookback period for BB
+Bollinger Band StdDev,2.8174,1,3,float,StdDev multiplier for BB width
+Long Entry on Wick Touch,1,0,1,int,"Enter if low touches lower band (0=false, 1=true) - OPTIMIZABLE"
 Long Entry on Body in Zone,0,0,1,int,"Enter if close ≤ lower band (0=false, 1=true) - OPTIMIZABLE"
-Long Trigger (% From Lower Band),0.0174,0,2,float,% below lower band to trigger (min 0.1% to avoid band extremes)
-Short Entry on Wick Touch,1,0,1,int,"Enter if high touches upper band (0=false, 1=true) - OPTIMIZABLE"
+Long Trigger (% From Lower Band),0.0005,0,2,float,% below lower band to trigger (min 0.1% to avoid band extremes)
+Short Entry on Wick Touch,0,0,1,int,"Enter if high touches upper band (0=false, 1=true) - OPTIMIZABLE"
 Short Entry on Body in Zone,1,0,1,int,"Enter if close ≥ upper band (0=false, 1=true) - OPTIMIZABLE"
-Short Trigger (% From Upper Band),0,0,2,float,% above upper band to trigger (min 0.1% to avoid band extremes)
-Max ATR Filter (Points),4.0,1.0,6.0,float,"Maximum ATR value to allow entries for mean reversion (ATR <= max). Low ATR = exhausted move ready to reverse (good). High ATR = strong momentum (bad for mean reversion). Range 1.0-6.0 points"
-Min ATR Filter (Points),0.5,0.5,1.0,float,"Minimum ATR floor (optional) to ensure stops aren't too tight. Default 0.5 points. ATR must be >= this AND <= Max ATR Filter"
+Short Trigger (% From Upper Band),0.1704,0,2,float,% above upper band to trigger (min 0.1% to avoid band extremes)
+Max ATR Filter (Points),4.3504,1,6,float,Maximum ATR value to allow entries for mean reversion (ATR <= max). Low ATR = exhausted move ready to reverse (good). High ATR = strong momentum (bad for mean reversion). Range 1.0-6.0 points
+Min ATR Filter (Points),0.622,0.5,1,float,Minimum ATR floor (optional) to ensure stops aren't too tight. Default 0.5 points. ATR must be >= this AND <= Max ATR Filter. NOTE: Must be <= Max ATR Filter value
 RTH Start (HH:MM),09:30,09:30,09:30,str,Regular trading hours start (Eastern Time)
 RTH End (HH:MM),16:00,16:00,16:00,str,Regular trading hours end (Eastern Time)
-Enable RTH Filter,1,0,1,int,"Restrict entries to RTH only (0=false, 1=true) - OPTIMIZABLE"
-RTH Exit Buffer (minutes),59,0,60,int,Minutes before RTH end to start closing positions (0 = no auto-close)
+Enable RTH Filter,0,0,1,int,"Restrict entries to RTH only (0=false, 1=true) - OPTIMIZABLE"
+RTH Exit Buffer (minutes),8,0,60,int,Minutes before RTH end to start closing positions (0 = no auto-close)
 Enable Maintenance Filter,true,false,true,bool,Exit positions before maintenance periods
 Daily Maintenance Start (HH:MM),17:00,17:00,17:00,str,Daily maintenance period start in Eastern Time (ES: 4:00 PM CT = 5:00 PM ET)
 Daily Maintenance End (HH:MM),17:30,17:30,17:30,str,Daily maintenance period end in Eastern Time (ES: 4:30 PM CT = 5:30 PM ET)
@@ -24,23 +24,23 @@ Weekend Maintenance Start Day,4,4,4,int,"Weekend maintenance start day (0=Monday
 Weekend Maintenance Start Time (HH:MM),17:00,17:00,17:00,str,Weekend maintenance start time in Eastern Time (ES: Fri 4:00 PM CT = 5:00 PM ET)
 Weekend Maintenance End Day,6,6,6,int,"Weekend maintenance end day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 6 (Sunday)"
 Weekend Maintenance End Time (HH:MM),18:00,18:00,18:00,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET)
-Maintenance Buffer Minutes,29,1,30,int,Minutes before/after maintenance to exit/block trading
-Max Volume Multiplier,0.3,0.5,3.0,float,"Volume filter for mean reversion - MAX volume allowed (volume <= avg * multiplier). Low volume = exhausted move ready to reverse. High volume = strong momentum (bad for mean reversion). Range 0.5-3.0 (1.0 = no filter, lower = more restrictive)"
-Timeframe (minutes),15,1,15,int,Resample timeframe in minutes
+Maintenance Buffer Minutes,22,1,30,int,Minutes before/after maintenance to exit/block trading
+Max Volume Multiplier,2.4385,0.5,3,float,"Volume filter for mean reversion - MAX volume allowed (volume <= avg * multiplier). Low volume = exhausted move ready to reverse. High volume = strong momentum (bad for mean reversion). Range 0.5-3.0 (1.0 = no filter, lower = more restrictive)"
+Timeframe (minutes),2,1,15,int,Resample timeframe in minutes
 Max Open Trades,1,1,1,int,Maximum concurrent positions
 === TAKE PROFIT CRITERIA ===,,,,,
-TP Method,0,0,2,int,"Take profit method (0=Fixed BB at Entry, 1=Fixed ATR, 2=Opposite BB) - OPTIMIZABLE"
-Opposite Bollinger Band TP,False,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly)
-Fixed ATR TP,True,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly)
+TP Method,2,0,2,int,"Take profit method (0=Fixed BB at Entry, 1=Fixed ATR, 2=Opposite BB) - OPTIMIZABLE"
+Opposite Bollinger Band TP,true,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly)
+Fixed ATR TP,False,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly)
 Fixed BB at Entry TP,False,false,true,bool,FIXED: Controlled by TP Method (do not optimize directly)
-ATR Length for TP,52,10,80,int,ATR period for fixed TP
-ATR Multiplier for TP,1.5668,1,5,float,Fixed TP ATR multiplier - reduced max to prevent overfitting
+ATR Length for TP,28,10,80,int,ATR period for fixed TP
+ATR Multiplier for TP,3.4971,1,5,float,Fixed TP ATR multiplier - reduced max to prevent overfitting
 === STOP LOSS CRITERIA ===,,,,,
-Initial Stop Loss (%),1.0115,0.5,2,float,Fixed stop loss % - wider range for better generalization
-Enable Trailing Stop,1,0,1,int,"Use ATR trailing stop (0=false, 1=true) - OPTIMIZABLE"
-ATR Length for Trailing Stop,83,10,100,int,ATR period for trailing
-ATR Multiplier for Trailing Stop,2.9731,0.5,4.5,float,Trailing stop ATR multiplier - reduced max to prevent overfitting
-Trailing Delay (bars),0,0,20,int,Bars before trailing stop begins tightening (0 = immediate)
+Initial Stop Loss (%),0.1,0.5,2,float,Fixed stop loss % - wider range for better generalization
+Enable Trailing Stop,0,0,1,int,"Use ATR trailing stop (0=false, 1=true) - OPTIMIZABLE"
+ATR Length for Trailing Stop,67,10,100,int,ATR period for trailing
+ATR Multiplier for Trailing Stop,2.5773,0.5,4.5,float,Trailing stop ATR multiplier - reduced max to prevent overfitting
+Trailing Delay (bars),6,0,20,int,Bars before trailing stop begins tightening (0 = immediate)
 === GA CRITERIA ===,,,,,
 POP_SIZE,120,100,150,int,Population size - reduced to prevent overfitting
 NUM_GEN,60,50,75,int,Number of generations - reduced to prevent overfitting

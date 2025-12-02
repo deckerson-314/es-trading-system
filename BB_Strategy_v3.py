@@ -43,7 +43,7 @@ os.makedirs(HTML_DIR, exist_ok=True)
 # === Config ===
 VERSION = '3.0'
 FROM_DATE = '2024-03-07'
-TO_DATE = '2024-07-19'
+TO_DATE = '2025-07-19'
 multiplier = 50
 initial_capital = 50000
 candles_before_after = 50
@@ -84,14 +84,18 @@ def group_params_for_display(params_dict_local):
                           'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                           'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                           'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                          'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                          'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
-                          'Max Open Trades'],
-        'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
-                                'ATR Length for TP', 'ATR Multiplier for TP'],
+                          'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 
+                          'RTH End (HH:MM)', 'Enable RTH Filter', 'RTH Exit Buffer (minutes)',
+                          'Max Volume Multiplier', 'Timeframe (minutes)', 'Max Open Trades'],
+        'Take Profit Criteria': ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 
+                                'Fixed BB at Entry TP', 'ATR Length for TP', 'ATR Multiplier for TP'],
         'Stop Loss Criteria': ['Initial Stop Loss (%)', 'Enable Trailing Stop', 
                               'ATR Length for Trailing Stop', 'ATR Multiplier for Trailing Stop',
                               'Trailing Delay (bars)'],
+        'Maintenance & Filters': ['Enable Maintenance Filter', 'Daily Maintenance Start (HH:MM)', 
+                                 'Daily Maintenance End (HH:MM)', 'Weekend Maintenance Start Day',
+                                 'Weekend Maintenance Start Time (HH:MM)', 'Weekend Maintenance End Day',
+                                 'Weekend Maintenance End Time (HH:MM)', 'Maintenance Buffer Minutes'],
         'GA Criteria': ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
                        'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                        'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
@@ -755,30 +759,40 @@ if not trades_df.empty:
         end_loc = min(len(df) - 1, exit_loc + candles_before_after)
         segment = df.iloc[start_loc:end_loc + 1]
         
-        fig_trade = go.Figure()
+        # Create subplots: price on top, volume on bottom
+        fig_trade = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            row_heights=[0.7, 0.3],  # Price chart 70%, volume 30%
+            subplot_titles=('Price & Bollinger Bands', 'Volume')
+        )
         
-        # Candlestick chart
+        # Convert index to list for better serialization
+        segment_index_list = segment.index.tolist()
+        
+        # Candlestick chart (row 1)
         fig_trade.add_trace(go.Candlestick(
-            x=segment.index,
-            open=segment['open'],
-            high=segment['high'],
-            low=segment['low'],
-            close=segment['close'],
+            x=segment_index_list,
+            open=segment['open'].tolist(),
+            high=segment['high'].tolist(),
+            low=segment['low'].tolist(),
+            close=segment['close'].tolist(),
             name='Price'
-        ))
+        ), row=1, col=1)
         
-        # BB Bands
-        fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['upper'],
+        # BB Bands (row 1)
+        fig_trade.add_trace(go.Scatter(x=segment_index_list, y=segment['upper'].tolist(),
                                       name='Upper BB', line=dict(color='blue', dash='dash', width=1),
-                                      opacity=0.7))
-        fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['mid'],
+                                      opacity=0.7, showlegend=True), row=1, col=1)
+        fig_trade.add_trace(go.Scatter(x=segment_index_list, y=segment['mid'].tolist(),
                                       name='Mid BB', line=dict(color='gray', dash='dash', width=1),
-                                      opacity=0.7))
-        fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['lower'],
+                                      opacity=0.7, showlegend=True), row=1, col=1)
+        fig_trade.add_trace(go.Scatter(x=segment_index_list, y=segment['lower'].tolist(),
                                       name='Lower BB', line=dict(color='blue', dash='dash', width=1),
-                                      opacity=0.7))
+                                      opacity=0.7, showlegend=True), row=1, col=1)
         
-        # Entry marker
+        # Entry marker (row 1)
         entry_color = 'green' if trade.direction == 1 else 'red'
         fig_trade.add_trace(go.Scatter(
             x=[trade.entry_time], y=[trade.entry_price],
@@ -786,9 +800,9 @@ if not trades_df.empty:
                                             line=dict(color='black', width=2)),
             text=['ENTRY'], textposition='top center',
             name='Entry', showlegend=True
-        ))
+        ), row=1, col=1)
         
-        # Exit marker
+        # Exit marker (row 1)
         exit_color = 'lime' if trade.pnl > 0 else 'darkred'
         fig_trade.add_trace(go.Scatter(
             x=[trade.exit_time], y=[trade.exit_price],
@@ -796,9 +810,9 @@ if not trades_df.empty:
                                             line=dict(color='black', width=2)),
             text=['EXIT'], textposition='bottom center',
             name='Exit', showlegend=True
-        ))
+        ), row=1, col=1)
         
-        # Trailing stop (if available) - make it very visible
+        # Trailing stop (if available) - make it very visible (row 1)
         if hasattr(trade, 'stop_history') and trade.stop_history:
             stop_times, stop_prices = zip(*trade.stop_history)
             fig_trade.add_trace(go.Scatter(
@@ -809,17 +823,35 @@ if not trades_df.empty:
                 opacity=0.9,
                 hovertemplate="<b>Trailing Stop</b><br>" +
                              "Time: %{x}<br>" +
-                             "Stop: $%{y:.2f}<extra></extra>"
-            ))
+                             "Stop: $%{y:.2f}<extra></extra>",
+                showlegend=True
+            ), row=1, col=1)
         
-        # Take Profit line (if fixed)
+        # Take Profit line (if fixed) (row 1)
         if trade.tp is not None:
             fig_trade.add_trace(go.Scatter(
                 x=[trade.entry_time, trade.exit_time],
                 y=[trade.tp, trade.tp],
                 mode='lines', name='Take Profit',
-                line=dict(color='purple', dash='dot', width=2)
-            ))
+                line=dict(color='purple', dash='dot', width=2),
+                showlegend=True
+            ), row=1, col=1)
+        
+        # Volume bars (row 2)
+        # Color volume bars based on price direction (green if close > open, red otherwise)
+        colors = ['green' if close >= open else 'red' 
+                 for close, open in zip(segment['close'], segment['open'])]
+        fig_trade.add_trace(go.Bar(
+            x=segment_index_list,
+            y=segment['volume'].tolist(),
+            name='Volume',
+            marker_color=colors,
+            opacity=0.6,
+            showlegend=True,
+            hovertemplate="<b>Volume</b><br>" +
+                         "Time: %{x}<br>" +
+                         "Volume: %{y:,.0f}<extra></extra>"
+        ), row=2, col=1)
         
         trade_type = trade.direction_str
         result = 'Win' if trade.pnl > 0 else 'Loss'
@@ -828,17 +860,18 @@ if not trades_df.empty:
         duration_min = (trade.exit_time - trade.entry_time).total_seconds() / 60
         duration_str = f"{duration_min:.1f} min" if duration_min < 60 else f"{duration_min/60:.1f} hr"
         
+        # Update layout for both subplots
         fig_trade.update_layout(
             title=f"Trade {i} | {trade_type} | {result} | PNL: {pnl_str} | Duration: {duration_str} | {trade.reason}",
-            xaxis_title="Time",
-            yaxis_title="Price ($)",
-            height=600,
+            height=800,  # Increased height to accommodate volume subplot
             hovermode='x unified',
-            yaxis=dict(
-                autorange=True,  # Auto-scale based on visible data
-                fixedrange=False  # Allow manual y-axis zoom
-            )
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
+        
+        # Update y-axis labels
+        fig_trade.update_yaxes(title_text="Price ($)", row=1, col=1, autorange=True, fixedrange=False)
+        fig_trade.update_yaxes(title_text="Volume", row=2, col=1, autorange=True, fixedrange=False)
+        fig_trade.update_xaxes(title_text="Time", row=2, col=1)
         
         filename = f"trade_last_{i:03d}_{trade_type}_{result}_{pnl_str.replace('$', '').replace(',', '')}_v{VERSION}.html"
         # Save to web directory (primary location for dashboard access)
@@ -931,6 +964,32 @@ if not trades_df.empty:
         <div class="metric-box">
             <div class="metric-label">Max Run-up</div>
             <div class="metric-value positive">${max_runup:,.2f}</div>
+        </div>
+        
+        <h2>Monthly Profit Statistics</h2>
+""")
+        # Calculate monthly profit stats
+        if not monthly_pnl.empty:
+            max_monthly = monthly_pnl['Total_PNL'].max()
+            min_monthly = monthly_pnl['Total_PNL'].min()
+            avg_monthly = monthly_pnl['Total_PNL'].mean()
+        else:
+            max_monthly = 0
+            min_monthly = 0
+            avg_monthly = 0
+        
+        f.write(f"""
+        <div class="metric-box">
+            <div class="metric-label">Max Monthly Profit</div>
+            <div class="metric-value positive">${max_monthly:,.2f}</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-label">Min Monthly Profit</div>
+            <div class="metric-value {'positive' if min_monthly >= 0 else 'negative'}">${min_monthly:,.2f}</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-label">Avg Monthly Profit</div>
+            <div class="metric-value {'positive' if avg_monthly >= 0 else 'negative'}">${avg_monthly:,.2f}</div>
         </div>
         
         <h2>Trade Statistics</h2>
@@ -1088,8 +1147,17 @@ if not trades_df.empty:
         
         <h2>Input Parameters</h2>
 """)
+        # Reload parameters from CSV to ensure we're displaying the most current values
+        # (in case CSV was updated after script started)
+        try:
+            current_params_dict = load_params(PARAMS_CSV, return_dataframe=True)[0]
+            log(f"Reloaded parameters from {PARAMS_CSV} for HTML display")
+        except Exception as e:
+            log(f"WARNING: Could not reload parameters for HTML: {e}, using original params_dict")
+            current_params_dict = params_dict
+        
         # Add parameters to table (grouped)
-        grouped_params_html = group_params_for_display(params_dict)
+        grouped_params_html = group_params_for_display(current_params_dict)
         for group_name, params in grouped_params_html.items():
             if params:
                 f.write(f"""

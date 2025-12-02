@@ -3,7 +3,7 @@ __indicatorName,BB Strategy,,,,Strategy identifier
 === ENTRY CRITERIA ===
 Enable Long Trades,true,false,true,bool,Allow long entries
 Enable Short Trades,true,false,true,bool,Allow short entries
-Bollinger Band Length,30,5,100,int,Lookback period for BB
+Bollinger Band Length,30,15,100,int,Lookback period for BB
 Bollinger Band StdDev,2.0,0.5,5.0,float,StdDev multiplier for BB width
 Long Entry on Wick Touch,0,0,1,int,"Enter if low touches lower band (0=false, 1=true) - OPTIMIZABLE"
 Long Entry on Body in Zone,1,0,1,int,"Enter if close ≤ lower band (0=false, 1=true) - OPTIMIZABLE"
@@ -42,7 +42,7 @@ ATR Length for Trailing Stop,26,10,100,int,ATR period for trailing
 ATR Multiplier for Trailing Stop,2.0,0.5,4.5,float,Trailing stop ATR multiplier - reduced max to prevent overfitting
 Trailing Delay (bars),5,0,20,int,"Bars before trailing stop begins tightening (0 = immediate, max 7 to avoid delayed trailing)"
 === GA CRITERIA ===
-POP_SIZE,150,100,150,int,Population size - reduced to prevent overfitting
+POP_SIZE,100,100,150,int,Population size - reduced to prevent overfitting
 NUM_GEN,150,50,75,int,Number of generations - reduced to prevent overfitting
 CX_PB,0.7,0.5,0.9,float,Crossover probability
 MUT_PB,0.4,0.2,0.5,float,Mutation probability (increased from 0.35 for more exploration)
@@ -61,6 +61,6 @@ NORM_SORTINO_MAX,10.0,5.0,20.0,float,Normalization range for Sortino Ratio (used
 NORM_DD_MAX,100000.0,50000.0,200000.0,float,Normalization range for Max Drawdown in dollars (used in fitness calculation)
 NORM_PF_MAX,5.0,3.0,10.0,float,Normalization range for Profit Factor (used in fitness calculation)
 NORM_TRADES_MAX,3.0,1.0,5.0,float,Normalization range for Avg Trades/Day (used in fitness calculation) - reduced to 3.0 for realistic expectations
-NORM_PNL_MAX,200000.0,100000.0,500000.0,float,Normalization range for Total Profit in dollars (used in fitness calculation)
+NORM_PNL_MAX,465000.0,100000.0,1000000.0,float,Normalization range for Total Profit in dollars (used in fitness calculation) - increased to prevent maxing out
 MIN_WIN_RATE,0.40,0.30,0.50,float,Minimum win rate threshold (hard constraint - strategies below this are eliminated)
 SORTINO_CAP,10.0,5.0,20.0,float,Maximum Sortino value before capping (prevents unrealistic values)

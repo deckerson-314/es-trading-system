@@ -120,10 +120,23 @@ def apply_atr_filter(df, max_atr_points, min_atr_points=0.5):
         DataFrame with added 'atr_filter' column (True when ATR is within range)
     """
     df = df.copy()
+    # Safety check: ensure min <= max (if not, swap them or use min as floor)
+    if min_atr_points > max_atr_points:
+        # Invalid configuration - use min as the floor and max as the ceiling
+        # This prevents the filter from being impossible to satisfy
+        import warnings
+        warnings.warn(f"ATR filter: Min ({min_atr_points}) > Max ({max_atr_points}). Using Min as floor and Max as ceiling.")
+        # Use min as the actual floor, but cap it at max
+        effective_min = min(min_atr_points, max_atr_points)
+        effective_max = max(min_atr_points, max_atr_points)
+    else:
+        effective_min = min_atr_points
+        effective_max = max_atr_points
+    
     # For mean reversion: filter allows LOW ATR (atr <= max_atr_points)
     # High ATR suggests strong momentum (bad for mean reversion)
     # But keep a minimum floor to ensure stops aren't unreasonably tight
-    df['atr_filter'] = (df['atr_ts'] >= min_atr_points) & (df['atr_ts'] <= max_atr_points)
+    df['atr_filter'] = (df['atr_ts'] >= effective_min) & (df['atr_ts'] <= effective_max)
     return df
 
 

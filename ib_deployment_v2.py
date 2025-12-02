@@ -73,7 +73,7 @@ def group_params_for_display(params_dict_local):
                           'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                           'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                           'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                          'Max ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                          'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
                           'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
                           'Max Open Trades'],
         'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
@@ -914,7 +914,11 @@ def update_dashboard():
         os.makedirs(WEB_DIR, exist_ok=True)
         with open(WEB_DASHBOARD, 'w', encoding='utf-8') as f:
             f.write(html)
-        logging.info(f"Dashboard saved to web directory: {WEB_DASHBOARD}")
+        # Only log dashboard saves every 60 seconds to reduce log noise
+        last_log_time = getattr(update_dashboard, '_last_log_time', None)
+        if last_log_time is None or (datetime.now() - last_log_time).total_seconds() >= 60:
+            logging.debug(f"Dashboard updated: {WEB_DASHBOARD}")
+            update_dashboard._last_log_time = datetime.now()
         
         dashboard_stats['last_update'] = datetime.now()
     except Exception as e:
@@ -1039,21 +1043,68 @@ def on_bar_update(bars, hasNewBar):
         return
     
     bar = bars[-1]
+    
+    # Diagnostic: Check bar attributes to understand volume reporting
+    bar_time = bar.date.astimezone(pytz.timezone('US/Eastern'))
+    bar_seconds = bar_time.second
+    bar_minute = bar_time.minute
+    
     new_row = pd.Series({
         'open': bar.open,
         'high': bar.high,
         'low': bar.low,
         'close': bar.close,
         'volume': bar.volume
-    }, name=bar.date.astimezone(pytz.timezone('US/Eastern')))
+    }, name=bar_time)
     
     data = data._append(new_row)
     bar_count += 1
     
-    logging.info(f"Bar received: {bar.date.strftime('%H:%M:%S')} | "
-                f"O: {bar.open:.2f} H: {bar.high:.2f} L: {bar.low:.2f} C: {bar.close:.2f} | Vol: {bar.volume}")
+    # Log incoming bar (currently 5-second bars for volume investigation)
+    # NOTE: IB API volume may be filtered (excludes combo trades, block trades, etc.)
+    # TWS shows unfiltered volume, which can be 10x-20x higher
+    # bar.volume is per-bar volume for the bar period (not cumulative across bars)
+    # Check if data is live or delayed by comparing bar time to current time
+    current_time = datetime.now(pytz.timezone('US/Eastern'))
+    time_delay_seconds = (current_time - bar_time).total_seconds()
+    delay_indicator = ""
+    if time_delay_seconds < 10:
+        delay_indicator = " [LIVE]"
+    elif time_delay_seconds > 900:  # 15 minutes
+        delay_indicator = " [DELAYED]"
+    
+    logging.info(f"[5-sec bar] {bar_time.strftime('%H:%M:%S')}{delay_indicator} | "
+                f"O: {bar.open:.2f} H: {bar.high:.2f} L: {bar.low:.2f} C: {bar.close:.2f} | "
+                f"Vol: {bar.volume:,.0f}")
+    
+    # Check if this bar completes a resampled period (for logging resampled bar)
+    should_log_resampled = False
+    if strategy.timeframe > 1:
+        # Check if current bar time completes a resampled period
+        # For 2-min bars: :00, :02, :04, :06, etc. (minute % timeframe == 0)
+        if bar_time.minute % strategy.timeframe == 0 and bar_time.second == 0:
+            should_log_resampled = True
     
     update_indicators()
+    
+    # Log resampled bar if timeframe > 1 and this bar completed a resampled period
+    if should_log_resampled and len(data) >= strategy.bb_length:
+        # Get the resampled data (calculate_indicators is called in update_indicators, but we need it here for logging)
+        data_with_indicators = strategy.calculate_indicators(data.copy())
+        
+        if len(data_with_indicators) > 0:
+            latest_resampled_idx = data_with_indicators.index[-1]
+            latest_resampled_row = data_with_indicators.iloc[-1]
+            
+            # Calculate how many 5-sec bars were included in this resampled bar
+            resample_start = latest_resampled_idx - pd.Timedelta(minutes=strategy.timeframe-1)
+            period_bars = data.loc[resample_start:bar_time] if resample_start in data.index else data.loc[:bar_time]
+            num_bars = len(period_bars)
+            
+            logging.info(f"[{strategy.timeframe}-min bar] {latest_resampled_idx.strftime('%H:%M:%S')} | "
+                        f"O: {latest_resampled_row.get('open', 0):.2f} H: {latest_resampled_row.get('high', 0):.2f} "
+                        f"L: {latest_resampled_row.get('low', 0):.2f} C: {latest_resampled_row.get('close', 0):.2f} | "
+                        f"Vol: {latest_resampled_row.get('volume', 0):,.0f} (sum of {num_bars} 5-sec bars)")
     
     # Only check entries/exits if we have enough data and indicators are calculated
     if len(data) >= strategy.bb_length and 'upper' in data.columns:
@@ -1083,9 +1134,33 @@ def update_indicators():
     data_with_filters = strategy.apply_filters(data_with_indicators)
     
     # Copy filter columns back (including maintenance and RTH filters)
-    for col in ['volume_filter', 'atr_filter', 'in_rth', 'in_maintenance', 'force_exit', 'force_exit_rth']:
+    # CRITICAL FIX: Handle resampling correctly and prevent stale force_exit values
+    # When resampling occurs (timeframe > 1), data_with_filters has fewer rows than data
+    # We need to map filter values from resampled bars back to 1-minute bars
+    
+    # For force_exit and force_exit_rth: NEVER forward-fill - these must be recalculated for each bar
+    # Forward-filling would cause stale True values to persist across day boundaries
+    for col in ['force_exit', 'force_exit_rth']:
         if col in data_with_filters.columns:
-            data[col] = data_with_filters[col]
+            # Reset to False first (prevents stale values)
+            data[col] = False
+            # Only copy values where indices match exactly (from resampled bars)
+            matching_indices = data.index.intersection(data_with_filters.index)
+            if len(matching_indices) > 0:
+                data.loc[matching_indices, col] = data_with_filters.loc[matching_indices, col]
+            # For latest row: if it doesn't have a match, use the most recent resampled bar's value
+            if len(data) > 0 and data.index[-1] not in matching_indices:
+                # Find the most recent resampled bar before or at the latest bar time
+                latest_time = data.index[-1]
+                earlier_resampled = data_with_filters[data_with_filters.index <= latest_time]
+                if len(earlier_resampled) > 0:
+                    data.loc[data.index[-1], col] = earlier_resampled[col].iloc[-1]
+    
+    # For other filter columns: forward-fill is OK (they're less time-sensitive)
+    for col in ['volume_filter', 'atr_filter', 'in_rth', 'in_maintenance']:
+        if col in data_with_filters.columns:
+            reindexed = data_with_filters[col].reindex(data.index, method='ffill')
+            data[col] = reindexed.fillna(False)
 
 # Entry Logic
 def check_entries(idx, latest_row):
@@ -1267,8 +1342,21 @@ def check_exits(idx, latest_row):
     if strategy.enable_rth_filter and strategy.rth_exit_buffer_minutes > 0:
         force_exit_rth = latest_row.get('force_exit_rth', False) if isinstance(latest_row, dict) else getattr(latest_row, 'force_exit_rth', False)
         if force_exit_rth:
-            logging.warning(f"⚠️ RTH ENDING - Closing all positions ({strategy.rth_exit_buffer_minutes} min buffer)")
-            add_to_live_tracker('warning', f'RTH: Closing all positions {strategy.rth_exit_buffer_minutes} minutes before RTH end')
+            # Only log warning if we have positions to close
+            es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+            has_open_position = any(abs(p.position) > 0 for p in es_positions)
+            
+            if has_open_position or len(positions) > 0:
+                # Only log warning once per RTH period to avoid spam
+                if not hasattr(check_exits, '_rth_warning_logged'):
+                    logging.warning(f"⚠️ RTH ENDING - Closing all positions ({strategy.rth_exit_buffer_minutes} min buffer)")
+                    add_to_live_tracker('warning', f'RTH: Closing all positions {strategy.rth_exit_buffer_minutes} minutes before RTH end')
+                    check_exits._rth_warning_logged = True
+            else:
+                # No positions to close - reset warning flag
+                if hasattr(check_exits, '_rth_warning_logged'):
+                    delattr(check_exits, '_rth_warning_logged')
+                return  # Exit early if no positions
             
             # Close all open positions
             for bracket in positions[:]:
@@ -1356,8 +1444,25 @@ def check_exits(idx, latest_row):
     if strategy.enable_maintenance_filter:
         force_exit = latest_row.get('force_exit', False) if isinstance(latest_row, dict) else getattr(latest_row, 'force_exit', False)
         if force_exit:
-            logging.warning("⚠️ MAINTENANCE PERIOD APPROACHING - Closing all positions")
-            add_to_live_tracker('warning', 'MAINTENANCE: Closing all positions 5 minutes before maintenance period')
+            # Only log warning and close positions if we actually have positions
+            es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+            has_open_position = any(abs(p.position) > 0 for p in es_positions)
+            
+            if has_open_position or len(positions) > 0:
+                # Get current time to show when maintenance actually is
+                current_time = datetime.now(pytz.timezone('America/New_York')).time()
+                # Only log warning once per maintenance period to avoid spam
+                if not hasattr(check_exits, '_maintenance_warning_logged'):
+                    logging.warning(f"⚠️ MAINTENANCE PERIOD APPROACHING - Closing all positions (Current: {current_time.strftime('%H:%M:%S')} ET)")
+                    add_to_live_tracker('warning', f'MAINTENANCE: Closing all positions 5 minutes before maintenance period ({current_time.strftime("%H:%M")} ET)')
+                    check_exits._maintenance_warning_logged = True
+            else:
+                # No positions to close, but force_exit is True - this is normal during buffer period
+                # Don't log warning if there are no positions
+                # Reset warning flag when force_exit becomes False again
+                if hasattr(check_exits, '_maintenance_warning_logged'):
+                    delattr(check_exits, '_maintenance_warning_logged')
+                return
             
             # Close all open positions
             for bracket in positions[:]:
@@ -2251,17 +2356,19 @@ def cleanup_orphaned_orders():
     es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
     has_open_position = any(abs(p.position) > 0 for p in es_positions)
     
-    # If no open position, all protective orders should be cancelled
+    # If no open position, all protective orders (stop loss/take profit) should be cancelled
+    # These orders remain active after a position closes and need to be cleaned up
     if not has_open_position:
-        logging.info("No open ES position detected. Cancelling all active ES orders (orphaned from position close).")
-        for trade in ib.trades():
-            if (trade.contract.conId == contract.conId and 
-                trade.isActive()):
+        active_orders = [t for t in ib.trades() if t.contract.conId == contract.conId and t.isActive()]
+        if active_orders:
+            logging.info(f"No open ES position detected. Cleaning up {len(active_orders)} protective order(s) (stop loss/take profit) left from closed position.")
+            for trade in active_orders:
                 try:
+                    order_type = type(trade.order).__name__
                     ib.cancelOrder(trade.order)
-                    logging.info(f"Cancelled orphaned order after position close: {type(trade.order).__name__} (PermID: {trade.order.permId})")
+                    logging.debug(f"Cancelled {order_type} order (PermID: {trade.order.permId})")
                 except Exception as e:
-                    logging.warning(f"Error cancelling orphaned order {trade.order.permId}: {e}")
+                    logging.warning(f"Error cancelling {order_type} order {trade.order.permId}: {e}")
         # Clear all tracked brackets since position is closed
         positions.clear()
         return
@@ -2793,6 +2900,16 @@ def ensure_connected_and_subscribed():
         ib.connect('127.0.0.1', 7497, clientId=100)
         ib.sleep(3)
     
+    # Explicitly request live market data (type 1)
+    # Default behavior: IB uses live data if subscribed, delayed otherwise
+    # Explicitly setting ensures we get live data if available
+    # Note: ib_insync doesn't expose marketDataTypeEvent callback, so we verify via timestamp check in on_bar_update
+    try:
+        ib.reqMarketDataType(1)  # Request live data (requires market data subscription)
+        logging.info("Requested LIVE market data (type 1) - will verify via timestamp check")
+    except Exception as e:
+        logging.warning(f"Could not set market data type: {e}")
+    
     if contract is None:
         contract = get_front_es_contract()
     
@@ -2806,7 +2923,7 @@ def ensure_connected_and_subscribed():
         contract,
         endDateTime='',
         durationStr='5400 S',
-        barSizeSetting='1 min',
+        barSizeSetting='5 secs',  # Using 5-second bars for accurate volume (matches TWS within ~2%)
         whatToShow='TRADES',
         useRTH=False,
         formatDate=1,
@@ -2820,13 +2937,25 @@ def ensure_connected_and_subscribed():
         hist_df.set_index('datetime', inplace=True)
         data = hist_df[['open', 'high', 'low', 'close', 'volume']].copy()
         bar_count = len(data)
-        logging.info(f"PRE-FILLED WITH {bar_count} HISTORICAL 1-MIN BARS. LATEST: {data.index[-1]}")
+        latest_bar_time = data.index[-1]
+        current_time = datetime.now(pytz.timezone('US/Eastern'))
+        time_delay_seconds = (current_time - latest_bar_time).total_seconds()
+        time_delay_minutes = time_delay_seconds / 60
+        
+        logging.info(f"PRE-FILLED WITH {bar_count} HISTORICAL 5-SEC BARS. LATEST: {latest_bar_time}")
+        if time_delay_seconds < 10:
+            logging.info(f"✅ Data appears LIVE (delay: {time_delay_seconds:.1f} seconds)")
+        elif time_delay_minutes > 10:
+            logging.warning(f"⚠️ Data appears DELAYED (delay: {time_delay_minutes:.1f} minutes - expected ~15 min for delayed data)")
+        else:
+            logging.info(f"Data delay: {time_delay_seconds:.1f} seconds ({time_delay_minutes:.1f} minutes)")
+        
         update_indicators()
     else:
         logging.warning("NO INITIAL HISTORICAL DATA.")
     
     bars.updateEvent += on_bar_update
-    logging.info("REAL-TIME 1-MIN BARS SUBSCRIBED VIA KEEPUPTODATE")
+    logging.info("REAL-TIME 5-SEC BARS SUBSCRIBED VIA KEEPUPTODATE")
 
 # Clean exit handler
 def clean_exit(signum=None, frame=None):
