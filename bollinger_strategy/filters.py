@@ -112,12 +112,12 @@ def apply_atr_filter(df, max_atr_points, min_atr_points=0.5):
     not HIGH ATR (strong momentum/trend continuation).
     
     Args:
-        df: DataFrame with 'atr_ts' column
+        df: DataFrame with 'atr_filter_values' column (ATR calculated with filter-specific length)
         max_atr_points: Maximum ATR value in points (ATR must be <= this to allow trades)
         min_atr_points: Minimum ATR floor (optional, default 0.5) to ensure stops aren't too tight
         
     Returns:
-        DataFrame with added 'atr_filter' column (True when ATR is within range)
+        DataFrame with added 'atr_filter' boolean column (True when ATR is within range)
     """
     df = df.copy()
     # Safety check: ensure min <= max (if not, swap them or use min as floor)
@@ -136,7 +136,12 @@ def apply_atr_filter(df, max_atr_points, min_atr_points=0.5):
     # For mean reversion: filter allows LOW ATR (atr <= max_atr_points)
     # High ATR suggests strong momentum (bad for mean reversion)
     # But keep a minimum floor to ensure stops aren't unreasonably tight
-    df['atr_filter'] = (df['atr_ts'] >= effective_min) & (df['atr_ts'] <= effective_max)
+    # Use 'atr_filter_values' column (calculated with filter-specific ATR length)
+    if 'atr_filter_values' not in df.columns:
+        raise ValueError("DataFrame must have 'atr_filter_values' column (ATR calculated with filter-specific length)")
+    # Create boolean filter column from ATR values
+    atr_values = df['atr_filter_values']
+    df['atr_filter'] = (atr_values >= effective_min) & (atr_values <= effective_max)
     return df
 
 

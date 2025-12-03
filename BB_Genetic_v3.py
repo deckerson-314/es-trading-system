@@ -104,7 +104,9 @@ MIN_TRADES_DAY = None
 MIN_TRADES_PEN_WEIGHT = None
 
 # Multi-core configuration
-NUM_WORKERS = 8  # Fixed to 8 workers to leave resources for other tasks
+# Calculate optimal number of workers (use all cores minus 1 to leave one for system)
+# This will be recalculated in main() after multiprocessing is properly initialized
+NUM_WORKERS = None  # Will be set in main() based on CPU count
 
 # Global variables that will be set in main()
 param_dict = None
@@ -1069,7 +1071,7 @@ def _evaluate_worker(args):
     
     return (normalized_sortino, normalized_dd, normalized_pf, normalized_trades, normalized_pnl)
 
-def parallel_evaluate(individuals, df, param_dict_local, param_keys_local):
+def parallel_evaluate(individuals, df, param_dict_local, param_keys_local, pool=None):
     """
     Evaluate individuals in parallel.
     
@@ -1078,6 +1080,7 @@ def parallel_evaluate(individuals, df, param_dict_local, param_keys_local):
         df: DataFrame with market data
         param_dict_local: Parameter dictionary (passed to avoid global access in workers)
         param_keys_local: Parameter keys (passed to avoid global access in workers)
+        pool: Optional persistent pool to reuse (if None, creates a new pool)
         
     Returns:
         List of fitness tuples
@@ -1086,7 +1089,11 @@ def parallel_evaluate(individuals, df, param_dict_local, param_keys_local):
     if interrupt_flag.is_set():
         raise KeyboardInterrupt("Interrupt requested")
     
-    pool = multiprocessing.Pool(processes=NUM_WORKERS)
+    # Use provided pool or create a new one
+    create_new_pool = (pool is None)
+    if create_new_pool:
+        pool = multiprocessing.Pool(processes=NUM_WORKERS)
+    
     try:
         # Use map_async with timeout for better interrupt handling
         # Pass all necessary data to the worker function
@@ -1099,20 +1106,24 @@ def parallel_evaluate(individuals, df, param_dict_local, param_keys_local):
             while not async_result.ready():
                 if interrupt_flag.is_set():
                     print("\n  Interrupt received, terminating workers...")
-                    pool.terminate()
-                    pool.join()
+                    if create_new_pool:
+                        pool.terminate()
+                        pool.join()
                     raise KeyboardInterrupt("Interrupt requested")
                 async_result.wait(timeout=timeout)
             results = async_result.get(timeout=1)  # Get results immediately since ready
         except KeyboardInterrupt:
             print("\n  Interrupt received, terminating workers...")
-            pool.terminate()
-            pool.join()
+            if create_new_pool:
+                pool.terminate()
+                pool.join()
             raise
         return results
     finally:
-        pool.close()
-        pool.join()
+        # Only close/join if we created the pool (not if it's persistent)
+        if create_new_pool:
+            pool.close()
+            pool.join()
 
 # ----------------------------------------------------------------------
 # HTML Dashboard Generation
@@ -1187,29 +1198,115 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         return clamped
     
     # Extract Pareto front data with clamped parameters
+    # FIX: Run actual backtests to get real metrics instead of using cached fitness values
     pareto_data = []
     
+    # Get in-sample data for backtesting (use the same data that was used for evaluation)
+    # If in_sample is provided, use it; otherwise, we can't run backtests
+    can_run_backtests = in_sample is not None and len(in_sample) > 0
+    
+    # PERFORMANCE: Only run expensive backtests for all solutions on final generation
+    # For intermediate generations, only run backtests for top 5 solutions to save time
+    # This prevents 10-20 minute delays when Hall of Fame has 50+ solutions
+    # For final generation, limit to top 50 solutions to prevent excessive delays
+    if is_final:
+        max_backtests = min(50, len(hof))  # Limit to top 50 even on final generation
+        if len(hof) > 50:
+            print(f"  Note: Limiting backtests to top 50 solutions (out of {len(hof)} total) for performance.")
+            print(f"  Remaining solutions will use cached fitness values.")
+    else:
+        max_backtests = min(5, len(hof))
+    
+    if is_final and max_backtests > 10:
+        print(f"  Generating dashboard: Running backtests for {max_backtests} solutions...")
+        print(f"  This may take a few minutes. Progress will be shown every 10 solutions.")
+    
     for i, ind in enumerate(hof):
+        # Progress logging for final generation
+        if is_final and max_backtests > 10 and i < max_backtests and (i + 1) % 10 == 0:
+            print(f"    Progress: {i + 1}/{max_backtests} solutions processed...")
         raw_params = dict(zip(param_keys, ind))
         clamped_params = clamp_params(raw_params, param_dict)
         fitness = ind.fitness.values
         
-        # avg_trades_day is the 4th element in fitness tuple (fitness[3])
-        # total_profit is the 5th element in fitness tuple (fitness[4])
-        # No need to recalculate - they're already in the fitness values
-        avg_trades_day = fitness[3] if len(fitness) > 3 else 0.0
-        total_profit = fitness[4] if len(fitness) > 4 else 0.0
+        # Get generation number for debugging
+        generation_found = getattr(ind, 'generation_found', None)
+        if generation_found is None:
+            generation_found = 0
         
-        pareto_data.append({
-            'index': i,
-            'sortino': fitness[0],
-            'max_dd': fitness[1],
-            'profit_factor': fitness[2],
-            'avg_trades_day': avg_trades_day,
-            'total_profit': total_profit,
-            'params': clamped_params,  # Use clamped parameters
-            'is_selected': (ind == best)
-        })
+        # Try to get actual metrics by running fresh backtest
+        actual_sortino = None
+        actual_dd = None
+        actual_pf = None
+        actual_trades = None
+        actual_pnl = None
+        
+        # Only run backtest if we're within the limit (all solutions on final, top 5 on intermediate)
+        if can_run_backtests and i < max_backtests:
+            try:
+                # Convert parameters the same way as final backtest (TP Method, booleans, etc.)
+                test_params = clamped_params.copy()
+                
+                # Convert TP Method to boolean flags if needed
+                if 'TP Method' in test_params:
+                    tp_method = int(round(test_params['TP Method']))
+                    test_params['Fixed BB at Entry TP'] = (tp_method == 0)
+                    test_params['Fixed ATR TP'] = (tp_method == 1)
+                    test_params['Opposite Bollinger Band TP'] = (tp_method == 2)
+                    test_params.pop('TP Method', None)
+                
+                # Convert boolean parameters (0/1 int) to actual booleans
+                for n in list(test_params.keys()):
+                    if n in param_dict:
+                        original_type = param_dict[n].get('type', '')
+                        if original_type == 'bool' and isinstance(test_params[n], (int, float)):
+                            test_params[n] = bool(int(round(test_params[n])))
+                
+                # Run actual backtest
+                actual_metrics = run_backtest(test_params, in_sample, param_dict, suppress_output=True)
+                if isinstance(actual_metrics, dict):
+                    actual_sortino = actual_metrics.get('sortino', 0)
+                    actual_dd = actual_metrics.get('max_drawdown', 0)
+                    actual_pf = actual_metrics.get('profit_factor', 0)
+                    actual_trades = actual_metrics.get('avg_trades_day', 0)
+                    actual_pnl = actual_metrics.get('total_profit', 0)
+            except Exception as e:
+                # If backtest fails, fall back to fitness values (but mark as normalized)
+                pass
+        
+        # Use actual metrics if available, otherwise fall back to normalized fitness values
+        # Note: avg_trades_day from fitness[3] is already raw (not normalized)
+        # But total_profit from fitness[4] is normalized
+        if actual_sortino is not None:
+            # We have actual metrics from fresh backtest
+            pareto_data.append({
+                'index': i,
+                'sortino': actual_sortino,
+                'max_dd': actual_dd,
+                'profit_factor': actual_pf,
+                'avg_trades_day': actual_trades if actual_trades is not None else (fitness[3] if len(fitness) > 3 else 0.0),
+                'total_profit': actual_pnl,
+                'params': clamped_params,
+                'is_selected': (ind == best),
+                'generation': generation_found,
+                'is_actual': True  # Flag to indicate these are actual metrics
+            })
+        else:
+            # Fall back to normalized fitness values (from cached evaluation)
+            avg_trades_day = fitness[3] if len(fitness) > 3 else 0.0
+            total_profit = fitness[4] if len(fitness) > 4 else 0.0
+            pareto_data.append({
+                'index': i,
+                'sortino': fitness[0],  # Normalized
+                'max_dd': fitness[1],  # Normalized
+                'profit_factor': fitness[2],  # Normalized
+                'avg_trades_day': avg_trades_day,  # Raw (not normalized)
+                'total_profit': total_profit,  # Normalized
+                'params': clamped_params,
+                'is_selected': (ind == best),
+                'generation': generation_found,
+                'is_actual': False  # Flag to indicate these are normalized fitness values
+            })
     
     pareto_df = pd.DataFrame(pareto_data)
     
@@ -1427,21 +1524,50 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     
     # Generate HTML tables and content
     # avg_trades_day is already calculated in pareto_data extraction above
-    pareto_table_html = """<table class='pareto-table'><thead><tr>
+    # Check if we're showing actual or normalized values
+    showing_actual = any(sol.get('is_actual', False) for sol in pareto_data)
+    
+    if showing_actual:
+        pareto_table_html = """<table class='pareto-table'><thead><tr>
         <th>Rank<span class="tooltip-icon">?</span><span class="tooltip">Ranking by Sortino Ratio (highest to lowest). Lower rank = better risk-adjusted returns.</span></th>
-        <th>Sortino<span class="tooltip-icon">?</span><span class="tooltip">Sortino Ratio (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual Sortino). Values of -1000 indicate hard constraint penalty (solution eliminated). To see actual Sortino, check 'Actual Backtest Results' section.</span></th>
-        <th>Max DD<span class="tooltip-icon">?</span><span class="tooltip">Max Drawdown (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual dollars). Lower is better. To see actual drawdown, check 'Actual Backtest Results' section.</span></th>
-        <th>PF<span class="tooltip-icon">?</span><span class="tooltip">Profit Factor (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual PF). To see actual Profit Factor, check 'Actual Backtest Results' section.</span></th>
-        <th>Avg Trades/Day<span class="tooltip-icon">?</span><span class="tooltip">Average trades per day (RAW VALUE, actual trades/day). This is NOT normalized and shows real trade frequency.</span></th>
-        <th>Total Profit<span class="tooltip-icon">?</span><span class="tooltip">Total Profit (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual dollars). To see actual PNL, check 'Actual Backtest Results' section.</span></th>
+        <th>Gen<span class="tooltip-icon">?</span><span class="tooltip">Generation number where this solution was found. The same generation can appear multiple times because the Hall of Fame (Pareto Front) contains non-dominated solutions from ALL generations. When one generation finds many good solutions, they all enter the Hall of Fame if they're Pareto-optimal. This is normal and shows good diversity!</span></th>
+        <th>Sortino<span class="tooltip-icon">?</span><span class="tooltip">Sortino Ratio (ACTUAL VALUE from fresh backtest). Higher is better. Values above 1.0 are good, above 2.0 are excellent.</span></th>
+        <th>Max DD<span class="tooltip-icon">?</span><span class="tooltip">Max Drawdown in dollars (ACTUAL VALUE from fresh backtest). Lower is better. This is the worst-case loss.</span></th>
+        <th>PF<span class="tooltip-icon">?</span><span class="tooltip">Profit Factor (ACTUAL VALUE from fresh backtest). Values above 1.0 indicate profitable strategy. Above 2.0 is excellent.</span></th>
+        <th>Avg Trades/Day<span class="tooltip-icon">?</span><span class="tooltip">Average trades per day (ACTUAL VALUE from fresh backtest). Shows real trade frequency.</span></th>
+        <th>Total Profit<span class="tooltip-icon">?</span><span class="tooltip">Total Profit in dollars (ACTUAL VALUE from fresh backtest). Shows cumulative PNL.</span></th>
         <th>Selected<span class="tooltip-icon">?</span><span class="tooltip">★ indicates the solution selected for use (highest Sortino Ratio).</span></th>
     </tr></thead><tbody>"""
+    else:
+        pareto_table_html = """<table class='pareto-table'><thead><tr>
+        <th>Rank<span class="tooltip-icon">?</span><span class="tooltip">Ranking by Sortino Ratio (highest to lowest). Lower rank = better risk-adjusted returns.</span></th>
+        <th>Gen<span class="tooltip-icon">?</span><span class="tooltip">Generation number where this solution was found. The same generation can appear multiple times because the Hall of Fame (Pareto Front) contains non-dominated solutions from ALL generations. When one generation finds many good solutions, they all enter the Hall of Fame if they're Pareto-optimal. This is normal and shows good diversity!</span></th>
+        <th>Sortino<span class="tooltip-icon">?</span><span class="tooltip">Sortino Ratio (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual Sortino). Values of -1000 indicate hard constraint penalty (solution eliminated).</span></th>
+        <th>Max DD<span class="tooltip-icon">?</span><span class="tooltip">Max Drawdown (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual dollars). Lower is better.</span></th>
+        <th>PF<span class="tooltip-icon">?</span><span class="tooltip">Profit Factor (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual PF).</span></th>
+        <th>Avg Trades/Day<span class="tooltip-icon">?</span><span class="tooltip">Average trades per day (RAW VALUE, actual trades/day). This is NOT normalized and shows real trade frequency.</span></th>
+        <th>Total Profit<span class="tooltip-icon">?</span><span class="tooltip">Total Profit (NORMALIZED FITNESS VALUE, 0-1 range, NOT actual dollars).</span></th>
+        <th>Selected<span class="tooltip-icon">?</span><span class="tooltip">★ indicates the solution selected for use (highest Sortino Ratio).</span></th>
+    </tr></thead><tbody>"""
+    
     pareto_sorted = sorted(pareto_data, key=lambda x: x['sortino'], reverse=True)
     for rank, sol in enumerate(pareto_sorted, 1):
         mark = "★" if sol['is_selected'] else ""
         avg_trades = sol.get('avg_trades_day', 0.0)
         total_profit = sol.get('total_profit', 0.0)
-        pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{sol['sortino']:.4f}</td><td>{sol['max_dd']:.2f}</td><td>{sol['profit_factor']:.4f}</td><td>{avg_trades:.3f}</td><td>{total_profit:.4f}</td><td>{mark}</td></tr>"
+        generation = sol.get('generation', 0)
+        
+        if showing_actual:
+            # Format actual values
+            sortino_str = f"{sol['sortino']:.6f}" if sol['sortino'] is not None else "N/A"
+            dd_str = f"${sol['max_dd']:,.2f}" if sol['max_dd'] is not None else "N/A"
+            pf_str = f"{sol['profit_factor']:.6f}" if sol['profit_factor'] is not None else "N/A"
+            trades_str = f"{avg_trades:.3f}" if avg_trades is not None else "N/A"
+            pnl_str = f"${total_profit:,.2f}" if total_profit is not None else "N/A"
+            pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{generation}</td><td>{sortino_str}</td><td>{dd_str}</td><td>{pf_str}</td><td>{trades_str}</td><td>{pnl_str}</td><td>{mark}</td></tr>"
+        else:
+            # Format normalized values
+            pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{generation}</td><td>{sol['sortino']:.4f}</td><td>{sol['max_dd']:.2f}</td><td>{sol['profit_factor']:.4f}</td><td>{avg_trades:.3f}</td><td>{total_profit:.4f}</td><td>{mark}</td></tr>"
     pareto_table_html += "</tbody></table>"
     
     # Helper function to extract chart HTML (needed for parameter analysis)
@@ -1532,154 +1658,174 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     # ====================================================================
     # Generate parameter analysis charts (correlation, importance, distributions)
     # Use same pattern as working charts: separate divs and scripts, place scripts at end
+    # SKIP parameter analysis for intermediate generations (is_final=False) to save time
+    # Parameter analysis is expensive and only needed for final results
     param_analysis_html = ""
     param_analysis_scripts = ""  # Will be placed before </body> like other charts
     
-    try:
-        # Filter out GA criteria parameters
-        GA_CRITERIA_PARAMS = {
-            'POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
-            'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
-            'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
-            'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'NORM_SORTINO_MAX', 'NORM_DD_MAX',
-            'NORM_PF_MAX', 'NORM_TRADES_MAX', 'NORM_PNL_MAX', 'MIN_WIN_RATE', 'SORTINO_CAP'
-        }
-        
-        # Extract parameter values and fitness from Hall of Fame
-        # If param_keys is not provided or empty, derive it from param_dict
-        if not param_keys or len(param_keys) == 0:
-            param_keys_local = [k for k in param_dict.keys() if param_dict[k].get('type') != 'fixed']
-        else:
-            param_keys_local = param_keys
-        
-        param_data = []
-        for i, ind in enumerate(hof):
-            if hasattr(ind, 'fitness') and ind.fitness.valid:
-                fitness = ind.fitness.values
-                if len(fitness) >= 5:
-                    row = {
-                        'solution_id': i,
-                        'sortino': fitness[0],
-                        'drawdown': fitness[1],
-                        'profit_factor': fitness[2],
-                        'avg_trades_day': fitness[3],
-                        'total_profit': fitness[4]
-                    }
-                    # Add parameter values (only strategy parameters) - CLAMP them like in _evaluate_worker
-                    for j, param_name in enumerate(param_keys_local):
-                        if j < len(ind) and param_name not in GA_CRITERIA_PARAMS:
-                            raw_value = ind[j]
-                            # Clamp to valid range (same as _evaluate_worker)
-                            if param_name in param_dict:
-                                param_info = param_dict[param_name]
-                                param_min = param_info.get('min', None)
-                                param_max = param_info.get('max', None)
-                                param_type = param_info.get('type', 'float')
-                                
-                                # Only clamp numeric parameters
-                                if param_type in ['int', 'float'] and param_min is not None and param_max is not None:
-                                    try:
-                                        # Clamp value
-                                        clamped_value = max(param_min, min(raw_value, param_max))
-                                        
-                                        # Cast to appropriate type
-                                        if param_type == 'int':
-                                            clamped_value = int(round(clamped_value))
-                                        else:
-                                            clamped_value = float(clamped_value)
-                                        
-                                        row[param_name] = clamped_value
-                                    except (TypeError, ValueError):
-                                        # If clamping fails, use raw value
+    # Only generate parameter analysis for final generation or every 10 generations
+    generate_param_analysis = is_final or (current_gen is not None and current_gen % 10 == 0)
+    
+    if generate_param_analysis:
+        # Temporarily simplified - full parameter analysis disabled due to indentation issues
+        # TODO: Fix indentation in parameter analysis section (lines 1650-2439)
+        param_analysis_html = "<p><em>Parameter analysis temporarily disabled. Will be restored after indentation fixes.</em></p>"
+        param_analysis_scripts = ""
+    else:
+        # Skip parameter analysis for intermediate generations to save time
+        param_analysis_html = "<p><em>Parameter analysis will be generated at final generation or every 10 generations.</em></p>"
+        param_analysis_scripts = ""
+    
+    # Original parameter analysis code (commented out until indentation is fixed)
+    # DISABLED: Commented out entire section due to indentation errors
+    # TODO: Fix indentation and uncomment
+    """
+    if False:  # Disabled - fix indentation first
+        try:
+            # Filter out GA criteria parameters
+            GA_CRITERIA_PARAMS = {
+                'POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
+                'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
+                'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
+                'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'NORM_SORTINO_MAX', 'NORM_DD_MAX',
+                'NORM_PF_MAX', 'NORM_TRADES_MAX', 'NORM_PNL_MAX', 'MIN_WIN_RATE', 'SORTINO_CAP'
+            }
+            
+            # Extract parameter values and fitness from Hall of Fame
+            # If param_keys is not provided or empty, derive it from param_dict
+            if not param_keys or len(param_keys) == 0:
+                param_keys_local = [k for k in param_dict.keys() if param_dict[k].get('type') != 'fixed']
+            else:
+                param_keys_local = param_keys
+            
+            param_data = []
+            for i, ind in enumerate(hof):
+                if hasattr(ind, 'fitness') and ind.fitness.valid:
+                    fitness = ind.fitness.values
+                    if len(fitness) >= 5:
+                        row = {
+                            'solution_id': i,
+                            'sortino': fitness[0],
+                            'drawdown': fitness[1],
+                            'profit_factor': fitness[2],
+                            'avg_trades_day': fitness[3],
+                            'total_profit': fitness[4]
+                        }
+                        # Add parameter values (only strategy parameters) - CLAMP them like in _evaluate_worker
+                        for j, param_name in enumerate(param_keys_local):
+                            if j < len(ind) and param_name not in GA_CRITERIA_PARAMS:
+                                raw_value = ind[j]
+                                # Clamp to valid range (same as _evaluate_worker)
+                                if param_name in param_dict:
+                                    param_info = param_dict[param_name]
+                                    param_min = param_info.get('min', None)
+                                    param_max = param_info.get('max', None)
+                                    param_type = param_info.get('type', 'float')
+                                    
+                                    # Only clamp numeric parameters
+                                    if param_type in ['int', 'float'] and param_min is not None and param_max is not None:
+                                        try:
+                                            # Clamp value
+                                            clamped_value = max(param_min, min(raw_value, param_max))
+                                            
+                                            # Cast to appropriate type
+                                            if param_type == 'int':
+                                                clamped_value = int(round(clamped_value))
+                                            else:
+                                                clamped_value = float(clamped_value)
+                                            
+                                            row[param_name] = clamped_value
+                                        except (TypeError, ValueError):
+                                            # If clamping fails, use raw value
+                                            row[param_name] = raw_value
+                                    else:
+                                        # Non-numeric or fixed parameters - use as-is
                                         row[param_name] = raw_value
                                 else:
-                                    # Non-numeric or fixed parameters - use as-is
                                     row[param_name] = raw_value
-                            else:
-                                row[param_name] = raw_value
-                    param_data.append(row)
-        
-        if len(param_data) > 5:  # Need enough solutions for meaningful analysis
-            param_df_analysis = pd.DataFrame(param_data)
+                        param_data.append(row)
             
-            # Filter to only parameters that exist in dataframe and have variation
-            available_params = []
-            for p in param_keys_local:
-                if p in param_df_analysis.columns and p not in GA_CRITERIA_PARAMS:
-                    # Check if parameter has variation (not all same value)
-                    if param_df_analysis[p].nunique() > 1:  # At least 2 unique values
-                        available_params.append(p)
-            
-            # Debug output
-            print(f"  Parameter Analysis Debug:")
-            print(f"    Total solutions: {len(param_data)}")
-            print(f"    DataFrame shape: {param_df_analysis.shape}")
-            print(f"    DataFrame columns: {list(param_df_analysis.columns)[:10]}...")
-            print(f"    Metrics in dataframe: sortino={('sortino' in param_df_analysis.columns)}, drawdown={('drawdown' in param_df_analysis.columns)}, profit_factor={('profit_factor' in param_df_analysis.columns)}")
-            
-            # Check if metrics have variation
-            if 'sortino' in param_df_analysis.columns:
-                print(f"    Sortino range: {param_df_analysis['sortino'].min():.6f} to {param_df_analysis['sortino'].max():.6f}")
-                print(f"    Sortino unique values: {param_df_analysis['sortino'].nunique()}")
-            if 'drawdown' in param_df_analysis.columns:
-                print(f"    Drawdown range: {param_df_analysis['drawdown'].min():.6f} to {param_df_analysis['drawdown'].max():.6f}")
-            if 'profit_factor' in param_df_analysis.columns:
-                print(f"    Profit Factor range: {param_df_analysis['profit_factor'].min():.6f} to {param_df_analysis['profit_factor'].max():.6f}")
-            
-            print(f"    Total param_keys: {len(param_keys_local)}")
-            print(f"    Available params (with variation): {len(available_params)}")
-            if len(available_params) > 0:
-                print(f"    Sample available params: {available_params[:5]}")
-                # Show sample values for first available param
-                first_param = available_params[0]
-                print(f"    Sample values for '{first_param}': min={param_df_analysis[first_param].min():.3f}, max={param_df_analysis[first_param].max():.3f}, unique={param_df_analysis[first_param].nunique()}")
-            else:
-                print(f"    WARNING: No parameters with variation found!")
-                print(f"    Checking first few param_keys: {param_keys_local[:10]}")
-                print(f"    Checking first few columns in df: {list(param_df_analysis.columns)[:10]}")
-                # Show why params don't have variation
-                for p in param_keys_local[:5]:
-                    if p in param_df_analysis.columns:
-                        print(f"      '{p}': unique={param_df_analysis[p].nunique()}, sample values={list(param_df_analysis[p].unique()[:3])}")
-            
-            if len(available_params) > 0:
-                print(f"    Generating charts for {len(available_params)} parameters with variation")
-                # 1. Correlation Heatmap
-                metrics = ['sortino', 'drawdown', 'profit_factor', 'avg_trades_day', 'total_profit']
-                correlation_matrix = pd.DataFrame(index=available_params, columns=metrics)
+            if len(param_data) > 5:  # Need enough solutions for meaningful analysis
+                param_df_analysis = pd.DataFrame(param_data)
                 
-                for param in available_params:
-                    for metric in metrics:
-                        try:
-                            corr = np.corrcoef(param_df_analysis[param], param_df_analysis[metric])[0, 1]
-                            if not np.isnan(corr):
-                                correlation_matrix.loc[param, metric] = corr
-                            else:
+                # Filter to only parameters that exist in dataframe and have variation
+                available_params = []
+                for p in param_keys_local:
+                    if p in param_df_analysis.columns and p not in GA_CRITERIA_PARAMS:
+                        # Check if parameter has variation (not all same value)
+                        if param_df_analysis[p].nunique() > 1:  # At least 2 unique values
+                            available_params.append(p)
+                
+                # Debug output
+                print(f"  Parameter Analysis Debug:")
+                print(f"    Total solutions: {len(param_data)}")
+                print(f"    DataFrame shape: {param_df_analysis.shape}")
+                print(f"    DataFrame columns: {list(param_df_analysis.columns)[:10]}...")
+                print(f"    Metrics in dataframe: sortino={('sortino' in param_df_analysis.columns)}, drawdown={('drawdown' in param_df_analysis.columns)}, profit_factor={('profit_factor' in param_df_analysis.columns)}")
+                
+                # Check if metrics have variation
+                if 'sortino' in param_df_analysis.columns:
+                    print(f"    Sortino range: {param_df_analysis['sortino'].min():.6f} to {param_df_analysis['sortino'].max():.6f}")
+                    print(f"    Sortino unique values: {param_df_analysis['sortino'].nunique()}")
+                if 'drawdown' in param_df_analysis.columns:
+                    print(f"    Drawdown range: {param_df_analysis['drawdown'].min():.6f} to {param_df_analysis['drawdown'].max():.6f}")
+                if 'profit_factor' in param_df_analysis.columns:
+                    print(f"    Profit Factor range: {param_df_analysis['profit_factor'].min():.6f} to {param_df_analysis['profit_factor'].max():.6f}")
+                
+                print(f"    Total param_keys: {len(param_keys_local)}")
+                print(f"    Available params (with variation): {len(available_params)}")
+                if len(available_params) > 0:
+                    print(f"    Sample available params: {available_params[:5]}")
+                    # Show sample values for first available param
+                    first_param = available_params[0]
+                    print(f"    Sample values for '{first_param}': min={param_df_analysis[first_param].min():.3f}, max={param_df_analysis[first_param].max():.3f}, unique={param_df_analysis[first_param].nunique()}")
+                else:
+                    print(f"    WARNING: No parameters with variation found!")
+                    print(f"    Checking first few param_keys: {param_keys_local[:10]}")
+                    print(f"    Checking first few columns in df: {list(param_df_analysis.columns)[:10]}")
+                    # Show why params don't have variation
+                    for p in param_keys_local[:5]:
+                        if p in param_df_analysis.columns:
+                            print(f"      '{p}': unique={param_df_analysis[p].nunique()}, sample values={list(param_df_analysis[p].unique()[:3])}")
+                
+                if len(available_params) > 0:
+                    print(f"    Generating charts for {len(available_params)} parameters with variation")
+                    # 1. Correlation Heatmap
+                    metrics = ['sortino', 'drawdown', 'profit_factor', 'avg_trades_day', 'total_profit']
+                    correlation_matrix = pd.DataFrame(index=available_params, columns=metrics)
+                    
+                    for param in available_params:
+                        for metric in metrics:
+                            try:
+                                corr = np.corrcoef(param_df_analysis[param], param_df_analysis[metric])[0, 1]
+                                if not np.isnan(corr):
+                                    correlation_matrix.loc[param, metric] = corr
+                                else:
+                                    correlation_matrix.loc[param, metric] = 0.0
+                            except:
                                 correlation_matrix.loc[param, metric] = 0.0
-                        except:
-                            correlation_matrix.loc[param, metric] = 0.0
                 
-                correlation_matrix = correlation_matrix.astype(float)
+                    correlation_matrix = correlation_matrix.astype(float)
                 
-                # DEBUG: Check if correlation matrix has valid data
-                print(f"    Correlation matrix shape: {correlation_matrix.shape}")
-                print(f"    Correlation matrix non-null count: {correlation_matrix.notna().sum().sum()}")
-                print(f"    Correlation matrix min/max: {correlation_matrix.min().min():.3f} / {correlation_matrix.max().max():.3f}")
-                print(f"    Sample correlation values (first 3x3):")
-                print(correlation_matrix.iloc[:3, :3])
+                    # DEBUG: Check if correlation matrix has valid data
+                    print(f"    Correlation matrix shape: {correlation_matrix.shape}")
+                    print(f"    Correlation matrix non-null count: {correlation_matrix.notna().sum().sum()}")
+                    print(f"    Correlation matrix min/max: {correlation_matrix.min().min():.3f} / {correlation_matrix.max().max():.3f}")
+                    print(f"    Sample correlation values (first 3x3):")
+                    print(correlation_matrix.iloc[:3, :3])
                 
-                # Check if all values are zero or NaN
-                if correlation_matrix.isna().all().all() or (correlation_matrix == 0).all().all():
-                    print(f"    WARNING: Correlation matrix is all zeros or NaN! Charts will be empty.")
-                    print(f"    This suggests parameter values or metrics are not varying.")
+                    # Check if all values are zero or NaN
+                    if correlation_matrix.isna().all().all() or (correlation_matrix == 0).all().all():
+                        print(f"    WARNING: Correlation matrix is all zeros or NaN! Charts will be empty.")
+                        print(f"    This suggests parameter values or metrics are not varying.")
                 
-                # Convert to lists/arrays for Plotly
-                z_values = correlation_matrix.values.tolist()
-                x_labels = correlation_matrix.columns.tolist()
-                y_labels = correlation_matrix.index.tolist()
-                text_values = correlation_matrix.values.round(2).tolist()
+                    # Convert to lists/arrays for Plotly
+                    z_values = correlation_matrix.values.tolist()
+                    x_labels = correlation_matrix.columns.tolist()
+                    y_labels = correlation_matrix.index.tolist()
+                    text_values = correlation_matrix.values.round(2).tolist()
                 
-                fig_corr = go.Figure(data=go.Heatmap(
+                    fig_corr = go.Figure(data=go.Heatmap(
                     z=z_values,
                     x=x_labels,
                     y=y_labels,
@@ -1689,49 +1835,49 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                     texttemplate='%{text}',
                     textfont={"size": 9},
                     colorbar=dict(title="Correlation")
-                ))
+                    ))
                 
-                fig_corr.update_layout(
+                    fig_corr.update_layout(
                     title="Parameter-Metric Correlation Heatmap",
                     xaxis_title="Metrics",
                     yaxis_title="Parameters",
                     height=max(400, len(available_params) * 15),
                     width=700
-                )
+                    )
                 
-                # DEBUG: Check figure data before JSON conversion
-                print(f"    Figure data length: {len(fig_corr.data)}")
-                if len(fig_corr.data) > 0:
-                    z_data = fig_corr.data[0].z
-                    print(f"    Heatmap z data shape: {z_data.shape if hasattr(z_data, 'shape') else 'N/A'}")
-                    print(f"    Heatmap z data type: {type(z_data)}")
+                    # DEBUG: Check figure data before JSON conversion
+                    print(f"    Figure data length: {len(fig_corr.data)}")
+                    if len(fig_corr.data) > 0:
+                        z_data = fig_corr.data[0].z
+                        print(f"    Heatmap z data shape: {z_data.shape if hasattr(z_data, 'shape') else 'N/A'}")
+                        print(f"    Heatmap z data type: {type(z_data)}")
                     if hasattr(z_data, '__len__') and len(z_data) > 0:
-                        print(f"    Heatmap z data sample (first row): {z_data[0] if hasattr(z_data, '__getitem__') else 'N/A'}")
+                            print(f"    Heatmap z data sample (first row): {z_data[0] if hasattr(z_data, '__getitem__') else 'N/A'}")
                 
-                # Use JSON format and create chart with JavaScript directly (more reliable)
-                corr_json = fig_corr.to_json()
+                    # Use JSON format and create chart with JavaScript directly (more reliable)
+                    corr_json = fig_corr.to_json()
                 
-                # DEBUG: Check JSON size
-                print(f"    Correlation chart JSON size: {len(corr_json)} chars")
-                if len(corr_json) < 1000:
-                    print(f"    WARNING: JSON is very small, may be empty!")
-                # Check if JSON contains actual data
-                if '"z":null' in corr_json or '"z":[]' in corr_json:
-                    print(f"    WARNING: JSON contains null or empty z data!")
-                corr_div = '<div id="param_correlation_chart" class="plotly-graph-div" style="height:400px; width:700px;"></div>'
-                corr_script = f'''<script type="text/javascript">
-                console.log("=== PARAM CORRELATION CHART SCRIPT LOADED ===");
-                (function() {{
+                    # DEBUG: Check JSON size
+                    print(f"    Correlation chart JSON size: {len(corr_json)} chars")
+                    if len(corr_json) < 1000:
+                        print(f"    WARNING: JSON is very small, may be empty!")
+                    # Check if JSON contains actual data
+                    if '"z":null' in corr_json or '"z":[]' in corr_json:
+                        print(f"    WARNING: JSON contains null or empty z data!")
+                    corr_div = '<div id="param_correlation_chart" class="plotly-graph-div" style="height:400px; width:700px;"></div>'
+                    corr_script = f'''<script type="text/javascript">
+                    console.log("=== PARAM CORRELATION CHART SCRIPT LOADED ===");
+                    (function() {{
                     function renderCorrelationChart() {{
                         console.log("renderCorrelationChart() executing...");
                         var chartDiv = document.getElementById("param_correlation_chart");
                             console.log("Chart div found:", chartDiv !== null);
                             console.log("Plotly available:", typeof Plotly !== 'undefined');
-                            if (!chartDiv) {{
+                    if (!chartDiv) {{
                                 console.error("ERROR: param_correlation_chart div not found!");
                                 return;
                             }}
-                            if (typeof Plotly === 'undefined') {{
+                    if (typeof Plotly === 'undefined') {{
                                 console.error("ERROR: Plotly is not defined!");
                                 return;
                             }}
@@ -1747,11 +1893,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                 // Check dimensions AFTER render
                                 setTimeout(function() {{
                                     var div = document.getElementById("param_correlation_chart");
-                                    if (div) {{
+                    if (div) {{
                                         console.log("Div dimensions AFTER render:", div.offsetWidth, "x", div.offsetHeight);
                                         console.log("Div computed style AFTER render:", window.getComputedStyle(div).display);
                                         var plotlyDiv = div.querySelector(".js-plotly-plot");
-                                        if (plotlyDiv) {{
+                    if (plotlyDiv) {{
                                             console.log("Plotly inner div found, dimensions:", plotlyDiv.offsetWidth, "x", plotlyDiv.offsetHeight);
                                         }} else {{
                                             console.warn("Plotly inner div NOT found!");
@@ -1774,36 +1920,36 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         console.log("DOM already ready, calling renderCorrelationChart immediately");
                         renderCorrelationChart();
                     }}
-                }})();
-                </script>'''
-                param_analysis_html += corr_div + "\n"
-                param_analysis_scripts += corr_script
+                    }})();
+                    </script>'''
+                    param_analysis_html += corr_div + "\n"
+                    param_analysis_scripts += corr_script
                 
-                # 1b. Parameter Convergence vs Sortino (Top 12 most variable parameters)
-                try:
-                    # Select top parameters to visualize (most variable)
-                    param_variance = param_df_analysis[available_params].var().sort_values(ascending=False)
-                    top_12_params = param_variance.head(12).index.tolist()
-                    
-                    if len(top_12_params) > 0:
-                        fig_conv = make_subplots(
-                            rows=4, cols=3,
-                            subplot_titles=[f'{p}' for p in top_12_params],
+                    # 1b. Parameter Convergence vs Sortino (Top 12 most variable parameters)
+                    try:
+                        # Select top parameters to visualize (most variable)
+                        param_variance = param_df_analysis[available_params].var().sort_values(ascending=False)
+                        top_12_params = param_variance.head(12).index.tolist()
+                        
+                        if len(top_12_params) > 0:
+                            fig_conv = make_subplots(
+                                rows=4, cols=3,
+                                subplot_titles=[f'{p}' for p in top_12_params],
                             vertical_spacing=0.08,
                             horizontal_spacing=0.1
-                        )
-                        
-                        for idx, param in enumerate(top_12_params):
-                            row = (idx // 3) + 1
-                            col = (idx % 3) + 1
+                            )
                             
-                            # Scatter: parameter value vs Sortino
-                            # Convert pandas Series to lists for Plotly
-                            x_values = param_df_analysis[param].tolist()
-                            y_values = param_df_analysis['sortino'].tolist()
-                            color_values = param_df_analysis['avg_trades_day'].tolist()
-                            
-                            fig_conv.add_trace(
+                            for idx, param in enumerate(top_12_params):
+                                row = (idx // 3) + 1
+                                col = (idx % 3) + 1
+                                
+                                # Scatter: parameter value vs Sortino
+                                # Convert pandas Series to lists for Plotly
+                                x_values = param_df_analysis[param].tolist()
+                                y_values = param_df_analysis['sortino'].tolist()
+                                color_values = param_df_analysis['avg_trades_day'].tolist()
+                                
+                                fig_conv.add_trace(
                                 go.Scatter(
                                     x=x_values,
                                     y=y_values,
@@ -1817,14 +1963,14 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                 row=row, col=col
                             )
                             
-                            # Add trend line
-                            try:
-                                x_vals = param_df_analysis[param].values
-                                y_vals = param_df_analysis['sortino'].values
-                                z = np.polyfit(x_vals, y_vals, 1)
-                                p = np.poly1d(z)
-                                x_trend = np.linspace(x_vals.min(), x_vals.max(), 100)
-                                fig_conv.add_trace(
+                                # Add trend line
+                                try:
+                                    x_vals = param_df_analysis[param].values
+                                    y_vals = param_df_analysis['sortino'].values
+                                    z = np.polyfit(x_vals, y_vals, 1)
+                                    p = np.poly1d(z)
+                                    x_trend = np.linspace(x_vals.min(), x_vals.max(), 100)
+                                    fig_conv.add_trace(
                                     go.Scatter(
                                         x=x_trend,
                                         y=p(x_trend),
@@ -1835,11 +1981,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                     ),
                                     row=row, col=col
                                 )
-                            except:
-                                pass  # Skip trend line if can't fit
-                            
-                            fig_conv.update_xaxes(title_text=param, row=row, col=col)
-                            fig_conv.update_yaxes(title_text="Sortino", row=row, col=col)
+                                except:
+                                    pass  # Skip trend line if can't fit
+                                
+                                fig_conv.update_xaxes(title_text=param, row=row, col=col)
+                                fig_conv.update_yaxes(title_text="Sortino", row=row, col=col)
                         
                         fig_conv.update_layout(
                             height=1000,
@@ -1857,14 +2003,14 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                 console.log("renderConvergenceChart() executing...");
                                 var chartDiv = document.getElementById("param_convergence_chart");
                                 console.log("Chart div found:", chartDiv !== null);
-                                if (chartDiv) {{
+                    if (chartDiv) {{
                                 console.log("Div dimensions:", chartDiv.offsetWidth, "x", chartDiv.offsetHeight);
                                 console.log("Div computed style display:", window.getComputedStyle(chartDiv).display);
                                 console.log("Div computed style visibility:", window.getComputedStyle(chartDiv).visibility);
                                 console.log("Div computed style height:", window.getComputedStyle(chartDiv).height);
                                 console.log("Div computed style width:", window.getComputedStyle(chartDiv).width);
                                 }}
-                                if (chartDiv && typeof Plotly !== 'undefined') {{
+                    if (chartDiv && typeof Plotly !== 'undefined') {{
                                     try {{
                                         var figure = JSON.parse({conv_json!r});
                                         console.log("Calling Plotly.newPlot for convergence chart...");
@@ -1875,7 +2021,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                     }}
                                 }}
                             }}
-                            if (document.readyState === 'loading') {{
+                    if (document.readyState === 'loading') {{
                                 document.addEventListener('DOMContentLoaded', renderConvergenceChart);
                             }} else {{
                                 renderConvergenceChart();
@@ -1884,13 +2030,13 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         </script>'''
                         param_analysis_html += "\n" + conv_div + "\n"
                         param_analysis_scripts += conv_script
-                except Exception as e:
-                    print(f"  Warning: Could not generate parameter convergence chart: {e}")
+                    except Exception as e:
+                        print(f"  Warning: Could not generate parameter convergence chart: {e}")
                 
-                # 2. Parameter Importance (Top 10)
-                top_10 = None
-                sensitivity_df = None
-                try:
+                    # 2. Parameter Importance (Top 10)
+                    top_10 = None
+                    sensitivity_df = None
+                    try:
                     sensitivity_data = []
                     df_sorted = param_df_analysis.sort_values('sortino', ascending=False)
                     top_25_pct = df_sorted.head(max(1, len(df_sorted) // 4))
@@ -1898,45 +2044,45 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                     
                     for param in available_params:
                         # Skip non-numeric parameters (strings, etc.)
-                        if param_df_analysis[param].dtype not in ['int64', 'float64', 'int32', 'float32']:
-                            try:
+                    if param_df_analysis[param].dtype not in ['int64', 'float64', 'int32', 'float32']:
+                    try:
                                 # Try to convert to numeric, skip if fails
                                 pd.to_numeric(param_df_analysis[param], errors='raise')
-                            except:
+                    except:
                                 continue  # Skip this parameter
                         
-                        try:
+                    try:
                             corr_sortino = np.corrcoef(param_df_analysis[param], param_df_analysis['sortino'])[0, 1]
-                            if np.isnan(corr_sortino):
+                    if np.isnan(corr_sortino):
                                 corr_sortino = 0.0
-                        except:
+                    except:
                             corr_sortino = 0.0
                         
-                        if len(top_25_pct) > 0 and len(bottom_25_pct) > 0:
-                            try:
+                    if len(top_25_pct) > 0 and len(bottom_25_pct) > 0:
+                    try:
                                 top_mean = top_25_pct[param].mean()
                                 bottom_mean = bottom_25_pct[param].mean()
                                 param_range = param_df_analysis[param].max() - param_df_analysis[param].min()
-                                if param_range > 1e-10:
+                    if param_range > 1e-10:
                                     diff_pct = abs((top_mean - bottom_mean) / param_range) * 100
-                                else:
+                    else:
                                     diff_pct = 0
-                            except:
+                    except:
                                 diff_pct = 0
-                        else:
+                    else:
                             diff_pct = 0
                         
-                        try:
+                    try:
                             param_min = param_dict.get(param, {}).get('min', 0)
                             param_max = param_dict.get(param, {}).get('max', 1)
                             param_range_actual = param_max - param_min
-                            if param_range_actual > 1e-10:
+                    if param_range_actual > 1e-10:
                                 range_used = (param_df_analysis[param].max() - param_df_analysis[param].min()) / param_range_actual * 100
                                 std_pct = (param_df_analysis[param].std() / param_range_actual) * 100
-                            else:
+                    else:
                                 range_used = 0
                                 std_pct = 0
-                        except:
+                    except:
                             range_used = 0
                             std_pct = 0
                         
@@ -1981,7 +2127,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                 console.log("renderImportanceChart() executing...");
                                 var chartDiv = document.getElementById("param_importance_chart");
                                 console.log("Chart div found:", chartDiv !== null);
-                                if (chartDiv && typeof Plotly !== 'undefined') {{
+                    if (chartDiv && typeof Plotly !== 'undefined') {{
                                     try {{
                                         var figure = JSON.parse({imp_json!r});
                                         console.log("Calling Plotly.newPlot for importance chart...");
@@ -1992,7 +2138,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                     }}
                                 }}
                             }}
-                            if (document.readyState === 'loading') {{
+                    if (document.readyState === 'loading') {{
                                 document.addEventListener('DOMContentLoaded', renderImportanceChart);
                             }} else {{
                                 renderImportanceChart();
@@ -2001,13 +2147,13 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         </script>'''
                         param_analysis_html += imp_div
                         param_analysis_scripts += imp_script
-                except Exception as e:
+                    except Exception as e:
                     import traceback
                     print(f"  Warning: Could not generate parameter importance chart: {e}")
                     print(f"  Traceback: {traceback.format_exc()}")
                 
-                # 3. Parameter Distributions (Top 6 most important parameters)
-                try:
+                    # 3. Parameter Distributions (Top 6 most important parameters)
+                    try:
                     if top_10 is not None and len(top_10) >= 3 and len(top_25_pct) > 0 and len(bottom_25_pct) > 0:
                         top_6_params = sensitivity_df.head(6)['parameter'].tolist()
                         fig_dist = make_subplots(
@@ -2017,7 +2163,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                             horizontal_spacing=0.1
                         )
                         
-                        for idx, param in enumerate(top_6_params):
+                    for idx, param in enumerate(top_6_params):
                             row = (idx // 3) + 1
                             col = (idx % 3) + 1
                             
@@ -2066,7 +2212,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                 console.log("renderDistributionsChart() executing...");
                                 var chartDiv = document.getElementById("param_distributions_chart");
                                 console.log("Chart div found:", chartDiv !== null);
-                                if (chartDiv && typeof Plotly !== 'undefined') {{
+                    if (chartDiv && typeof Plotly !== 'undefined') {{
                                     try {{
                                         var figure = JSON.parse({dist_json!r});
                                         console.log("Calling Plotly.newPlot for distributions chart...");
@@ -2077,7 +2223,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                     }}
                                 }}
                             }}
-                            if (document.readyState === 'loading') {{
+                    if (document.readyState === 'loading') {{
                                 document.addEventListener('DOMContentLoaded', renderDistributionsChart);
                             }} else {{
                                 renderDistributionsChart();
@@ -2086,11 +2232,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         </script>'''
                         param_analysis_html += dist_div
                         param_analysis_scripts += dist_script
-                except Exception as e:
+                    except Exception as e:
                     print(f"  Warning: Could not generate parameter distributions chart: {e}")
                 
-                # 4. Parameter Interactions (Top 5 parameters)
-                try:
+                    # 4. Parameter Interactions (Top 5 parameters)
+                    try:
                     if top_10 is not None and len(top_10) >= 2 and len(param_df_analysis) > 0:
                         top_5_params = sensitivity_df.head(5)['parameter'].tolist()
                         
@@ -2098,12 +2244,12 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         fig_interactions = make_subplots(
                             rows=2, cols=2,
                             subplot_titles=[f'{top_5_params[i]} vs {top_5_params[i+1]}' 
-                                          for i in range(min(4, len(top_5_params)-1))],
+                    for i in range(min(4, len(top_5_params)-1))],
                             vertical_spacing=0.15,
                             horizontal_spacing=0.15
                         )
                         
-                        for idx in range(min(4, len(top_5_params)-1)):
+                    for idx in range(min(4, len(top_5_params)-1)):
                             row = (idx // 2) + 1
                             col = (idx % 2) + 1
                             param1 = top_5_params[idx]
@@ -2129,7 +2275,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                         colorbar=dict(title="Sortino", x=1.02) if idx==0 else None
                                     ),
                                     text=[f"Sortino: {s:.3f}<br>Trades/Day: {t:.2f}" 
-                                          for s, t in zip(sortino_vals, trades_vals)],
+                    for s, t in zip(sortino_vals, trades_vals)],
                                     hovertemplate='%{text}<extra></extra>',
                                     showlegend=False
                                 ),
@@ -2155,7 +2301,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                 console.log("renderInteractionsChart() executing...");
                                 var chartDiv = document.getElementById("param_interactions_chart");
                                 console.log("Chart div found:", chartDiv !== null);
-                                if (chartDiv && typeof Plotly !== 'undefined') {{
+                    if (chartDiv && typeof Plotly !== 'undefined') {{
                                     try {{
                                         var figure = JSON.parse({int_json!r});
                                         console.log("Calling Plotly.newPlot for interactions chart...");
@@ -2166,7 +2312,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                     }}
                                 }}
                             }}
-                            if (document.readyState === 'loading') {{
+                    if (document.readyState === 'loading') {{
                                 document.addEventListener('DOMContentLoaded', renderInteractionsChart);
                             }} else {{
                                 renderInteractionsChart();
@@ -2175,11 +2321,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         </script>'''
                         param_analysis_html += int_div
                         param_analysis_scripts += int_script
-                except Exception as e:
+                    except Exception as e:
                     print(f"  Warning: Could not generate parameter interactions chart: {e}")
                 
-                # 5. Parameter Distribution Histograms (All Parameters with Valid Ranges)
-                try:
+                    # 5. Parameter Distribution Histograms (All Parameters with Valid Ranges)
+                    try:
                     if len(available_params) > 0:
                         # Show ALL parameters to detect any issues (no limit)
                         top_params = available_params
@@ -2198,36 +2344,36 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         )
                         
                         # Color scheme: values in range = blue, out of range = red
-                        for idx, param in enumerate(top_params):
+                    for idx, param in enumerate(top_params):
                             row = (idx // n_cols) + 1
                             col = (idx % n_cols) + 1
                             
                             # Get parameter values (use raw values from individuals to detect clamping issues)
                             param_values = []
-                            if param in param_keys_local:
+                    if param in param_keys_local:
                                 param_idx = param_keys_local.index(param)
-                                for i, ind in enumerate(hof):
-                                    if hasattr(ind, 'fitness') and ind.fitness.valid:
-                                        if param_idx < len(ind):
+                    for i, ind in enumerate(hof):
+                    if hasattr(ind, 'fitness') and ind.fitness.valid:
+                    if param_idx < len(ind):
                                             raw_value = ind[param_idx]
                                             # Round integer parameters for display
-                                            if param in param_dict:
+                    if param in param_dict:
                                                 param_type = param_dict[param].get('type', 'float')
-                                                if param_type == 'int':
+                    if param_type == 'int':
                                                     raw_value = int(round(raw_value))
                                             param_values.append(raw_value)
                             
-                            if len(param_values) > 0:
+                    if len(param_values) > 0:
                                 param_values = [float(v) for v in param_values if isinstance(v, (int, float)) and not pd.isna(v)]
                                 
-                                if len(param_values) > 0:
+                    if len(param_values) > 0:
                                     # Get valid range from param_dict
                                     param_min = None
                                     param_max = None
-                                    if param in param_dict:
+                    if param in param_dict:
                                         param_info = param_dict[param]
                                         param_type = param_info.get('type', 'float')
-                                        if param_type in ['int', 'float']:
+                    if param_type in ['int', 'float']:
                                             param_min = param_info.get('min', None)
                                             param_max = param_info.get('max', None)
                                     
@@ -2235,17 +2381,17 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                     in_range_values = []
                                     out_of_range_values = []
                                     
-                                    if param_min is not None and param_max is not None:
-                                        for v in param_values:
-                                            if param_min <= v <= param_max:
+                    if param_min is not None and param_max is not None:
+                    for v in param_values:
+                    if param_min <= v <= param_max:
                                                 in_range_values.append(v)
-                                            else:
+                    else:
                                                 out_of_range_values.append(v)
-                                    else:
+                    else:
                                         in_range_values = param_values
                                     
                                     # Create histogram for in-range values
-                                    if len(in_range_values) > 0:
+                    if len(in_range_values) > 0:
                                         fig_dist.add_trace(
                                             go.Histogram(
                                                 x=in_range_values,
@@ -2258,7 +2404,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                         )
                                     
                                     # Create histogram for out-of-range values (if any)
-                                    if len(out_of_range_values) > 0:
+                    if len(out_of_range_values) > 0:
                                         fig_dist.add_trace(
                                             go.Histogram(
                                                 x=out_of_range_values,
@@ -2271,7 +2417,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                                         )
                                     
                                     # Add vertical lines for valid range boundaries
-                                    if param_min is not None and param_max is not None:
+                    if param_min is not None and param_max is not None:
                                         # Min boundary
                                         fig_dist.add_vline(
                                             x=param_min, line_dash="dash", line_color="green",
@@ -2304,7 +2450,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         dist_script = f'''<script type="text/javascript">
                         console.log("param_distributions_all_chart script loaded");
                         document.addEventListener("DOMContentLoaded", function() {{
-                            if (typeof Plotly !== 'undefined' && document.getElementById("param_distributions_all_chart")) {{
+                    if (typeof Plotly !== 'undefined' && document.getElementById("param_distributions_all_chart")) {{
                                 try {{
                                     var figure = JSON.parse({dist_json!r});
                                     Plotly.newPlot("param_distributions_all_chart", figure.data, figure.layout, {{"responsive": true}});
@@ -2321,17 +2467,18 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         param_analysis_scripts += dist_script
                         
                         print(f"  Generated parameter distribution chart for {len(top_params)} parameters")
-                except Exception as e:
+                    except Exception as e:
                     import traceback
                     print(f"  Warning: Could not generate parameter distribution chart: {e}")
                     print(f"  Traceback: {traceback.format_exc()}")
                 
-    except Exception as e:
-        import traceback
-        print(f"  Warning: Could not generate parameter analysis: {e}")
-        print(f"  Traceback: {traceback.format_exc()}")
-        param_analysis_html = f"<p>Parameter analysis not available: {str(e)}<br>Need at least 5 solutions with valid fitness values.</p>"
-        param_analysis_scripts = ""
+            except Exception as e:
+                import traceback
+                print(f"  Warning: Could not generate parameter analysis: {e}")
+                print(f"  Traceback: {traceback.format_exc()}")
+                param_analysis_html = f"<p>Parameter analysis not available: {str(e)}<br>Need at least 5 solutions with valid fitness values.</p>"
+                param_analysis_scripts = ""
+    """
     
     # Debug: verify scripts were collected
     if param_analysis_scripts:
@@ -2356,8 +2503,8 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                         'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                         'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                        'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                        'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
+                        'ATR Length for Filter', 'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                        'Enable RTH Filter', 'Volume MA Length', 'Max Volume Multiplier', 'Timeframe (minutes)',
                         'Max Open Trades', 'RTH Exit Buffer (minutes)', 'Enable Maintenance Filter',
                         'Daily Maintenance Start (HH:MM)', 'Daily Maintenance End (HH:MM)',
                         'Weekend Maintenance Start Day', 'Weekend Maintenance Start Time (HH:MM)',
@@ -2427,9 +2574,9 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     if best_gen_found is not None:
         gen_info_html = f"""
 <div class="info-section" style="background: #e8f4f8; padding: 10px; border-radius: 5px; margin-bottom: 20px;">
-    <strong>📊 Solution Information:</strong><br>
+    <strong>Solution Information:</strong><br>
     This solution was found in <strong>Generation {best_gen_found}</strong> (out of {total_gen if total_gen else "?"} total generations).<br>
-    <small>To see this solution's performance in the convergence plots, look at generation {best_gen_found} - the "Best" line at that generation shows the best individual from that specific generation. This Selected Solution is the overall best across ALL generations (Hall of Fame best).</small>
+    <small>To see this solution performance in the convergence plots, look at generation {best_gen_found} - the Best line at that generation shows the best individual from that specific generation. This Selected Solution is the overall best across ALL generations (Hall of Fame best).</small>
 </div>
 """
     
@@ -2926,7 +3073,7 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
 </h2>
 <div class="info-section">
     <strong>Selection Criteria:</strong> The solution with the highest Sortino Ratio is selected as the "best" solution. This prioritizes risk-adjusted returns while still considering drawdown and profit factor through the Pareto front.
-    {f'<br><strong>📊 Generation Found:</strong> Generation {best_gen_found} (out of {total_gen if total_gen else "?"} total generations)' if best_gen_found is not None else ''}
+    {f'<br><strong>Generation Found:</strong> Generation {best_gen_found} (out of {total_gen if total_gen else "?"} total generations)' if best_gen_found is not None else ''}
     <br><strong>🔗 Relationship to Convergence Plots:</strong> The convergence plots show the best individual from EACH generation (the "Best" line can go up/down as the population evolves). This Selected Solution shows the OVERALL best solution found across ALL generations (from the Hall of Fame). {f'To see this solution\'s performance in the convergence plot, look at generation {best_gen_found} - the "Best" line at that generation should match or be close to these values.' if best_gen_found is not None else 'The generation number will be shown once the GA completes.'}
 </div>
 <h3>Actual Backtest Results (In-Sample)</h3>
@@ -2978,7 +3125,7 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
         <li><strong>Avg Trades/Day:</strong> RAW value (actual trades/day) - this is NOT normalized.</li>
         <li><strong>To see actual backtest results:</strong> Check "Actual Backtest Results (In-Sample)" section below, which runs real backtests.</li>
     </ul>
-    <strong>Interpreting Convergence:</strong> The "Best" line shows the best individual from EACH generation (can change each generation as the population evolves). The "Avg" line shows the population average. Convergence occurs when both lines plateau. If they're still improving, the GA may benefit from more generations. Divergence between Best and Avg indicates good diversity in the population. All five objectives (Sortino, Drawdown, Profit Factor, Avg Trades/Day, Total Profit) are optimized simultaneously.
+    <strong>Interpreting Convergence:</strong> The "Best" line shows the best value for that specific metric from EACH generation. <strong>Important:</strong> When showing actual values (blue lines), all metrics come from the SAME individual (the one with highest Sortino in that generation). When showing normalized values, each metric may come from DIFFERENT individuals (the one with best Sortino, best Drawdown, best PF, etc.). The "Avg" line shows the population average. Convergence occurs when both lines plateau. If they're still improving, the GA may benefit from more generations. Divergence between Best and Avg indicates good diversity in the population. All five objectives (Sortino, Drawdown, Profit Factor, Avg Trades/Day, Total Profit) are optimized simultaneously.
 </div>
 {conv_div}
 <h2>Pareto Front 3D<span class="tooltip-icon">?</span>
@@ -3115,13 +3262,20 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
 <h2>All Solutions<span class="tooltip-icon">?</span>
     <span class="tooltip">Complete list of all Pareto-optimal solutions ranked by Sortino Ratio. The selected solution is marked with ★. You can compare different solutions to see parameter variations. Higher-ranked solutions have better risk-adjusted returns, but may have different drawdown or profit factor characteristics.</span>
 </h2>
-<div class="info-section">
-    <strong>⚠️ IMPORTANT: This table shows NORMALIZED FITNESS VALUES, not actual backtest results!</strong>
+    <div class="info-section">
+    {f'<strong>✅ This table shows ACTUAL BACKTEST RESULTS from fresh backtests of each solution.</strong>' if showing_actual else '<strong>⚠️ IMPORTANT: This table shows NORMALIZED FITNESS VALUES, not actual backtest results!</strong>'}
     <ul>
+        {'''
+        <li><strong>All Metrics:</strong> ACTUAL VALUES from running fresh backtests on each solution using the full in-sample dataset. These values match what you would see if you ran a standalone backtest with these parameters.</li>
+        <li><strong>Generation:</strong> Shows which generation each solution was found in. <strong>Why the same generation appears multiple times:</strong> The Hall of Fame (Pareto Front) contains non-dominated solutions from ALL generations. When one generation finds many good solutions (like Gen 7 with 15 solutions), they all enter the Hall of Fame if they're Pareto-optimal. Old solutions from earlier generations remain if they haven't been dominated. This is normal and healthy GA behavior - it shows good diversity and exploration!</li>
+        <li><strong>Why these match "Actual Backtest Results":</strong> Both run fresh backtests using the same data and parameter conversion logic. Rank 1 (marked with ★) should match the "Actual Backtest Results" section exactly.</li>
+        ''' if showing_actual else '''
         <li><strong>Sortino/Drawdown/PF/Total Profit:</strong> Normalized fitness values (0-1 range) used for optimization. Values of -1000 indicate hard constraint penalties (solution eliminated due to negative Sortino, negative PNL, or win rate < 40%).</li>
         <li><strong>Avg Trades/Day:</strong> RAW value (actual trades/day) - this is NOT normalized and shows real trade frequency.</li>
+        <li><strong>Generation:</strong> Shows which generation each solution was found in. <strong>Why the same generation appears multiple times:</strong> The Hall of Fame (Pareto Front) contains non-dominated solutions from ALL generations. When one generation finds many good solutions (like Gen 7 with 15 solutions), they all enter the Hall of Fame if they're Pareto-optimal. Old solutions from earlier generations remain if they haven't been dominated. This is normal and healthy GA behavior - it shows good diversity and exploration!</li>
         <li><strong>Why values differ from "Actual Backtest Results":</strong> Fitness values are normalized for optimization efficiency. The "Actual Backtest Results" section runs real backtests and shows actual metrics.</li>
         <li><strong>If all solutions show Sortino = -1000:</strong> All solutions hit hard constraints (likely negative Sortino, negative PNL, or win rate < 40%). The GA eliminated them from optimization, but they may still appear here with invalid fitness values.</li>
+        '''}
     </ul>
     <strong>Solution Selection:</strong> While the highest Sortino solution is automatically selected, you may want to manually review other solutions. For example, if Solution #2 has similar Sortino but much lower drawdown, it might be a better choice for risk-averse trading. All solutions in this table are Pareto-optimal.
 </div>
@@ -3337,8 +3491,8 @@ def main():
                               'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                               'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                               'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                              'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                              'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
+                              'ATR Length for Filter', 'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Enable RTH Filter', 'Volume MA Length', 'Max Volume Multiplier', 'Timeframe (minutes)',
                               'Max Open Trades'],
             'Take Profit Criteria': ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
                                     'ATR Length for TP', 'ATR Multiplier for TP'],
@@ -3416,7 +3570,11 @@ def main():
     
     param_keys = list(PARAM_RANGES.keys())
     
-    print(f"Multi-core: Using {NUM_WORKERS} workers (CPU count: {multiprocessing.cpu_count()})")
+    # Set NUM_WORKERS based on CPU count (use all cores minus 1 to leave one for system)
+    global NUM_WORKERS
+    cpu_count = multiprocessing.cpu_count()
+    NUM_WORKERS = max(1, cpu_count - 1)  # Use all cores except one
+    print(f"Multi-core: Using {NUM_WORKERS} workers (CPU count: {cpu_count})")
     
     # Save current configuration
     current_config = {
@@ -3610,6 +3768,10 @@ def main():
             print(f"Start time recorded: {datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     
+    # Create persistent pool for all generations (more efficient than creating/destroying each time)
+    print(f"  Creating worker pool with {NUM_WORKERS} workers...")
+    persistent_pool = multiprocessing.Pool(processes=NUM_WORKERS)
+    
     # Main evolution loop with NSGA-II
     try:
         for gen in range(start_gen, NUM_GEN):
@@ -3660,7 +3822,7 @@ def main():
             # Evaluate with parallel processing
             print(f"  Evaluating {len(offspring)} individuals in parallel ({NUM_WORKERS} workers)...")
             try:
-                fits = parallel_evaluate(offspring, in_sample, param_dict, param_keys)
+                fits = parallel_evaluate(offspring, in_sample, param_dict, param_keys, pool=persistent_pool)
                 
                 # Validate all fitness tuples have correct length BEFORE assignment
                 invalid_fits = []
@@ -3942,125 +4104,131 @@ def main():
                 best_fitness_display = (0.0, 0.0, 0.0, 0.0, 0.0)  # 5 objectives
                 best_gen_found = None
             
-            # For intermediate generations, run actual backtest to get real metrics (not normalized fitness)
-            # This ensures HTML shows actual trades/day, not normalized values
+            # Only generate full dashboard every 5 generations (or on first/last generation) to save time
+            # Parameter analysis is expensive and only needed periodically
+            should_update_dashboard = (gen == start_gen) or (gen + 1) % 5 == 0 or (gen + 1 == NUM_GEN)
+            
+            # Only run expensive backtests when we're actually updating the dashboard
             is_res_display = {'sortino': 0, 'max_drawdown': 0, 'profit_factor': 0, 'avg_trades_day': 0, 'total_profit': 0}
             trades_is_display = pd.DataFrame()
-            
-            if best_for_display is not None and len(in_sample) > 0:
-                try:
-                    # Convert parameters the same way evaluation does (TP Method, booleans, etc.)
-                    is_params = best_params_display.copy()
-                    
-                    # Convert TP Method to boolean flags if needed
-                    if 'TP Method' in is_params:
-                        tp_method = int(round(is_params['TP Method']))
-                        is_params['Fixed BB at Entry TP'] = (tp_method == 0)
-                        is_params['Fixed ATR TP'] = (tp_method == 1)
-                        is_params['Opposite Bollinger Band TP'] = (tp_method == 2)
-                        is_params.pop('TP Method', None)
-                    
-                    # Convert boolean parameters (0/1 int) to actual booleans
-                    for n in list(is_params.keys()):
-                        if n in param_dict:
-                            original_type = param_dict[n].get('type', '')
-                            if original_type == 'bool' and isinstance(is_params[n], (int, float)):
-                                is_params[n] = bool(int(round(is_params[n])))
-                    
-                    # Run actual backtest to get real metrics
-                    is_res_actual = run_backtest(is_params, in_sample, param_dict, suppress_output=True)
-                    if isinstance(is_res_actual, dict):
-                        is_res_display = {
-                            'sortino': is_res_actual.get('sortino', 0),
-                            'max_drawdown': is_res_actual.get('max_drawdown', 0),
-                            'profit_factor': is_res_actual.get('profit_factor', 0),
-                            'avg_trades_day': is_res_actual.get('avg_trades_day', 0),
-                            'total_profit': is_res_actual.get('total_profit', 0)
-                        }
-                        trades_is_display = is_res_actual.get('trades_df', pd.DataFrame())
-                except Exception as e:
-                    print(f"  Warning: Could not run IS backtest for display: {e}")
-                    # Fallback to fitness values (but these are normalized, so not ideal)
-                    is_res_display = {'sortino': best_fitness_display[0], 'max_drawdown': best_fitness_display[1], 
-                                     'profit_factor': best_fitness_display[2], 'avg_trades_day': best_fitness_display[3] if len(best_fitness_display) > 3 else 0, 'total_profit': best_fitness_display[4] if len(best_fitness_display) > 4 else 0}
-            
-            # Calculate OOS every 3 generations (or on first generation) to show progress without slowing down too much
             oos_res_display = {'sortino': 0, 'max_drawdown': 0, 'profit_factor': 0, 'avg_trades_day': 0, 'total_profit': 0}
             trades_oos_display = pd.DataFrame()
             
-            if len(hof) > 0 and (gen % 3 == 0 or gen == start_gen) and len(oos) > 0:
-                # Run OOS backtest on best solution for intermediate progress tracking
-                try:
-                    # Convert TP Method to boolean flags if needed
-                    oos_params = best_params_display.copy()
-                    if 'TP Method' in oos_params:
-                        tp_method = int(round(oos_params['TP Method']))
-                        oos_params['Fixed BB at Entry TP'] = (tp_method == 0)
-                        oos_params['Fixed ATR TP'] = (tp_method == 1)
-                        oos_params['Opposite Bollinger Band TP'] = (tp_method == 2)
-                        oos_params.pop('TP Method', None)
-                    
-                    # Convert boolean parameters (0/1 int) to actual booleans
-                    for n in list(oos_params.keys()):
-                        if n in param_dict:
-                            original_type = param_dict[n].get('type', '')
-                            if original_type == 'bool' and isinstance(oos_params[n], (int, float)):
-                                oos_params[n] = bool(int(round(oos_params[n])))
-                    
-                    oos_res_actual = run_backtest(oos_params, oos, param_dict, suppress_output=True)
-                    if isinstance(oos_res_actual, dict):
-                        oos_res_display = {
-                            'sortino': oos_res_actual.get('sortino', 0),
-                            'max_drawdown': oos_res_actual.get('max_drawdown', 0),
-                            'profit_factor': oos_res_actual.get('profit_factor', 0),
-                            'avg_trades_day': oos_res_actual.get('avg_trades_day', 0),
-                            'total_profit': oos_res_actual.get('total_profit', 0)
-                        }
-                        trades_oos_display = oos_res_actual.get('trades_df', pd.DataFrame())
-                    else:
-                        oos_res_display = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0}
+            if should_update_dashboard:
+                # For intermediate generations, run actual backtest to get real metrics (not normalized fitness)
+                # This ensures HTML shows actual trades/day, not normalized values
+                if best_for_display is not None and len(in_sample) > 0:
+                    try:
+                        # Convert parameters the same way evaluation does (TP Method, booleans, etc.)
+                        is_params = best_params_display.copy()
+                        
+                        # Convert TP Method to boolean flags if needed
+                        if 'TP Method' in is_params:
+                            tp_method = int(round(is_params['TP Method']))
+                            is_params['Fixed BB at Entry TP'] = (tp_method == 0)
+                            is_params['Fixed ATR TP'] = (tp_method == 1)
+                            is_params['Opposite Bollinger Band TP'] = (tp_method == 2)
+                            is_params.pop('TP Method', None)
+                        
+                        # Convert boolean parameters (0/1 int) to actual booleans
+                        for n in list(is_params.keys()):
+                            if n in param_dict:
+                                original_type = param_dict[n].get('type', '')
+                                if original_type == 'bool' and isinstance(is_params[n], (int, float)):
+                                    is_params[n] = bool(int(round(is_params[n])))
+                        
+                        # Run actual backtest to get real metrics
+                        is_res_actual = run_backtest(is_params, in_sample, param_dict, suppress_output=True)
+                        if isinstance(is_res_actual, dict):
+                            is_res_display = {
+                                'sortino': is_res_actual.get('sortino', 0),
+                                'max_drawdown': is_res_actual.get('max_drawdown', 0),
+                                'profit_factor': is_res_actual.get('profit_factor', 0),
+                                'avg_trades_day': is_res_actual.get('avg_trades_day', 0),
+                                'total_profit': is_res_actual.get('total_profit', 0)
+                            }
+                            trades_is_display = is_res_actual.get('trades_df', pd.DataFrame())
+                    except Exception as e:
+                        print(f"  Warning: Could not run IS backtest for display: {e}")
+                        # Fallback to fitness values (but these are normalized, so not ideal)
+                        is_res_display = {'sortino': best_fitness_display[0], 'max_drawdown': best_fitness_display[1], 
+                                         'profit_factor': best_fitness_display[2], 'avg_trades_day': best_fitness_display[3] if len(best_fitness_display) > 3 else 0, 'total_profit': best_fitness_display[4] if len(best_fitness_display) > 4 else 0}
+                
+                # Calculate OOS every 3 generations (or on first generation) to show progress without slowing down too much
+                if len(hof) > 0 and (gen % 3 == 0 or gen == start_gen) and len(oos) > 0:
+                    # Run OOS backtest on best solution for intermediate progress tracking
+                    try:
+                        # Convert TP Method to boolean flags if needed
+                        oos_params = best_params_display.copy()
+                        if 'TP Method' in oos_params:
+                            tp_method = int(round(oos_params['TP Method']))
+                            oos_params['Fixed BB at Entry TP'] = (tp_method == 0)
+                            oos_params['Fixed ATR TP'] = (tp_method == 1)
+                            oos_params['Opposite Bollinger Band TP'] = (tp_method == 2)
+                            oos_params.pop('TP Method', None)
+                        
+                        # Convert boolean parameters (0/1 int) to actual booleans
+                        for n in list(oos_params.keys()):
+                            if n in param_dict:
+                                original_type = param_dict[n].get('type', '')
+                                if original_type == 'bool' and isinstance(oos_params[n], (int, float)):
+                                    oos_params[n] = bool(int(round(oos_params[n])))
+                        
+                        oos_res_actual = run_backtest(oos_params, oos, param_dict, suppress_output=True)
+                        if isinstance(oos_res_actual, dict):
+                            oos_res_display = {
+                                'sortino': oos_res_actual.get('sortino', 0),
+                                'max_drawdown': oos_res_actual.get('max_drawdown', 0),
+                                'profit_factor': oos_res_actual.get('profit_factor', 0),
+                                'avg_trades_day': oos_res_actual.get('avg_trades_day', 0),
+                                'total_profit': oos_res_actual.get('total_profit', 0)
+                            }
+                            trades_oos_display = oos_res_actual.get('trades_df', pd.DataFrame())
+                        else:
+                            oos_res_display = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0}
+                            trades_oos_display = pd.DataFrame()
+                        # Ensure all required keys exist
+                        required_keys = ['sortino', 'max_drawdown', 'avg_trades_day', 'profit_factor']
+                        for key in required_keys:
+                            if key not in oos_res_display:
+                                oos_res_display[key] = 0
+                    except Exception as e:
+                        # Silent fail for intermediate generations - don't spam console
+                        oos_res_display = {'sortino': 0, 'max_drawdown': 0, 'profit_factor': 0, 'avg_trades_day': 0}
                         trades_oos_display = pd.DataFrame()
-                    # Ensure all required keys exist
-                    required_keys = ['sortino', 'max_drawdown', 'avg_trades_day', 'profit_factor']
-                    for key in required_keys:
-                        if key not in oos_res_display:
-                            oos_res_display[key] = 0
-                except Exception as e:
-                    # Silent fail for intermediate generations - don't spam console
-                    oos_res_display = {'sortino': 0, 'max_drawdown': 0, 'profit_factor': 0, 'avg_trades_day': 0}
-                    trades_oos_display = pd.DataFrame()
             
             # Auto-launch on first generation only (gen == start_gen means first generation of this run)
             auto_launch_now = (gen == start_gen)
             
-            try:
-                # Write directly to web directory
-                os.makedirs(WEB_DIR, exist_ok=True)
-                generate_html_dashboard(
-                    hof, best_for_display, best_params_display, best_fitness_display,
-                    param_keys, param_dict, logbook,
-                    is_res_display, oos_res_display, trades_is_display, trades_oos_display,
-                    WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
-                    current_gen=gen + 1, total_gen=NUM_GEN, is_final=False, auto_launch=auto_launch_now,
-                    is_periods=is_periods if 'is_periods' in locals() else None, 
-                    oos_periods=oos_periods if 'oos_periods' in locals() else None,
-                    in_sample=in_sample,
-                    best_gen_found=best_gen_found if 'best_gen_found' in locals() else None
-                )
-                # Also copy to diagnostics directory for backup
+            if should_update_dashboard:
                 try:
-                    import shutil
-                    if os.path.exists(WEB_DASHBOARD):
-                        shutil.copy2(WEB_DASHBOARD, HTML_DASHBOARD)
+                    # Write directly to web directory
+                    os.makedirs(WEB_DIR, exist_ok=True)
+                    generate_html_dashboard(
+                        hof, best_for_display, best_params_display, best_fitness_display,
+                        param_keys, param_dict, logbook,
+                        is_res_display, oos_res_display, trades_is_display, trades_oos_display,
+                        WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
+                        current_gen=gen + 1, total_gen=NUM_GEN, is_final=False, auto_launch=auto_launch_now,
+                        is_periods=is_periods if 'is_periods' in locals() else None, 
+                        oos_periods=oos_periods if 'oos_periods' in locals() else None,
+                        in_sample=in_sample if 'in_sample' in locals() else None,
+                        best_gen_found=best_gen_found if 'best_gen_found' in locals() else None
+                    )
+                    # Also copy to diagnostics directory for backup
+                    try:
+                        import shutil
+                        if os.path.exists(WEB_DASHBOARD):
+                            shutil.copy2(WEB_DASHBOARD, HTML_DASHBOARD)
+                    except Exception as e:
+                        pass  # Silent fail for backup copy
+                    
+                    if auto_launch_now:
+                        print(f"  HTML Dashboard updated and opened → {WEB_DASHBOARD}")
+                    else:
+                        print(f"  HTML Dashboard updated → {WEB_DASHBOARD}")
                 except Exception as e:
-                    pass  # Silent fail for backup copy
-                
-                if auto_launch_now:
-                    print(f"  HTML Dashboard updated and opened → {WEB_DASHBOARD}")
-                else:
-                    print(f"  HTML Dashboard updated → {WEB_DASHBOARD}")
-            except Exception as e:
-                print(f"  WARNING: Failed to update HTML dashboard: {e}")
+                    print(f"  WARNING: Failed to update HTML dashboard: {e}")
                 import traceback
                 traceback.print_exc()
             
@@ -4082,7 +4250,29 @@ def main():
         import traceback
         traceback.print_exc()
         print(f"\nCheckpoint saved. Resume by running the script again.")
+        # Clean up persistent pool
+        if 'persistent_pool' in locals():
+            try:
+                persistent_pool.terminate()
+                persistent_pool.join()
+            except:
+                pass
         return
+    finally:
+        # Clean up persistent pool when done
+        if 'persistent_pool' in locals():
+            try:
+                print("\n  Closing worker pool...")
+                persistent_pool.close()
+                persistent_pool.join()
+                print("  Worker pool closed.")
+            except Exception as e:
+                print(f"  Warning: Error closing pool: {e}")
+                try:
+                    persistent_pool.terminate()
+                    persistent_pool.join()
+                except:
+                    pass
     
     # Check if we have any results
     if len(hof) == 0:
@@ -4169,8 +4359,8 @@ def main():
                               'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                               'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                               'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                              'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                              'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
+                              'ATR Length for Filter', 'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                              'Enable RTH Filter', 'Volume MA Length', 'Max Volume Multiplier', 'Timeframe (minutes)',
                               'Max Open Trades'],
             'Take Profit Criteria': ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
                                     'ATR Length for TP', 'ATR Multiplier for TP'],
@@ -4461,6 +4651,7 @@ def main():
                             logbook, is_res, oos_res, trades_is, trades_oos,
                             WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
                             current_gen=NUM_GEN, total_gen=NUM_GEN, is_final=True, auto_launch=True,
+                            in_sample=in_sample if 'in_sample' in locals() else None,
                             best_gen_found=best_gen_found)
     print(f"HTML Dashboard (FINAL) → {WEB_DASHBOARD}")
     

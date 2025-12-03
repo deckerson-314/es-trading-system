@@ -53,6 +53,7 @@ class BollingerBandStrategy:
         self.fixed_bb_entry_tp = get_param_value(self.params_dict, 'Fixed BB at Entry TP', True)
         self.atr_length_tp = int(get_param_value(self.params_dict, 'ATR Length for TP', 26))
         self.atr_mult_tp = float(get_param_value(self.params_dict, 'ATR Multiplier for TP', 2.0))
+        self.atr_length_filter = int(get_param_value(self.params_dict, 'ATR Length for Filter', 26))
         self.max_atr_points = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
         self.max_atr_points_opt = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
         self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))  # Optional floor
@@ -61,6 +62,7 @@ class BollingerBandStrategy:
         self.rth_start_str = get_param_value(self.params_dict, 'RTH Start (HH:MM)', '09:30')
         self.rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
         self.rth_exit_buffer_minutes = int(get_param_value(self.params_dict, 'RTH Exit Buffer (minutes)', 0))
+        self.volume_ma_length = int(get_param_value(self.params_dict, 'Volume MA Length', 50))
         self.max_volume_multiplier = float(get_param_value(self.params_dict, 'Max Volume Multiplier', 1.5))
         
         # Maintenance period filter parameters
@@ -119,6 +121,8 @@ class BollingerBandStrategy:
             self.short_wick_touch = bool(int(round(params['Short Entry on Wick Touch'])))
         if 'ATR Multiplier for Trailing Stop' in params:
             self.atr_mult_ts_opt = float(params['ATR Multiplier for Trailing Stop'])
+        if 'Volume MA Length' in params:
+            self.volume_ma_length = max(1, int(params['Volume MA Length']))
         if 'Max Volume Multiplier' in params:
             self.max_volume_multiplier_opt = float(params['Max Volume Multiplier'])
         if 'Max ATR Filter (Points)' in params:
@@ -134,6 +138,8 @@ class BollingerBandStrategy:
             self.atr_length_ts = max(1, int(params['ATR Length for Trailing Stop']))
         if 'ATR Length for TP' in params:
             self.atr_length_tp = max(1, int(params['ATR Length for TP']))
+        if 'ATR Length for Filter' in params:
+            self.atr_length_filter = max(1, int(params['ATR Length for Filter']))
         if 'ATR Multiplier for TP' in params:
             self.atr_mult_tp = float(params['ATR Multiplier for TP'])
         # CRITICAL FIX: Update Initial Stop Loss (this was missing!)
@@ -171,28 +177,42 @@ class BollingerBandStrategy:
         """
         df = df.copy()
         
-        # Resample if needed
-        if self.timeframe > 1:
-            # IB API bar.volume for real-time bars is per-bar volume
-            # Using 5-second bars provides more accurate volume aggregation than 1-minute bars
-            # When resampling to larger timeframes, we sum volumes from all smaller bars
-            # Use label='right' and closed='right' to match IB's bar alignment
-            df_resampled = df.resample(f'{self.timeframe}T', label='right', closed='right').agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'  # Sum volumes from all smaller bars (5-sec) in the resampled period
-            })
-            # Drop only rows where all OHLCV values are NaN (partial data is OK)
-            df_resampled = df_resampled.dropna(subset=['open', 'high', 'low', 'close', 'volume'], how='all')
-            df = df_resampled
+        # Detect incoming bar frequency and resample to target timeframe if needed
+        # IB API provides 5-second bars for accurate volume, but we need to resample to target timeframe
+        if len(df) >= 2:
+            # Calculate time difference between first two bars to detect frequency
+            time_diff = (df.index[1] - df.index[0]).total_seconds()
+            incoming_bar_seconds = int(time_diff)
+            
+            # Calculate target bar seconds
+            target_bar_seconds = self.timeframe * 60
+            
+            # Resample if incoming bars are smaller than target timeframe
+            # (e.g., 5-second bars -> 1-minute bars, or 5-second bars -> 2-minute bars)
+            if incoming_bar_seconds < target_bar_seconds:
+                # IB API bar.volume for real-time bars is per-bar volume
+                # Using 5-second bars provides more accurate volume aggregation than 1-minute bars
+                # When resampling to larger timeframes, we sum volumes from all smaller bars
+                # Use label='right' and closed='right' to match IB's bar alignment
+                df_resampled = df.resample(f'{self.timeframe}T', label='right', closed='right').agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'  # Sum volumes from all smaller bars (5-sec) in the resampled period
+                })
+                # Drop only rows where all OHLCV values are NaN (partial data is OK)
+                df_resampled = df_resampled.dropna(subset=['open', 'high', 'low', 'close', 'volume'], how='all')
+                df = df_resampled
         
         # Bollinger Bands
         df = calculate_bollinger_bands(df, self.bb_length, self.bb_stddev)
         
         # ATR for trailing stop
         df['atr_ts'] = calculate_atr(df, self.atr_length_ts)
+        
+        # ATR for filter (separate from trailing stop) - store as atr_filter_values
+        df['atr_filter_values'] = calculate_atr(df, self.atr_length_filter)
         
         # ATR for TP (if needed)
         if self.fixed_atr_tp:
@@ -225,7 +245,7 @@ class BollingerBandStrategy:
         )
         
         # Volume filter (for mean reversion: allows LOW volume, filters out HIGH volume)
-        df = apply_volume_filter(df, self.max_volume_multiplier_opt, volume_window=50)
+        df = apply_volume_filter(df, self.max_volume_multiplier_opt, volume_window=self.volume_ma_length)
         
         # ATR filter (for mean reversion: allows LOW ATR, filters out HIGH ATR)
         # CRITICAL FIX: Use min_atr_points_opt if it was set by update_optimizable_params, otherwise use default

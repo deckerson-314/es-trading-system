@@ -73,8 +73,8 @@ def group_params_for_display(params_dict_local):
                           'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                           'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                           'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
-                          'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
-                          'Enable RTH Filter', 'Max Volume Multiplier', 'Timeframe (minutes)',
+                          'ATR Length for Filter', 'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 'RTH Start (HH:MM)', 'RTH End (HH:MM)',
+                          'Enable RTH Filter', 'Volume MA Length', 'Max Volume Multiplier', 'Timeframe (minutes)',
                           'Max Open Trades'],
         'Take Profit Criteria': ['Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
                                 'ATR Length for TP', 'ATR Multiplier for TP'],
@@ -298,6 +298,9 @@ HTML_DASHBOARD = 'ib_deployment_dashboard.html'
 WEB_DIR = os.path.join(os.getcwd(), 'web')  # Common web directory
 WEB_DASHBOARD = os.path.join(WEB_DIR, 'ib_deployment_dashboard.html')
 
+# Track realized PNL from portfolio updates (more accurate than positions)
+portfolio_realized_pnl = None  # Will be updated from updatePortfolio callback
+
 # Define helper functions
 def send_email(subject, body):
     try:
@@ -490,8 +493,15 @@ def get_account_summary():
                 realized = 0
             total_realized_pnl += realized
         
+        # Use portfolio_realized_pnl if available (from updatePortfolio callback - more accurate)
+        # This is especially important when there are no open positions
+        global portfolio_realized_pnl
+        if portfolio_realized_pnl is not None:
+            summary['RealizedPNL'] = portfolio_realized_pnl
+        else:
+            summary['RealizedPNL'] = total_realized_pnl
+        
         summary['UnrealizedPNL'] = total_unrealized_pnl
-        summary['RealizedPNL'] = total_realized_pnl
         summary['ES_Positions'] = len(es_positions)
         
         return summary
@@ -1078,33 +1088,130 @@ def on_bar_update(bars, hasNewBar):
                 f"Vol: {bar.volume:,.0f}")
     
     # Check if this bar completes a resampled period (for logging resampled bar)
+    # Since we're receiving 5-second bars, we need to resample to target timeframe
+    # IMPORTANT: With label='right', the resampled bar timestamp is the END of the period
+    # So a 7-min bar at 12:08:00 includes data from 12:01:00 (exclusive) to 12:08:00 (inclusive)
+    # We should log it when we receive the LAST 5-sec bar that completes the period
+    # For 1-min bars: log when we receive a bar at :00 (the bar that completes the minute)
+    # For 7-min bars: log when we receive a bar at :08, :15, :22, :29, :36, :43, :50, :57
     should_log_resampled = False
-    if strategy.timeframe > 1:
-        # Check if current bar time completes a resampled period
-        # For 2-min bars: :00, :02, :04, :06, etc. (minute % timeframe == 0)
+    if strategy.timeframe == 1:
+        # For 1-minute bars, log when second == 0 (the bar that completes the minute)
+        if bar_time.second == 0:
+            should_log_resampled = True
+    elif strategy.timeframe > 1:
+        # For multi-minute bars, log when minute % timeframe == 0 and second == 0
+        # This is when we receive the last 5-sec bar that completes the resampled period
         if bar_time.minute % strategy.timeframe == 0 and bar_time.second == 0:
             should_log_resampled = True
     
     update_indicators()
     
     # Log resampled bar if timeframe > 1 and this bar completed a resampled period
+    # IMPORTANT: Only log if we actually have data up to (or very close to) the resampled bar timestamp
+    # This prevents logging incomplete resampled bars
     if should_log_resampled and len(data) >= strategy.bb_length:
-        # Get the resampled data (calculate_indicators is called in update_indicators, but we need it here for logging)
-        data_with_indicators = strategy.calculate_indicators(data.copy())
+        # Check if we have data up to the expected resampled bar timestamp
+        # For a 7-min bar, if current bar is at 12:08:00, we should have data up to 12:08:00
+        expected_resampled_time = bar_time.replace(second=0, microsecond=0)
+        # Allow up to 5 seconds of tolerance (one bar) - this handles the case where
+        # we receive the bar at 12:08:00 but the resampled bar timestamp is also 12:08:00
+        has_sufficient_data = len(data) > 0 and (data.index[-1] >= expected_resampled_time - pd.Timedelta(seconds=5))
         
-        if len(data_with_indicators) > 0:
-            latest_resampled_idx = data_with_indicators.index[-1]
-            latest_resampled_row = data_with_indicators.iloc[-1]
+        if has_sufficient_data:
+            # Get the resampled data (calculate_indicators is called in update_indicators, but we need it here for logging)
+            data_with_indicators = strategy.calculate_indicators(data.copy())
+        
+            if len(data_with_indicators) > 0:
+                latest_resampled_idx = data_with_indicators.index[-1]
+                latest_resampled_row = data_with_indicators.iloc[-1]
+                
+                # Only log if we have data up to (or very close to) the resampled bar timestamp
+                # This prevents logging incomplete resampled bars
+                time_gap_to_resampled = (latest_resampled_idx - data.index[-1]).total_seconds()
+                if time_gap_to_resampled > 60:  # More than 1 minute gap
+                    # Don't log - we don't have enough data for this resampled bar yet
+                    logging.debug(f"  Skipping resampled bar at {latest_resampled_idx} - only have data up to {data.index[-1]} (gap: {time_gap_to_resampled:.0f}s)")
+                    return
             
             # Calculate how many 5-sec bars were included in this resampled bar
-            resample_start = latest_resampled_idx - pd.Timedelta(minutes=strategy.timeframe-1)
-            period_bars = data.loc[resample_start:bar_time] if resample_start in data.index else data.loc[:bar_time]
+            # For a 7-minute bar, we need 7 minutes of 5-sec bars = 420 seconds / 5 = 84 bars
+            # The resampled bar at latest_resampled_idx represents data from (latest_resampled_idx - timeframe) to latest_resampled_idx
+            # With label='right' and closed='right', the bar at 11:54:00 includes data from 11:47:00 (exclusive) to 11:54:00 (inclusive)
+            # So we need bars from (11:47:00 + 5 seconds) to 11:54:00 (inclusive) = 84 bars
+            # Example: 11:47:05, 11:47:10, ..., 11:53:55, 11:54:00 = 84 bars
+            resample_start = latest_resampled_idx - pd.Timedelta(minutes=strategy.timeframe)
+            # With closed='right', the start time is exclusive, so we need bars AFTER resample_start
+            # The first bar included is resample_start + 5 seconds (the first 5-sec bar after the start)
+            resample_start_exclusive = resample_start + pd.Timedelta(seconds=5)
+            
+            # IMPORTANT: With label='right', the resampled bar timestamp (latest_resampled_idx) is the END of the period
+            # But we might not have data up to that exact timestamp yet. We need to find the actual
+            # last 5-second bar that was included in the resampling.
+            # The resampled bar at 12:08:00 should include bars from 12:01:00 (exclusive) to 12:08:00 (inclusive)
+            # But if the last 5-sec bar is only at 12:07:00, we only have 6 minutes of data
+            
+            # Find all bars that are <= latest_resampled_idx (the resampled bar end time)
+            available_bars_up_to_resampled = data[data.index <= latest_resampled_idx]
+            
+            if len(available_bars_up_to_resampled) == 0:
+                # No bars available - shouldn't happen, but handle gracefully
+                period_bars = pd.DataFrame()
+            else:
+                # Use the actual last 5-second bar timestamp as the end point
+                actual_end_time = available_bars_up_to_resampled.index[-1]
+                
+                # Check if we have enough data to reach the resampled bar timestamp
+                time_gap_seconds = (latest_resampled_idx - actual_end_time).total_seconds()
+                if time_gap_seconds > 10:  # More than 10 seconds gap
+                    # We're logging a resampled bar before we have all the data for it
+                    # This happens because we check at the start of the period, not the end
+                    logging.debug(f"  Note: Resampled bar timestamp ({latest_resampled_idx}) is {time_gap_seconds:.0f} seconds ahead of last 5-sec bar ({actual_end_time})")
+                
+                # Get all bars in the resampled period (from resample_start_exclusive to actual_end_time)
+                if resample_start_exclusive >= data.index[0]:
+                    # Get all bars in the range, including both endpoints
+                    period_bars = data.loc[resample_start_exclusive:actual_end_time]
+                else:
+                    # If resample_start is before our data starts, use what we have
+                    period_bars = data.loc[:actual_end_time]
+            
             num_bars = len(period_bars)
+            
+            # Expected number of bars: timeframe minutes * 60 seconds / 5 seconds per bar
+            expected_bars = (strategy.timeframe * 60) // 5
+            
+            # If we don't have enough history, the count will be less than expected
+            # This is normal during startup - the resampling still works correctly
+            if num_bars < expected_bars:
+                # Calculate actual time span and log detailed debug info
+                actual_start = period_bars.index[0] if len(period_bars) > 0 else None
+                actual_end = period_bars.index[-1] if len(period_bars) > 0 else None
+                if actual_start and actual_end:
+                    actual_span_minutes = (actual_end - actual_start).total_seconds() / 60
+                    logging.warning(f"  ⚠️ {strategy.timeframe}-min bar has {num_bars} bars (expected {expected_bars})")
+                    logging.warning(f"     Resampled bar time: {latest_resampled_idx}")
+                    logging.warning(f"     Calculated start: {resample_start}, exclusive start: {resample_start_exclusive}")
+                    logging.warning(f"     Actual period: {actual_start} to {actual_end} (span: {actual_span_minutes:.1f} min)")
+                    logging.warning(f"     Data range: {data.index[0]} to {data.index[-1]} (total: {len(data)} bars)")
+                    logging.warning(f"     Bars up to resampled time: {len(available_bars_up_to_resampled)}")
+            
+            # Always log the actual count (even if less than expected during startup)
+            if num_bars == expected_bars:
+                bar_count_msg = f"sum of {num_bars} 5-sec bars"
+            else:
+                bar_count_msg = f"sum of {num_bars} 5-sec bars (expected {expected_bars}, limited by available data)"
+                # Log a debug message if the count doesn't match expected
+                if num_bars == expected_bars + 1:
+                    # Common case: we're including the start boundary when we shouldn't
+                    logging.debug(f"  Note: Found {num_bars} bars (expected {expected_bars}) - likely including start boundary. Period: {resample_start} to {latest_resampled_idx}")
+                else:
+                    logging.debug(f"  Note: Found {num_bars} bars, expected {expected_bars} for {strategy.timeframe}-min period (from {resample_start_exclusive} to {latest_resampled_idx})")
             
             logging.info(f"[{strategy.timeframe}-min bar] {latest_resampled_idx.strftime('%H:%M:%S')} | "
                         f"O: {latest_resampled_row.get('open', 0):.2f} H: {latest_resampled_row.get('high', 0):.2f} "
                         f"L: {latest_resampled_row.get('low', 0):.2f} C: {latest_resampled_row.get('close', 0):.2f} | "
-                        f"Vol: {latest_resampled_row.get('volume', 0):,.0f} (sum of {num_bars} 5-sec bars)")
+                        f"Vol: {latest_resampled_row.get('volume', 0):,.0f} ({bar_count_msg})")
     
     # Only check entries/exits if we have enough data and indicators are calculated
     if len(data) >= strategy.bb_length and 'upper' in data.columns:
@@ -3037,6 +3144,20 @@ async def main():
         contract = get_front_es_contract()
         cancel_all_pending()
         ensure_connected_and_subscribed()
+        
+        # Register portfolio update callback to track realized PNL
+        def on_portfolio_update(item):
+            """Handle portfolio updates to track realized PNL."""
+            global portfolio_realized_pnl
+            if item.contract.symbol == 'ES' and item.contract.conId == contract.conId:
+                # Update realized PNL from portfolio item (most accurate source)
+                portfolio_realized_pnl = getattr(item, 'realizedPNL', None)
+                if portfolio_realized_pnl is None:
+                    portfolio_realized_pnl = getattr(item, 'realizedPnl', None)
+                if portfolio_realized_pnl is None:
+                    portfolio_realized_pnl = getattr(item, 'realized_pnl', None)
+        
+        ib.updatePortfolioEvent += on_portfolio_update
         
         # Wait a moment for data to load
         await asyncio.sleep(2)
