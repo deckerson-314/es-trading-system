@@ -58,7 +58,16 @@ class BollingerBandStrategy:
         self.max_atr_points_opt = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
         self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))  # Optional floor
         self.min_atr_points_opt = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))  # Initialize to default, will be updated by update_optimizable_params
-        self.enable_rth_filter = get_param_value(self.params_dict, 'Enable RTH Filter', True)
+        # Convert RTH filter parameter to boolean explicitly
+        # CSV value 0 = False (disabled), 1 = True (enabled)
+        rth_filter_val = get_param_value(self.params_dict, 'Enable RTH Filter', True)
+        if isinstance(rth_filter_val, (int, float)):
+            self.enable_rth_filter = bool(int(rth_filter_val))
+        elif isinstance(rth_filter_val, bool):
+            self.enable_rth_filter = rth_filter_val
+        else:
+            # String or other - try to convert
+            self.enable_rth_filter = bool(int(float(str(rth_filter_val))))
         self.rth_start_str = get_param_value(self.params_dict, 'RTH Start (HH:MM)', '09:30')
         self.rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
         self.rth_exit_buffer_minutes = int(get_param_value(self.params_dict, 'RTH Exit Buffer (minutes)', 0))

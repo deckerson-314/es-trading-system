@@ -42,7 +42,7 @@ os.makedirs(HTML_DIR, exist_ok=True)
 
 # === Config ===
 VERSION = '3.0'
-FROM_DATE = '2024-03-07'
+FROM_DATE = '2020-03-07'
 TO_DATE = '2025-07-19'
 multiplier = 50
 initial_capital = 50000
@@ -522,6 +522,22 @@ if not trades_df.empty:
     # === Create Interactive Plotly Dashboard ===
     log("\nCreating interactive Plotly visualizations...")
     
+    # Data downsampling for large date ranges to prevent dashboard loading issues
+    MAX_CHART_POINTS = 5000  # Maximum data points for overview chart
+    downsample_factor = 1
+    if len(df) > MAX_CHART_POINTS:
+        downsample_factor = len(df) // MAX_CHART_POINTS
+        log(f"Large dataset detected ({len(df)} points). Downsampling by factor {downsample_factor} for overview chart...")
+        # Downsample price/volume data (keep every Nth point)
+        df_chart = df.iloc[::downsample_factor].copy()
+        equity_df_chart = equity_df.iloc[::downsample_factor].copy() if len(equity_df) > MAX_CHART_POINTS else equity_df.copy()
+        drawdown_df_chart = drawdown_df.iloc[::downsample_factor].copy() if len(drawdown_df) > MAX_CHART_POINTS else drawdown_df.copy()
+        log(f"Downsampled to {len(df_chart)} points for chart display")
+    else:
+        df_chart = df.copy()
+        equity_df_chart = equity_df.copy()
+        drawdown_df_chart = drawdown_df.copy()
+    
     # 1. MAIN OVERVIEW CHART (Price, BB, Trades, Volume, Equity)
     fig_main = make_subplots(
         rows=4, cols=1,
@@ -531,29 +547,29 @@ if not trades_df.empty:
         shared_xaxes=True
     )
     
-    # Convert index to list for better serialization
-    df_index_list = df.index.tolist()
+    # Convert index to list for better serialization (use downsampled data)
+    df_index_list = df_chart.index.tolist()
     
-    # Candlestick chart
+    # Candlestick chart (use downsampled data)
     fig_main.add_trace(go.Candlestick(
         x=df_index_list,
-        open=df['open'].tolist(),
-        high=df['high'].tolist(),
-        low=df['low'].tolist(),
-        close=df['close'].tolist(),
+        open=df_chart['open'].tolist(),
+        high=df_chart['high'].tolist(),
+        low=df_chart['low'].tolist(),
+        close=df_chart['close'].tolist(),
         name='Price',
         increasing_line_color='green',
         decreasing_line_color='red'
     ), row=1, col=1)
     
-    # BB Bands
-    fig_main.add_trace(go.Scatter(x=df_index_list, y=df['upper'].tolist(), name='Upper BB', 
+    # BB Bands (use downsampled data)
+    fig_main.add_trace(go.Scatter(x=df_index_list, y=df_chart['upper'].tolist(), name='Upper BB', 
                                   line=dict(color='blue', width=1, dash='dash'), 
                                   opacity=0.7), row=1, col=1)
-    fig_main.add_trace(go.Scatter(x=df_index_list, y=df['mid'].tolist(), name='Mid BB', 
+    fig_main.add_trace(go.Scatter(x=df_index_list, y=df_chart['mid'].tolist(), name='Mid BB', 
                                   line=dict(color='gray', width=1, dash='dash'), 
                                   opacity=0.7), row=1, col=1)
-    fig_main.add_trace(go.Scatter(x=df_index_list, y=df['lower'].tolist(), name='Lower BB', 
+    fig_main.add_trace(go.Scatter(x=df_index_list, y=df_chart['lower'].tolist(), name='Lower BB', 
                                   line=dict(color='blue', width=1, dash='dash'), 
                                   opacity=0.7), row=1, col=1)
     
@@ -616,28 +632,33 @@ if not trades_df.empty:
                              "Stop: $%{y:.2f}<extra></extra>"
             ), row=1, col=1)
     
-    # Volume
-    fig_main.add_trace(go.Bar(x=df_index_list, y=df['volume'].tolist(), name='Volume',
+    # Volume (use downsampled data)
+    fig_main.add_trace(go.Bar(x=df_index_list, y=df_chart['volume'].tolist(), name='Volume',
                              marker_color='gray', opacity=0.6), row=2, col=1)
     
-    # Equity Curve
-    equity_index_list = equity_df.index.tolist()
-    equity_values_list = equity_df['equity'].tolist()
+    # Equity Curve (use downsampled data)
+    equity_index_list = equity_df_chart.index.tolist()
+    equity_values_list = equity_df_chart['equity'].tolist()
     fig_main.add_trace(go.Scatter(x=equity_index_list, y=equity_values_list, 
                                   name='Equity', line=dict(color='blue', width=2),
                                   fill='tozeroy', fillcolor='rgba(0,100,255,0.1)'), row=3, col=1)
     fig_main.add_hline(y=initial_capital, line_dash="dash", line_color="gray", 
                       annotation_text="Initial Capital", row=3, col=1)
     
-    # Drawdown
-    drawdown_index_list = drawdown_df.index.tolist()
-    drawdown_values_list = drawdown_df['drawdown'].tolist()
+    # Drawdown (use downsampled data)
+    drawdown_index_list = drawdown_df_chart.index.tolist()
+    drawdown_values_list = drawdown_df_chart['drawdown'].tolist()
     fig_main.add_trace(go.Scatter(x=drawdown_index_list, y=drawdown_values_list,
                                  name='Drawdown', line=dict(color='red', width=2),
                                  fill='tozeroy', fillcolor='rgba(255,0,0,0.2)'), row=4, col=1)
     
+    # Add note about downsampling if applicable
+    title_suffix = ""
+    if downsample_factor > 1:
+        title_suffix = f" | Chart downsampled {downsample_factor}x for performance ({len(df_chart)}/{len(df)} points)"
+    
     fig_main.update_layout(
-        title=f'BB Strategy Backtest Overview - v{VERSION} | Period: {FROM_DATE} to {TO_DATE}',
+        title=f'BB Strategy Backtest Overview - v{VERSION} | Period: {FROM_DATE} to {TO_DATE}{title_suffix}',
         height=1200,
         hovermode='x unified',
         showlegend=True
@@ -1350,6 +1371,17 @@ else:
     log("")
     
     # Still generate HTML even with zero trades
+    # Data downsampling for large date ranges
+    MAX_CHART_POINTS = 5000
+    downsample_factor = 1
+    if len(df) > MAX_CHART_POINTS:
+        downsample_factor = len(df) // MAX_CHART_POINTS
+        log(f"Large dataset detected ({len(df)} points). Downsampling by factor {downsample_factor} for overview chart...")
+        df_chart = df.iloc[::downsample_factor].copy()
+        log(f"Downsampled to {len(df_chart)} points for chart display")
+    else:
+        df_chart = df.copy()
+    
     # Create a minimal overview chart with just price data
     fig_main = make_subplots(
         rows=1, cols=1,
@@ -1357,18 +1389,22 @@ else:
         vertical_spacing=0.1
     )
     
-    # Add candlestick chart
+    # Add candlestick chart (use downsampled data)
     fig_main.add_trace(go.Candlestick(
-        x=df.index,
-        open=df['open'],
-        high=df['high'],
-        low=df['low'],
-        close=df['close'],
+        x=df_chart.index,
+        open=df_chart['open'],
+        high=df_chart['high'],
+        low=df_chart['low'],
+        close=df_chart['close'],
         name='Price'
     ), row=1, col=1)
     
+    title_suffix = ""
+    if downsample_factor > 1:
+        title_suffix = f" | Chart downsampled {downsample_factor}x for performance ({len(df_chart)}/{len(df)} points)"
+    
     fig_main.update_layout(
-        title=f'BB Strategy Backtest Overview - v{VERSION} | Period: {FROM_DATE} to {TO_DATE} | NO TRADES',
+        title=f'BB Strategy Backtest Overview - v{VERSION} | Period: {FROM_DATE} to {TO_DATE} | NO TRADES{title_suffix}',
         height=600,
         hovermode='x unified',
         showlegend=True

@@ -4,7 +4,7 @@ __indicatorName,BB Strategy,,,,Strategy identifier
 Enable Long Trades,true,false,true,bool,Allow long entries
 Enable Short Trades,true,false,true,bool,Allow short entries
 Bollinger Band Length,8,10,100,int,Lookback period for BB
-Bollinger Band StdDev,2.5254,1,3,float,StdDev multiplier for BB width
+Bollinger Band StdDev,1,1,3,float,StdDev multiplier for BB width
 Long Entry on Wick Touch,1,0,1,int,"Enter if low touches lower band (0=false, 1=true) - OPTIMIZABLE"
 Long Entry on Body in Zone,0,0,1,int,"Enter if close ≤ lower band (0=false, 1=true) - OPTIMIZABLE"
 Long Trigger (% From Lower Band),0.0037,0,2,float,% below lower band to trigger (min 0.1% to avoid band extremes)
@@ -28,7 +28,7 @@ Weekend Maintenance End Time (HH:MM),18:00,18:00,18:00,str,Weekend maintenance e
 Maintenance Buffer Minutes,9,1,30,int,Minutes before/after maintenance to exit/block trading
 Volume MA Length,10,10,200,int,Rolling window for average volume calculation (used by volume filter)
 Max Volume Multiplier,2.677,0.5,3,float,"Volume filter for mean reversion - MAX volume allowed (volume <= avg * multiplier). Low volume = exhausted move ready to reverse. High volume = strong momentum (bad for mean reversion). Range 0.5-3.0 (1.0 = no filter, lower = more restrictive)"
-Timeframe (minutes),7,1,15,int,Resample timeframe in minutes
+Timeframe (minutes),1,1,15,int,Resample timeframe in minutes
 Max Open Trades,1,1,1,int,Maximum concurrent positions
 === TAKE PROFIT CRITERIA ===,,,,,
 TP Method,2,0,2,int,"Take profit method (0=Fixed BB at Entry, 1=Fixed ATR, 2=Opposite BB) - OPTIMIZABLE"
