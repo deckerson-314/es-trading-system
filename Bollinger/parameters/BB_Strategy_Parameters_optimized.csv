@@ -30,6 +30,7 @@ Volume MA Length,10,10,200,int,Rolling window for average volume calculation (us
 Max Volume Multiplier,2.677,0.5,3,float,"Volume filter for mean reversion - MAX volume allowed (volume <= avg * multiplier). Low volume = exhausted move ready to reverse. High volume = strong momentum (bad for mean reversion). Range 0.5-3.0 (1.0 = no filter, lower = more restrictive)"
 Timeframe (minutes),7,1,15,int,Resample timeframe in minutes
 Max Open Trades,1,1,1,int,Maximum concurrent positions
+Transaction Cost (Per Trade),20.0,0,100,float,"Estimated friction per trade (Slippage + Commissions) to realistic PnL. E.g. $4 comm + $12.50 slip = 16.5"
 === TAKE PROFIT CRITERIA ===,,,,,
 TP Method,2,0,2,int,"Take profit method (0=Fixed BB at Entry, 1=Fixed ATR, 2=Opposite BB) - OPTIMIZABLE"
 Opposite Bollinger Band TP,True,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly)

@@ -38,6 +38,10 @@ temp_plots/
 !Bollinger/parameters/BB_Strategy_Parameters_optimized_TWS.csv
 !Bollinger/parameters/BB_Strategy_Parameters_optimized.csv
 !Bollinger/parameters/BB_Strategy_Parameters_v1.12.csv
+!Bollinger/parameters/backtest_params.csv
+!Bollinger/parameters/live_params.csv
+!Bollinger/parameters/BB_Strategy_Parameters.csv
+!Bollinger/parameters/genetic_results_*.csv
 
 # Large data file specifically
 **/ES_full_1min_continuous_ratio_adjusted.csv
@@ -72,4 +76,8 @@ Backtrader/data/
 # OS files
 .DS_Store
 Thumbs.db
+
+
+
+
 
