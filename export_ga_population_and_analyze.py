@@ -12,7 +12,7 @@ if not hasattr(creator, "FitnessMulti"):
 if not hasattr(creator, "Individual"):
     creator.create("Individual", list, fitness=creator.FitnessMulti)
 
-CHECKPOINT_FILE = r"C:\Trading\ga_diagnostics_v4\ga_checkpoint_2025-12-08-2.pkl"
+CHECKPOINT_FILE = r"C:\Trading\ga_diagnostics_v4\ga_checkpoint_2025-12-09-2.pkl"
 
 def load_checkpoint(filepath):
     try:
@@ -48,7 +48,9 @@ def analyze_population():
                 'POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
                 'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                 'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
-                'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT'
+                'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT',
+                'NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 
+                'NORM_PNL_MAX', 'NORM_PROFIT_TRADE_MAX', 'MIN_WIN_RATE', 'SORTINO_CAP'
             ])
             
             param_keys = []
@@ -65,7 +67,8 @@ def analyze_population():
                         param_keys.append(n)
                 except: continue
                 
-            print(f"Loaded {len(param_names) if 'param_names' in locals() else len(param_keys)} keys from CSV.")
+            print(f"Loaded {len(param_keys)} keys from CSV.")
+            print(f"Keys: {param_keys}")
             
         except Exception as e:
             print(f"Error loading params from CSV: {e}")
@@ -151,7 +154,7 @@ def analyze_population():
         print(f"    Sortino: {best_sol['Fitness_Sortino']:.4f} | PnL: ${best_sol['Fitness_PnL']:,.2f}")
         
         # Print Key Params for the best
-        params_to_show = ['Bollinger Band StdDev', 'Bollinger Band Length', 'ATR Multiplier for TP', 'Max ATR Filter (Points)']
+        params_to_show = ['Bollinger Band StdDev', 'Bollinger Band Length', 'ATR Multiplier for TP', 'Max ATR Filter (Points)', 'Enable ADX Filter', 'Max ADX Threshold', 'ADX Period']
         for p in params_to_show:
             if p in best_sol:
                 print(f"    {p}: {best_sol[p]}")

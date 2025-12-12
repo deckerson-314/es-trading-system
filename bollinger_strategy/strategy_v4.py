@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 from datetime import time
 from .parameters import get_param_value
-from .indicators import calculate_bollinger_bands, calculate_atr
+from .indicators import calculate_bollinger_bands, calculate_atr, calculate_ema, calculate_adx
 from .filters import apply_rth_filter, apply_volume_filter, apply_atr_filter, apply_maintenance_filter
 
 
@@ -59,6 +59,20 @@ class BollingerBandStrategyV4:
         self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))
         self.min_atr_points_opt = float(get_param_value(self.params_dict, 'Min ATR Filter (Points)', 0.5))
         
+        # Trend Filter
+        self.enable_trend_filter = get_param_value(self.params_dict, 'Enable Trend Filter', False)
+        if isinstance(self.enable_trend_filter, (int, float)):
+             self.enable_trend_filter = bool(int(self.enable_trend_filter))
+        self.trend_ema_length = int(get_param_value(self.params_dict, 'Trend EMA Length', 200))
+        
+        # ADX Filter
+        self.enable_adx_filter = get_param_value(self.params_dict, 'Enable ADX Filter', False)
+        if isinstance(self.enable_adx_filter, (int, float)):
+             self.enable_adx_filter = bool(int(self.enable_adx_filter))
+        self.adx_period = int(get_param_value(self.params_dict, 'ADX Period', 14))
+        self.max_adx_threshold = float(get_param_value(self.params_dict, 'Max ADX Threshold', 25.0))
+        self.max_adx_threshold_opt = float(get_param_value(self.params_dict, 'Max ADX Threshold', 25.0))
+        
         # RTH filter
         rth_filter_val = get_param_value(self.params_dict, 'Enable RTH Filter', True)
         if isinstance(rth_filter_val, (int, float)):
@@ -92,6 +106,7 @@ class BollingerBandStrategyV4:
         self.max_atr_points_opt = float(get_param_value(self.params_dict, 'Max ATR Filter (Points)', 4.0))
         self.timeframe = max(1, int(get_param_value(self.params_dict, 'Timeframe (minutes)', 1)))
         self.trailing_delay = max(0, int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5)))
+        self.adx_period = max(10, int(get_param_value(self.params_dict, 'ADX Period', 14)))
         
         # Parse RTH times
         self.rth_start = self._parse_time(self.rth_start_str)
@@ -162,6 +177,16 @@ class BollingerBandStrategyV4:
             self.rth_exit_buffer_minutes = int(params['RTH Exit Buffer (minutes)'])
         if 'Maintenance Buffer Minutes' in params:
             self.maintenance_buffer_minutes = int(params['Maintenance Buffer Minutes'])
+        if 'Enable Trend Filter' in params:
+            self.enable_trend_filter = bool(int(round(params['Enable Trend Filter'])))
+        if 'Trend EMA Length' in params:
+             self.trend_ema_length = max(10, int(params['Trend EMA Length']))
+        if 'Enable ADX Filter' in params:
+            self.enable_adx_filter = bool(int(round(params['Enable ADX Filter'])))
+        if 'ADX Period' in params:
+             self.adx_period = max(10, int(params['ADX Period']))
+        if 'Max ADX Threshold' in params:
+             self.max_adx_threshold_opt = float(params['Max ADX Threshold'])
 
     def calculate_indicators(self, df):
         """Calculate all indicators (BB, ATR)."""
@@ -195,8 +220,15 @@ class BollingerBandStrategyV4:
         df['atr_filter_values'] = calculate_atr(df, self.atr_length_filter)
         
         # ATR for TP
+        # ATR for TP
         if self.fixed_atr_tp:
             df['atr_tp'] = calculate_atr(df, self.atr_length_tp)
+            
+        # Trend EMA
+        df['trend_ema'] = calculate_ema(df, self.trend_ema_length)
+        
+        # ADX
+        df['adx'] = calculate_adx(df, self.adx_period)
         
         return df
 
@@ -253,8 +285,28 @@ class BollingerBandStrategyV4:
         in_maintenance = df[in_main_col].values if in_main_col in df.columns else np.zeros(len(df), dtype=bool)
 
         # Combined Entry Filter: Must be in RTH, pass ATR/Vol filters, not in maintenance
+        # Combined Entry Filter: Must be in RTH, pass ATR/Vol filters, not in maintenance
         entry_allowed = in_rth & atr_filter & vol_filter & (~in_maintenance)
         
+        # ADX Filter Logic
+        if self.enable_adx_filter and 'adx' in df.columns:
+             adx_vals = df['adx'].values
+             # We want Ranging Market: ADX < Threshold
+             adx_aligned = (adx_vals < self.max_adx_threshold_opt)
+        else:
+             adx_aligned = np.ones(len(df), dtype=bool)
+        
+        # Trend Filter Logic
+        trend_long = np.ones(len(df), dtype=bool)
+        trend_short = np.ones(len(df), dtype=bool)
+        
+        if self.enable_trend_filter and 'trend_ema' in df.columns:
+            ema_vals = df['trend_ema'].values
+            # Long: Close > EMA
+            trend_long = (close > ema_vals)
+            # Short: Close < EMA
+            trend_short = (close < ema_vals)
+            
         entry_long = np.zeros(len(df), dtype=bool)
         entry_short = np.zeros(len(df), dtype=bool)
         
@@ -263,14 +315,14 @@ class BollingerBandStrategyV4:
             # Vectorized conditions
             cond_wick = (low <= trig_long) if self.long_wick_touch else np.zeros(len(df), dtype=bool)
             cond_body = (close <= trig_long) if self.long_body_zone else np.zeros(len(df), dtype=bool)
-            entry_long = entry_allowed & (cond_wick | cond_body)
+            entry_long = entry_allowed & adx_aligned & trend_long & (cond_wick | cond_body)
 
         if self.enable_short:
             trig_short = upper * (1 + self.short_trigger_pct / 100.0)
             # Vectorized conditions
             cond_wick = (high >= trig_short) if self.short_wick_touch else np.zeros(len(df), dtype=bool)
             cond_body = (close >= trig_short) if self.short_body_zone else np.zeros(len(df), dtype=bool)
-            entry_short = entry_allowed & (cond_wick | cond_body)
+            entry_short = entry_allowed & adx_aligned & trend_short & (cond_wick | cond_body)
             
         return entry_long, entry_short
 
