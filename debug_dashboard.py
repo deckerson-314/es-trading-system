@@ -1,5 +1,32 @@
 
 import os
+import sys
+
+# Help Support
+if len(sys.argv) > 1 and sys.argv[1] in ['?', '-?', '/?', '--help', '-h']:
+    print(f"""
+================================================================================
+             DASHBOARD DEBUGGER
+================================================================================
+
+DESCRIPTION:
+  Scans the generated 'ga_dashboard_v4.html' for common rendering issues:
+  1. Duplicate HTML IDs (e.g., 'param_analysis_plot' appearing twice).
+  2. Missing Script Tags (Plotly JSON data not injected correctly).
+  3. Truncated Content (Unexpected file end).
+
+USAGE:
+  python debug_dashboard.py [ARGUMENTS]
+
+ARGUMENTS:
+  ? / -h            Show this help manual.
+
+EXAMPLES:
+  Run Check:        python debug_dashboard.py
+
+================================================================================
+""")
+    sys.exit(0)
 
 try:
     with open('ga_diagnostics_v4/html/ga_dashboard_v4.html', 'r', encoding='utf-8') as f:

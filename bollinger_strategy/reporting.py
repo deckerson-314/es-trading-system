@@ -106,6 +106,120 @@ def calculate_stats(trades_df, equity_series=None):
         'Avg Duration (min)': avg_dur, 'Max Duration (min)': max_dur
     }
 
+def generate_trade_plot(trade, df, output_dir, version, sol_name=None):
+    """Generate detailed HTML plot for a single trade."""
+    try:
+        # Get data segment
+        entry_time = pd.to_datetime(trade.entry_time)
+        exit_time = pd.to_datetime(trade.exit_time)
+        
+        # Ensure DF index is datetime
+        if not pd.api.types.is_datetime64_any_dtype(df.index):
+            df.index = pd.to_datetime(df.index)
+            
+        # Find locs (handle potential missing indices by using nearest or slice)
+        # Using slice is safer for timestamps
+        candles_before_after = 50
+        
+        # We need to find the integer locations since index slicing might be tricky if exact time missing
+        # But let's try direct time slicing with margin
+        # Simple approach: find index of entry, get integer loc, expand
+        
+        try:
+             entry_idx = df.index.get_indexer([entry_time], method='nearest')[0]
+             exit_idx = df.index.get_indexer([exit_time], method='nearest')[0]
+        except:
+             # Fallback if get_indexer fails
+             return None
+             
+        start_loc = max(0, entry_idx - candles_before_after)
+        end_loc = min(len(df) - 1, exit_idx + candles_before_after)
+        segment = df.iloc[start_loc:end_loc + 1]
+        
+        # Create subplots
+        fig_trade = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            row_heights=[0.7, 0.3],
+            subplot_titles=('Price & Bollinger Bands', 'Volume')
+        )
+        
+        # Price
+        fig_trade.add_trace(go.Candlestick(
+            x=segment.index, open=segment['open'], high=segment['high'],
+            low=segment['low'], close=segment['close'], name='Price'
+        ), row=1, col=1)
+        
+        # Bands
+        if 'upper' in segment.columns:
+            fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['upper'], line=dict(color='blue', dash='dash', width=1), name='Upper BB'), row=1, col=1)
+            fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['lower'], line=dict(color='blue', dash='dash', width=1), name='Lower BB'), row=1, col=1)
+            
+        # Markers
+        entry_color = 'green' if trade.direction == 1 else 'red'
+        exit_color = 'lime' if trade.pnl_currency > 0 else 'darkred'
+        
+        fig_trade.add_trace(go.Scatter(
+            x=[entry_time], y=[trade.entry_price],
+            mode='markers+text', marker=dict(symbol='triangle-up', size=15, color=entry_color, line=dict(color='black', width=2)),
+            text=['ENTRY'], textposition='top center', name='Entry'
+        ), row=1, col=1)
+        
+        fig_trade.add_trace(go.Scatter(
+            x=[exit_time], y=[trade.exit_price],
+            mode='markers+text', marker=dict(symbol='triangle-down', size=15, color=exit_color, line=dict(color='black', width=2)),
+            text=['EXIT'], textposition='bottom center', name='Exit'
+        ), row=1, col=1)
+        
+        # Trailing stop (if available) - make it very visible
+        if hasattr(trade, 'stop_history') and isinstance(trade.stop_history, list) and len(trade.stop_history) > 0:
+            stop_times, stop_prices = zip(*trade.stop_history)
+            # Ensure stop times are datetime
+            stop_times_dt = pd.to_datetime(stop_times)
+            
+            fig_trade.add_trace(go.Scatter(
+                x=stop_times_dt, 
+                y=list(stop_prices),
+                name='Trailing Stop', 
+                line=dict(color='red', width=2, dash='solid'),
+                opacity=0.8,
+            ), row=1, col=1)
+        
+        # Take Profit line (if fixed)
+        if hasattr(trade, 'tp') and trade.tp is not None and not pd.isna(trade.tp):
+            fig_trade.add_trace(go.Scatter(
+                x=[entry_time, exit_time],
+                y=[trade.tp, trade.tp],
+                mode='lines', name='Take Profit',
+                line=dict(color='purple', dash='dot', width=2),
+            ), row=1, col=1)
+        
+        # Volume
+        colors = ['green' if c >= o else 'red' for c, o in zip(segment['close'], segment['open'])]
+        fig_trade.add_trace(go.Bar(
+            x=segment.index, y=segment['volume'], name='Volume', marker_color=colors
+        ), row=2, col=1)
+        
+        # Layout
+        res_str = "WIN" if trade.pnl_currency > 0 else "LOSS"
+        sol_prefix = f"[{sol_name}] " if sol_name else ""
+        title = f"{sol_prefix}Trade {trade.Index if hasattr(trade, 'Index') else ''} | {res_str} ${abs(trade.pnl_currency):,.0f} | {trade.reason}"
+        fig_trade.update_layout(title=title, height=800, hovermode='x unified', template='plotly_white')
+        
+        # Filename
+        pnl_str = f"{abs(trade.pnl_currency):.0f}"
+        sol_suffix = f"_{sol_name.replace(' ', '_')}" if sol_name else ""
+        filename = f"trade_{entry_time.strftime('%Y%m%d_%H%M')}_{res_str}_{pnl_str}{sol_suffix}.html"
+        filepath = os.path.join(output_dir, filename)
+        
+        fig_trade.write_html(filepath, include_plotlyjs='cdn')
+        return filename
+        
+    except Exception as e:
+        print(f"Error generating plot for trade: {e}")
+        return None
+
 def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_browser=True):
     """
     Generate Unified HTML Dashboard.
@@ -581,6 +695,8 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
         if not t_df.empty:
             tail = t_df.tail(20).copy() 
             tail['sol_name'] = sol['name']
+            # Store reference to DF for plotting
+            tail['df_ref'] = [sol.get('df')] * len(tail)
             all_trades.append(tail)
             
     if all_trades:
@@ -607,12 +723,21 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
                      dur_str = f"{mins}m"
             except: pass
 
+            # Generate Plot for Trade
+            chart_link = ""
+            if hasattr(trade, 'df_ref') and trade.df_ref is not None:
+                # Generate plot
+                plot_filename = generate_trade_plot(trade, trade.df_ref, output_dir, version, sol_name=trade.sol_name)
+                if plot_filename:
+                    chart_link = f'<a href="{plot_filename}" target="_blank" class="btn">View Chart</a>'
+
             html_content += f"""
             <div class="trade-card" style="border-left: 5px solid {'#27ae60' if pnl>0 else '#c0392b'}">
                 <span class="sol-tag">{trade.sol_name}</span>
                 <h3>{res} <span class="{cls}">${abs(pnl):,.0f}</span></h3>
                 <p style="margin: 5px 0 0; color: #666; font-size: 13px;">{trade.exit_time}</p>
                 <p style="margin: 5px 0 0; font-size: 14px;"><strong>{trade.direction}</strong> | {trade.reason} | ⏱️ {dur_str}</p>
+                {chart_link}
             </div>
             """
     else:

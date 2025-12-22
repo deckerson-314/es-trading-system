@@ -14,6 +14,59 @@ from datetime import datetime, timedelta
 
 import hashlib
 
+# HELP SUPPORT: Detailed Manual
+def print_help():
+    print(f"""
+================================================================================
+             BOLLINGER BAND GENETIC ALGORITHM OPTIMIZER (V4)
+================================================================================
+
+DESCRIPTION:
+  Evolves trading strategies using NSGA-II to optimize for Sortino Ratio, 
+  Drawdown, Profit Factor, Trade Frequency, and Profitability.
+
+USAGE:
+  python BB_Genetic_v4.py [ARGUMENTS]
+
+CRITICAL ARGUMENTS:
+  --cores N               Number of CPU cores to use (Default: All - 1).
+                          Example: --cores 4
+
+  --params FILE           Path to parameter configuration CSV (Default: 'Bollinger/parameters/backtest_params.csv').
+                          Defines ranges for optimization (min, max, type).
+
+  --dashboard-from FILE   Generate Dashboard ONLY from an existing Checkpoint (.pkl).
+                          * INPUT: Must be a .pkl file (e.g., 'ga_diagnostics_v4/ga_checkpoint_v4.pkl')
+                          * DOES NOT RUN OPTIMIZATION. Generates HTML and exits.
+
+  --fresh / -f            Force a fresh start (Ignores existing checkpoints).
+                          WARNING: Will overwrite previous run logs if filenames collide.
+
+COMMON QUESTIONS:
+  Q: How do I resume a run?
+  A: Just run `python BB_Genetic_v4.py`. It automatically detects the latest checkpoint 
+     in `ga_diagnostics_v4/` and resumes from the last saved generation.
+
+  Q: What file does --dashboard-from take?
+  A: It takes the PICKLE (.pkl) checkpoint file, NOT the CSV.
+     Example: `python BB_Genetic_v4.py --dashboard-from ga_diagnostics_v4/ga_checkpoint_v4.pkl`
+
+  Q: How many solutions?
+  A: The population size is defined in 'backtest_params.csv' (POP_SIZE).
+     Standard is 50-100. The Hall of Fame (HOF) keeps the best solutions found so far.
+
+EXAMPLES:
+  Standard Run:           python BB_Genetic_v4.py --cores 6
+  Fresh Run:              python BB_Genetic_v4.py --fresh
+  Generate Report:        python BB_Genetic_v4.py --dashboard-from ga_diagnostics_v4/ga_checkpoint_2025-12-13-1.pkl
+
+================================================================================
+""")
+    sys.exit(0)
+
+# Intercept help text
+if len(sys.argv) > 1 and ('?' in sys.argv or '-?' in sys.argv or '/?' in sys.argv or '--help' in sys.argv or '-h' in sys.argv):
+    print_help()
 def get_file_info():
     try:
         fpath = os.path.abspath(__file__)
@@ -482,7 +535,8 @@ def evaluate_multi_objective(ind_and_df):
     min_trades = param_dict.get('MIN_TRADES_DAY', {'value': 1.0})['value']
     if avg_trades_day < min_trades:
         # Hard constraint: eliminate solutions with < 1 trade/day
-        return (-float('inf'), float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf'))
+        # Return negative infinity or very large negative to ensure elimination
+        return (-100.0, 100000.0, -100.0, -100.0, -100.0, -100.0)
     
     # ====================================================================
     # GRADUATED PENALTIES - Allow exploration while discouraging bad solutions
@@ -588,16 +642,27 @@ def evaluate_multi_objective(ind_and_df):
         excess_wr = (win_rate - 0.95) / 0.05  # 0 to 1 scale (95% to 100%)
         penalty_factor *= (1.0 - excess_wr * 0.3)  # Reduce by up to 30%
     
-    # 3. Very short average trade duration (potential data issues)
-    if not trades_df.empty and 'entry_time' in trades_df.columns and 'exit_time' in trades_df.columns:
-        durations = (trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds() / 60
-        avg_duration = durations.mean() if len(durations) > 0 else 0
-        if avg_duration < 2.0:
-            # Gradual penalty for very short trades
-            penalty = (2.0 - avg_duration) / 2.0  # 0 to 1 scale
-            penalty_factor *= (1.0 - penalty * 0.2)  # Reduce by up to 20%
+
+    # ====================================================================
+    # GRADUATED PENALTY: Minimum trades per day
+    # OLD: Hard constraint (< 1.0 = -Infinity) -> CAUSED EVOLUTIONARY DEAD END
+    # NEW: Graduated penalty (0.9 is better than 0.0)
+    # ====================================================================
+    # Ensure min_trades is defined
+    min_trades = param_dict.get('MIN_TRADES_DAY', {'value': 1.0})['value']
     
-    # 4. No TP enabled (gradual penalty, not elimination)
+    # Define penalty variable (default 0)
+    low_trade_penalty = 0.0
+    if avg_trades_day < min_trades:
+        shortfall = min_trades - avg_trades_day
+        # Penalty scaling: 100.0 per trade deficit
+        # e.g. 0.99 deficit (1 trade total) -> Penalty 99.0
+        # This is enough to crush Sortino (range 0-1) into negative territory
+        low_trade_penalty = shortfall * 100.0
+        
+    # ====================================================================
+    # GRADUATED PENALTIES - Allow exploration while discouraging bad solutions
+
     no_tp = (not params.get('Opposite Bollinger Band TP', False) and 
              not params.get('Fixed ATR TP', False) and 
              not params.get('Fixed BB at Entry TP', False))
@@ -641,64 +706,55 @@ def evaluate_multi_objective(ind_and_df):
     TRADES_MAX = param_dict.get('NORM_TRADES_MAX', {'value': 3.0})['value']
     PNL_MAX = param_dict.get('NORM_PNL_MAX', {'value': 200000.0})['value']
     
-    # Normalize Sortino (0-1, higher is better)
-    normalized_sortino = min(1.0, max(0.0, sortino / SORTINO_MAX))
-    
-    # Normalize Drawdown (0-1, inverted - lower is better)
-    # Inverted: $0 DD = 1.0, $100K DD = 0.0
-    normalized_dd = 1.0 - min(1.0, max(0.0, max_dd / DD_MAX))
-    
-    # Normalize Profit Factor (0-1, higher is better)
-    normalized_pf = min(1.0, max(0.0, pf / PF_MAX))
-    
-    # Use RAW Avg Trades/Day (no normalization) - higher is better
-    # Use NORMALIZED Avg Trades/Day (0-1) - Normalize using TRADES_MAX
-    # CRITICAL FIX: Normalize to prevent raw value (e.g., 90) from dominating
-    # Target is TRADES_MAX, so we cap at 1.0
-    normalized_trades = min(1.0, avg_trades_day / TRADES_MAX)
-    
-    # DEBUG: Sanity check for normalization (print once per process for verification)
-    if not hasattr(evaluate_multi_objective, "_verified_norm"):
-        print(f"DEBUG: evaluate_multi_objective ACTIVE. Normalization Logic: min(1.0, trade/{TRADES_MAX})")
-        evaluate_multi_objective._verified_norm = True
-    
-    # Normalize Total Profit (0-1, higher is better)
-    # Clamp to reasonable range to prevent extreme values from dominating
-    normalized_pnl = min(1.0, max(0.0, total_pnl / PNL_MAX))
-    
     # ====================================================================
-    # CAP EXTREME VALUES (after normalization, before final return)
+    # NORMALIZATION & FINAL CALCULATION
     # ====================================================================
     
-    # Cap infinite or extreme profit factor
-    if pf == float('inf') or pf > PF_MAX * 2:
-        normalized_pf = 1.0  # Cap at maximum normalized value
+    # Normalization ranges
+    SORTINO_MAX = param_dict.get('NORM_SORTINO_MAX', {'value': 10.0})['value']
+    DD_MAX = param_dict.get('NORM_DD_MAX', {'value': 100000.0})['value']
+    PF_MAX = param_dict.get('NORM_PF_MAX', {'value': 5.0})['value']
+    TRADES_MAX = param_dict.get('NORM_TRADES_MAX', {'value': 3.0})['value']
+    PNL_MAX = param_dict.get('NORM_PNL_MAX', {'value': 200000.0})['value']
     
-    # Handle zero drawdown (add small artificial drawdown to prevent zero)
-    if max_dd == 0.0 and not trades_df.empty and len(trades_df) > 10:
-        # Add small penalty, but don't eliminate
-        max_dd = 100.0  # Small artificial drawdown
-        normalized_dd = 1.0 - (max_dd / DD_MAX)  # Re-normalize
+    # Normalize (No Floors)
+    normalized_sortino = sortino / SORTINO_MAX
+    normalized_dd = 1.0 - (max_dd / DD_MAX)
+    normalized_pf = pf / PF_MAX
+    normalized_trades = avg_trades_day  # Raw
+    normalized_pnl = total_pnl / PNL_MAX
     
-    # ====================================================================
-    # FINAL FLOOR VALUES - Apply at very end to ensure positive values
-    # Reduced from 0.01 to 0.0001 to allow penalties to work
-    # ====================================================================
+    # Apply Penalties to ALL objectives to enforce constraints
+    # This implements "Constrained Dominance" via penalty functions
+    # A solution that fails constraints must be worse than any feasible solution
     
-    # Ensure positive values (but much smaller floor to allow penalties to work)
-    normalized_sortino = max(0.0001, normalized_sortino)
-    normalized_pf = max(0.0001, normalized_pf)
-    normalized_dd = max(0.0001, normalized_dd)  # For minimization, this is fine
-    # Floor for trades (raw value, so use actual minimum like 0.01)
-    # Floor for trades (raw value, so use actual minimum like 0.01 trades/day)
-    normalized_trades = max(0.01, normalized_trades)
-    normalized_pnl = max(0.0001, normalized_pnl)  # Ensure positive for NSGA-II
+    # Apply specific Low Trade Penalty (Subtract from positive metrics, Add to negative/minimized ones)
+    normalized_trades -= low_trade_penalty
+    normalized_sortino -= low_trade_penalty
+    normalized_pf -= low_trade_penalty
+    normalized_pnl -= low_trade_penalty
+    normalized_ppt -= low_trade_penalty
     
-    # Convert numpy types to Python floats (DEAP requires native Python types)
+    # For Drawdown (Minimized, where 1.0 is Best/NoDD and 0.0 is Worst/MaxDD)
+    # Wait, normalized_dd is 1.0 - (DD/Max). So 1.0 is Good.
+    # So we should SUBTRACT penalty from it too?
+    # Yes, make it lower (worse).
+    normalized_dd -= low_trade_penalty
+    
+    # Apply generic penalty factor logic (multiplicative)
+
+    normalized_pnl *= penalty_factor
+    normalized_dd *= penalty_factor
+    normalized_sortino *= penalty_factor
+    normalized_pf *= penalty_factor
+    
+    # Cast
     normalized_sortino = float(normalized_sortino)
     normalized_dd = float(normalized_dd)
     normalized_pf = float(normalized_pf)
-    normalized_pf = float(normalized_pf)
+    normalized_trades = float(normalized_trades)
+    normalized_pnl = float(normalized_pnl)
+
     
     # CRITICAL FIX: Apply penalty to Trade Score too!
     # (Applied above before normalization, or we apply here if normalization resets it?)
@@ -707,6 +763,11 @@ def evaluate_multi_objective(ind_and_df):
     # Let's check block structure. 635 is BEFORE 665.
     # So we must apply penalty AFTER normalization to be safe.
     # CRITICAL FIX: Apply penalty to ALL metrics (Trades, PnL, DD) to ensure bad strategies are punished
+    # CRITICAL FIX: Apply penalty to ALL metrics (Trades, PnL, DD) to ensure bad strategies are punished
+    # Apply the specific Low Trade Penalty
+    normalized_trades = avg_trades_day - low_trade_penalty
+    
+    # Apply generic penalty factor
     normalized_trades *= penalty_factor
     normalized_pnl *= penalty_factor
     normalized_dd *= penalty_factor
@@ -749,9 +810,38 @@ toolbox.register("select", tools.selNSGA2)
 # ----------------------------------------------------------------------
 # Parallel evaluation setup
 # ----------------------------------------------------------------------
+# Global variables for worker processes (Shared memory optimization)
+_worker_df = None
+_worker_param_dict = None
+_worker_keys = None
+
+def init_worker(df_shared, param_dict_shared, keys_shared):
+    """
+    Initialize worker process with shared data to avoid pickling overhead on every task.
+    """
+    global _worker_df, _worker_param_dict, _worker_keys
+    _worker_df = df_shared
+    _worker_param_dict = param_dict_shared
+    _worker_keys = keys_shared
+
 # Module-level function for multiprocessing (must be at module level to be picklable)
-def _evaluate_worker(args):
-    ind, df_local, param_dict_local, param_keys_local = args
+def _evaluate_worker(ind):
+    # Use shared memory globals if available (Initialized via init_worker), 
+    # otherwise fall back to old slow method (handling legacy logic if any, but we are rewriting caller too)
+    
+    # NOTE: Calling function must now pass ONLY 'ind', not a tuple of args!
+    # If caller still passes tuple, we must handle it (Backwards compatibility check)
+    if isinstance(ind, tuple) and len(ind) == 4 and _worker_df is None:
+         # Legacy mode (Slow, causes WinError 1450 on large data)
+         ind, df_local, param_dict_local, param_keys_local = ind
+    else:
+         # Optimized mode
+         df_local = _worker_df
+         param_dict_local = _worker_param_dict
+         param_keys_local = _worker_keys
+    
+    args = (ind, df_local, param_dict_local, param_keys_local)
+
     
     # Use the passed parameters instead of globals
     params = dict(zip(param_keys_local, ind))
@@ -824,28 +914,23 @@ def _evaluate_worker(args):
     avg_trades_day = metrics.get('avg_trades_day', 0.0)
     
     # ====================================================================
-    # HARD CONSTRAINT: Minimum trades per day (< 1.0 = eliminated)
-    # Solutions with < 1 trade/day are completely useless and must be eliminated
-    # This is the ONLY hard constraint - all others use graduated penalties
+    # GRADUATED PENALTY: Minimum trades per day
+    # OLD: Hard constraint (< 1.0 = -Infinity) -> CAUSED EVOLUTIONARY DEAD END
+    # NEW: Graduated penalty (0.9 is better than 0.0)
     # ====================================================================
     min_trades = param_dict_local.get('MIN_TRADES_DAY', {'value': 1.0})['value']
-    if avg_trades_day < min_trades:
-        # Hard constraint: eliminate solutions with < 1 trade/day
-        return (-float('inf'), float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf'))
-    
-    # Check trade frequency constraints (use values from param_dict_local)
     target_trades = param_dict_local.get('TARGET_TRADES_DAY', {'value': 2})['value']
-    min_trades = param_dict_local.get('MIN_TRADES_DAY', {'value': 1.0})['value']
-    avg_trades_day = metrics['avg_trades_day']
     
-    # ====================================================================
-    # HARD CONSTRAINT: Minimum trades per day (< 1.0 = eliminated)
-    # Solutions with < 1 trade/day are completely useless and must be eliminated
-    # This is the ONLY hard constraint - all others use graduated penalties
-    # ====================================================================
+    # We do NOT return immediately anymore. We calculate a penalty.
+    low_trade_penalty = 0.0
     if avg_trades_day < min_trades:
-        # Hard constraint: eliminate solutions with < 1 trade/day
-        return (-float('inf'), float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf'))
+        # Distance from requirement (e.g. 1.0 - 0.2 = 0.8 shortfall)
+        shortfall = min_trades - avg_trades_day
+        # Penalty scaling: A severe penalty, but not infinite
+        # e.g. 0.8 shortfall * 100 = Score -80.0
+        # e.g. 0.1 shortfall * 100 = Score -10.0
+        low_trade_penalty = shortfall * 100.0
+
     
     # ====================================================================
     # GRADUATED PENALTIES - Allow exploration while discouraging bad solutions
@@ -971,58 +1056,25 @@ def _evaluate_worker(args):
     pf *= penalty_factor
     
     # ====================================================================
-    # NORMALIZATION - Normalize objectives to 0-1 range
+    # NORMALIZATION & FINAL CALCULATION
     # ====================================================================
     
-    # Normalization ranges - loaded from param_dict (passed from main process)
+    # Load Constants
     SORTINO_MAX = param_dict_local.get('NORM_SORTINO_MAX', {}).get('value', 10.0)
     DD_MAX = param_dict_local.get('NORM_DD_MAX', {}).get('value', 100000.0)
     PF_MAX = param_dict_local.get('NORM_PF_MAX', {}).get('value', 5.0)
     TRADES_MAX = param_dict_local.get('NORM_TRADES_MAX', {}).get('value', 3.0)
     PNL_MAX = param_dict_local.get('NORM_PNL_MAX', {}).get('value', 200000.0)
+    norm_profit_trade_max = param_dict_local.get('NORM_PROFIT_TRADE_MAX', {'value': 250.0})['value']
     
-    normalized_sortino = min(1.0, max(0.0, sortino / SORTINO_MAX))
-    normalized_dd = 1.0 - min(1.0, max(0.0, max_dd / DD_MAX))
-    normalized_pf = min(1.0, max(0.0, pf / PF_MAX))
-    # Use RAW Avg Trades/Day (no normalization) - must match evaluate_multi_objective
-    # CRITICAL: This must match evaluate_multi_objective which uses raw value
-    normalized_trades = avg_trades_day  # Use raw value directly (not normalized)
-    normalized_pnl = min(1.0, max(0.0, total_pnl / PNL_MAX))
-    
-    # ====================================================================
-    # CAP EXTREME VALUES
-    # ====================================================================
-    
-    if pf == float('inf') or pf > PF_MAX * 2:
-        normalized_pf = 1.0
-    
-    if max_dd == 0.0 and not trades_df.empty and len(trades_df) > 10:
-        max_dd = 100.0
-        normalized_dd = 1.0 - (max_dd / DD_MAX)
-    
-    # ====================================================================
-    # FINAL FLOOR VALUES
-    # ====================================================================
-    
-    # CRITICAL FIX: Apply penalty to ALL metrics (Trades, PnL, DD) to ensure bad strategies are punished
-    normalized_trades *= penalty_factor
-    normalized_pnl *= penalty_factor
-    normalized_dd *= penalty_factor
+    # Calculate PPT
+    total_trades_count = len(metrics['trades_df']) if 'trades_df' in metrics else 0
+    avg_profit_per_trade = 0.0
+    if total_trades_count > 0:
+        avg_profit_per_trade = total_pnl / total_trades_count
 
-    normalized_sortino = max(0.0001, normalized_sortino)
-    normalized_pf = max(0.0001, normalized_pf)
-    normalized_dd = max(0.0001, normalized_dd)
-    # Floor for trades (raw value, so use actual minimum like 0.01)
-    # Floor for trades (raw value, so use actual minimum like 0.01 trades/day)
-    normalized_trades = max(0.01, normalized_trades)
-    normalized_pnl = max(0.0001, normalized_pnl)  # Ensure positive for NSGA-II
     
-    # Convert numpy types to Python floats (DEAP requires native Python types)
-    normalized_sortino = float(normalized_sortino)
-    normalized_dd = float(normalized_dd)
-    normalized_pf = float(normalized_pf)
-    normalized_trades = float(normalized_trades)
-    normalized_pnl = float(normalized_pnl)
+
     
     # Calculate Avg Profit Per Trade (new metrics)
     total_trades_count = len(metrics['trades_df']) if 'trades_df' in metrics else 0
@@ -1040,6 +1092,60 @@ def _evaluate_worker(args):
     normalized_ppt = max(0.0001, normalized_ppt)
     normalized_ppt = float(normalized_ppt)
 
+    # Normalize metrics (higher is better for all, except DD which is minimized by weight)
+    # CRITICAL CHANGE: Removed max(0.0001) floor. Allow negative values to preserve gradient.
+    
+    # 1. Sortino: Range [-Inf, CAP]. 
+    # If negative, it flows through directly.
+    normalized_sortino = min(sortino / SORTINO_MAX, 1.0) # Assuming 1.0 is the cap
+    
+    # 2. Drawdown: Range [0, Inf]. Minimization objective.
+    # We pass the raw normalized ratio. Weight is -1.0, so higher DD = lower fitness.
+    normalized_dd = max_dd / DD_MAX
+    
+    # 3. Profit Factor: Range [0, CAP]. 
+    normalized_pf = min(pf / PF_MAX, 1.0)
+    
+    # 4. Trades: Range [0, CAP]. 
+    normalized_trades = min(avg_trades_day / TRADES_MAX, 1.0)
+    
+    # 5. Total PnL: Range [-Inf, CAP]. 
+    normalized_pnl = min(total_pnl / PNL_MAX, 1.0)
+    
+    # 6. Avg PPT: Range [-Inf, CAP]. 
+    normalized_ppt = min(avg_profit_per_trade / norm_profit_trade_max, 1.0)
+    
+    # Final check: Apply penalty for constraints
+    # If penalty_factor < 1.0, we reduce the positive scores.
+    # For negative scores, multiplying by 0.5 makes them "less bad" (closer to 0), which is WRONG.
+    # We want Bad * Penalty = WORSE.
+    # So if Score > 0: Score * Penalty.
+    # If Score < 0: Score / Penalty (make it more negative)? Or Score - Penalty?
+    # Simple approach: Apply penalty as a scalar reduction to everything.
+    
+    # CRITICAL FIX: Apply specific Low Trade Penalty to ALL objectives
+    # This prevents "1-Trade Wonders" (High Sortino/PF, Low Trades) from surviving
+    normalized_trades -= low_trade_penalty
+    normalized_sortino -= low_trade_penalty
+    normalized_pf -= low_trade_penalty
+    normalized_pnl -= low_trade_penalty
+    normalized_ppt -= low_trade_penalty
+    
+    # For DD (minimized, 0.0 is Best), ADD penalty (make it worse/larger)
+    normalized_dd += low_trade_penalty
+
+    if constraint_penalty_factor < 1.0:
+        penalty_hit = (1.0 - constraint_penalty_factor) # e.g. 0.2
+        # Apply strict reduction
+        normalized_sortino -= penalty_hit
+        normalized_pf -= penalty_hit
+        normalized_trades -= penalty_hit
+        normalized_pnl -= penalty_hit
+        normalized_ppt -= penalty_hit
+        # For DD (minimized), ADD penalty
+        normalized_dd += penalty_hit
+
+
     # Return 6-objective fitness
     return (normalized_sortino, normalized_dd, normalized_pf, normalized_trades, normalized_pnl, normalized_ppt)
 
@@ -1055,9 +1161,9 @@ def parallel_evaluate(individuals, df, param_dict_local, param_keys_local, pool=
     
     try:
         # Use map_async with timeout for better interrupt handling
-        # Pass all necessary data to the worker function
-        async_result = pool.map_async(_evaluate_worker, 
-                                     [(ind, df, param_dict_local, param_keys_local) for ind in individuals])
+        # Pass only individuals (workers use shared memory globals)
+        # NOTE: This assumes pool was created with init_worker!
+        async_result = pool.map_async(_evaluate_worker, individuals)
         # Wait with timeout to allow interruption - check flag periodically
         try:
             # Use shorter timeout and check interrupt flag
@@ -1166,8 +1272,8 @@ def generate_parameter_analysis(hof, param_keys, param_dict, current_gen):
                     std = df_analysis[col].std()
                     importance[col] = std / p_range
     
-    # Get top 24 parameters (or all if fewer)
-    top_params = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:24]
+    # Get all parameters sorted by importance (User requested ALL parameters)
+    top_params = sorted(importance.items(), key=lambda x: x[1], reverse=True)
     top_param_names = [p[0] for p in top_params]
     
     if not top_param_names:
@@ -2441,12 +2547,12 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         }
         
         notes = [
-            '<strong>Penalty:</strong> <code>-1000 if &lt; 0</code>. Scaled 0-1 against <code>NORM_SORTINO_MAX</code>.',
-            '<strong>Penalty:</strong> <code>-1000 if &gt; Max</code>. Inverted Score: <code>1.0 - (DD / NORM_DD_MAX)</code>.',
-            '<strong>Penalty:</strong> <code>-1000 if &lt; 1.0</code>. Scaled 0-1 against <code>NORM_PF_MAX</code>.',
-            '<strong>Constraint:</strong> <code>if Trades &lt; MIN_TRADES: Score = -1000</code><br><strong>Targeting:</strong> <code>Score = 1.0 - abs(Trades - TARGET)/TARGET</code> (Gaussian Peak at 3/day).',
-            '<strong>Penalty Logic:</strong> <code>if PnL &lt; 0: Score = -1000</code><br><strong>Normalization:</strong> <code>Score = min(Raw_PnL / NORM_PNL_MAX, 1.0)</code><br><strong>Goal:</strong> Maximize Profit ($).',
-            '<strong>Penalty Logic:</strong> <code>if WinRate &lt; 40%: Score = -1000</code><br><strong>Normalization:</strong> <code>Score = min(Raw_PPT / NORM_PROFIT_TRADE_MAX, 1.0)</code><br><strong>Goal:</strong> High quality trades (&gt; $250/trade).'
+            '<strong>Constraint:</strong> No Floor (Negative Values Allowed). Goal: Maximize. Penalized if < 0.',
+            '<strong>Constraint:</strong> Minimize. Penalty: Geometric increase if DD > Limit.',
+            '<strong>Constraint:</strong> Maximize. Penalty: Small linear penalty if < 1.0.',
+            '<strong>Hard Constraint:</strong> <code>-Infinity</code> if < 1 trade/day.<br><strong>Soft Constraint:</strong> Penalty if trades > Target.',
+            '<strong>Goal:</strong> Maximize Profit ($).<br>No Floor. Negative PnL allowed to preserve gradient.',
+            '<strong>Goal:</strong> High quality trades (> $250/trade).<br>Graduated Penalty if WinRate < 40%.'
         ]
         
         for i, (name, weight, direction, note) in enumerate(zip(weight_names, weights, directions, notes)):
@@ -3171,8 +3277,11 @@ def main():
     print()
     
     # Create persistent pool for all generations (more efficient than creating/destroying each time)
-    print(f"  Creating worker pool with {NUM_WORKERS} workers...")
-    persistent_pool = multiprocessing.Pool(processes=NUM_WORKERS)
+    print(f"  Creating worker pool with {NUM_WORKERS} workers (Shared Memory Mode)...")
+    # Initialize workers with global data (in_sample dataframe) so we don't pickle it every task
+    persistent_pool = multiprocessing.Pool(processes=NUM_WORKERS, 
+                                          initializer=init_worker, 
+                                          initargs=(in_sample, param_dict, param_keys))
     
     # Main evolution loop with NSGA-II
     # If in dashboard mode, skip loop by setting NUM_GEN = start_gen

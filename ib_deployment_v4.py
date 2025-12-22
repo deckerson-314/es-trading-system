@@ -280,11 +280,164 @@ status_timer = StatusTimer()
 
 # Global State
 ib = IB()
+
+# --- Execution Logging to CSV ---
+def log_execution(trade, fill):
+    """
+    Callback to log execution details (fills) to a structured CSV.
+    Captures: Time, Symbol, Side, Price, Shares, Commission, NetCost
+    target_file: 'live_trades.csv'
+    """
+    try:
+        # 1. Define CSV path
+        csv_path = 'live_trades.csv'
+        file_exists = os.path.isfile(csv_path)
+
+        # 2. Extract Data
+        # Ensure we have a valid time (convert UTC to Eastern)
+        et_tz = pytz.timezone('US/Eastern')
+        if fill.time:
+            # fill.time is usually UTC-aware datetime from ib_insync
+            if fill.time.tzinfo is None:
+                # If naive, assume UTC (IB standard)
+                ft = pytz.utc.localize(fill.time)
+            else:
+                ft = fill.time
+            fill_time = ft.astimezone(et_tz).strftime('%Y-%m-%d %H:%M:%S')
+            fill_dt = ft.astimezone(et_tz) # Keep datetime obj for duration calc
+        else:
+            fill_dt = datetime.now(et_tz)
+            fill_time = fill_dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Get symbol
+        symbol = fill.contract.localSymbol if fill.contract else 'ES'
+        
+        # Side (BOT/SLD)
+        side = fill.execution.side if hasattr(fill, 'execution') else 'UNKNOWN'
+        
+        # Price and Quantity
+        price = fill.execution.price if hasattr(fill, 'execution') else 0.0
+        shares = abs(fill.execution.shares) if hasattr(fill, 'execution') else 0
+        
+        # Commission (might be None initially)
+        comm = fill.commissionReport.commission if fill.commissionReport else 0.0
+        
+        # Realized PnL (if available in this fill, usually tracked separately but good to log)
+        realized = fill.commissionReport.realizedPNL if fill.commissionReport else 0.0
+        
+        # PermID helps track unique orders
+        perm_id = fill.execution.permId if hasattr(fill, 'execution') else 0
+        
+        # 3. Write to CSV
+        with open(csv_path, 'a', newline='') as f:
+            # Header if new file
+            if not file_exists:
+                f.write("Time,Symbol,Side,Price,Qty,Commission,RealizedPNL,PermID\n")
+            
+            # Data row
+            row = f"{fill_time},{symbol},{side},{price},{shares},{comm},{realized},{perm_id}\n"
+            f.write(row)
+            f.flush() # Force write to disk
+            
+        logging.info(f"💾 Execution Logged: {side} {shares} @ {price} (Comm: {comm})")
+        
+        # 4. Update Trade Logic (Pairing)
+        global completed_trades, open_fills_log
+        
+        # Initialize open_fills_log if it doesn't exist (handle locally if new session)
+        if 'open_fills_log' not in globals():
+            global open_fills_log
+            open_fills_log = []
+
+        # Determine if this is an Open or Close
+        # Heuristic: Check if we have an opposing open fill to match against (FIFO)
+        matched_fill = None
+        
+        if side == 'BOT':
+            # Look for a SLD to close
+            for i, f in enumerate(open_fills_log):
+                if f['side'] == 'SLD':
+                    matched_fill = open_fills_log.pop(i)
+                    break
+        elif side == 'SLD':
+            # Look for a BOT to close
+            for i, f in enumerate(open_fills_log):
+                if f['side'] == 'BOT':
+                    matched_fill = open_fills_log.pop(i)
+                    break
+        
+        if matched_fill:
+            # We closed a trade
+            entry_price = matched_fill['price']
+            exit_price = price
+            qty = shares # Assuming 1:1 match for simplicity (basic FIFO)
+            
+            # Calculate PnL
+            multiplier = 50 # ES
+            if side == 'SLD': # Long Loop (BoT -> SLD)
+                pnl = (exit_price - entry_price) * qty * multiplier
+                direction = 'LONG'
+            else: # Short Loop (SLD -> BOT)
+                pnl = (entry_price - exit_price) * qty * multiplier
+                direction = 'SHORT'
+                
+            # Duration
+            # matched_fill['dt'] should be datetime obj
+            duration = fill_dt - matched_fill['dt']
+            duration_str = str(duration).split('.')[0]
+            
+            completed_trades.append({
+                'exit_time': fill_dt, # keep obj for dashboard logic
+                'direction': direction,
+                'qty': qty,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'pnl': pnl - comm - matched_fill['comm'], # Net PnL
+                'r_multiple': 0, # To be calc later if risk info available
+                'duration': duration_str,
+                'reason': 'Live Fill'
+            })
+            
+            # Send Email Notification
+            try:
+                msg = (f"TRADE CLOSE - {direction} (Bracket/Fill)\n"
+                       f"{'='*30}\n"
+                       f"Entry: ${entry_price:.2f}\n"
+                       f"Exit:  ${exit_price:.2f}\n"
+                       f"Qty:   {qty}\n"
+                       f"PnL:   ${pnl:.2f}\n"
+                       f"Dur:   {duration_str}\n"
+                       f"Time:  {fill_time}")
+                send_email("BB Strategy - Trade CLOSE", msg)
+            except Exception as e:
+                logging.error(f"Error sending close email: {e}")
+
+            logging.info(f"✅ Trade Closed: {direction} PnL=${pnl:.2f}")
+            
+        else:
+            # New Open Position
+            open_fills_log.append({
+                'time': fill_time,
+                'dt': fill_dt,
+                'side': side,
+                'qty': shares,
+                'price': price,
+                'comm': comm
+            })
+            logging.info(f"🆕 New Position Opened: {side} @ {price}")
+        
+    except Exception as e:
+        logging.error(f"Failed to log execution to CSV: {e}")
+
+# Wire up the handler
+ib.execDetailsEvent += log_execution
+
 positions = []  # List of BracketOrder objects for open positions
 data = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
 bar_count = 0
 bars = None
 contract = None
+last_data_receipt_time = datetime.now() # Track data liveness
 
 # Disconnect tracking for email alerts
 disconnect_start_time = None  # Timestamp when disconnect was first detected
@@ -307,6 +460,7 @@ dashboard_stats = {
 }
 live_tracker = []  # List of recent events (max 200)
 bar_log = []  # List of aggregated bar logs with entry criteria (max 20)
+completed_trades = []  # List of completed trade records (max 50)
 HTML_DASHBOARD = 'ib_deployment_dashboard.html'
 WEB_DIR = os.path.join(os.getcwd(), 'web')  # Common web directory
 WEB_DASHBOARD = os.path.join(WEB_DIR, 'ib_deployment_dashboard.html')
@@ -564,7 +718,7 @@ def add_error(error_msg):
 
 def generate_dashboard_html():
     """Generate the live trading dashboard HTML."""
-    global connection_start_time, total_uptime_seconds, dashboard_stats, error_log, live_tracker, params_dict, ib, contract, data, bar_log
+    global connection_start_time, total_uptime_seconds, dashboard_stats, error_log, live_tracker, params_dict, ib, contract, data, bar_log, completed_trades
     
     # Calculate connection uptime
     current_uptime = 0
@@ -677,6 +831,36 @@ def generate_dashboard_html():
         .params-table td {{ padding: 5px; }}
         .return-button {{ display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }}
         .return-button:hover {{ background: #5568d3; }}
+        
+        /* Tooltip Styles */
+        .tooltip {{ position: relative; border-bottom: 1px dotted #fff; cursor: help; }}
+        .tooltip:hover::after {{
+            content: attr(data-tooltip);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #333;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            white-space: pre-wrap;
+            width: 250px;
+            text-align: center;
+            z-index: 1000;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }}
+        .tooltip:hover::before {{ /* Arrow */
+            content: '';
+            position: absolute;
+            top: -5px;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }}
     </style>
 </head>
 <body>
@@ -737,17 +921,22 @@ def generate_dashboard_html():
         html += """        <table>
             <thead>
                 <tr>
-                    <th>Direction</th>
-                    <th>Size</th>
-                    <th>Avg Price</th>
-                    <th>Current Price</th>
-                    <th>Stop Loss</th>
-                    <th>Take Profit</th>
-                    <th>Risk ($)</th>
-                    <th>Reward ($)</th>
-                    <th>R:R Ratio</th>
-                    <th>Unrealized PNL</th>
-                    <th>Realized PNL</th>
+                <tr>
+                    <th class="tooltip" data-tooltip="Long or Short position">Direction</th>
+                    <th class="tooltip" data-tooltip="Number of contracts (e.g. 1)">Size</th>
+                    <th class="tooltip" data-tooltip="Weighted average entry price">Avg Price</th>
+                    <th class="tooltip" data-tooltip="Real-time market price">Current Price</th>
+                    <th class="tooltip" data-tooltip="Active Stop Loss order price">Stop Loss</th>
+                    <th class="tooltip" data-tooltip="Active Take Profit order price">Take Profit</th>
+                    <th class="tooltip" data-tooltip="INITIAL RISK ($)&#10;Original dollar risk at entry.&#10;Calc: Entry * StopLoss% * 50 * Qty">Init Risk ($)</th>
+                    <th class="tooltip" data-tooltip="INITIAL REWARD ($)&#10;Planned profit to target.&#10;Calc: |Target - Entry| * 50 * Qty">Init Reward ($)</th>
+                    <th class="tooltip" data-tooltip="OPEN RISK ($)&#10;Current exposure if stopped out NOW.&#10;Calc: |Price - Stop| * 50 * Qty">Open Risk ($)</th>
+                    <th class="tooltip" data-tooltip="OPEN REWARD ($)&#10;Remaining profit potential to target.&#10;Calc: |Target - Price| * 50 * Qty">Open Reward ($)</th>
+                    <th class="tooltip" data-tooltip="LOCKED PROFIT ($)&#10;Guaranteed profit secured by trailing stop (if In The Money).&#10;Calc: |Stop - Entry| * 50">Locked Profit ($)</th>
+                    <th class="tooltip" data-tooltip="Risk/Reward Ratio&#10;Open Reward / Open Risk">R:R Ratio</th>
+                    <th class="tooltip" data-tooltip="Current Floating PnL">Unrealized PNL</th>
+                    <th class="tooltip" data-tooltip="R-MULTIPLE&#10;Performance efficiency metric.&#10;Calc: Unrealized PnL / Initial Risk&#10;(+2.0R means you made 2x your risk)">R-Multiple</th>
+                    <th class="tooltip" data-tooltip="Closed PnL for this session">Realized PNL</th>
                 </tr>
             </thead>
             <tbody>
@@ -770,6 +959,12 @@ def generate_dashboard_html():
                         avg_price = abs(pos.marketValue / pos.position)
                 if avg_price is None or avg_price == 0:
                     avg_price = current_price  # Fallback to current price
+                
+                # FIX: For Futures (ES), avgCost is Total Cost (Price * Multiplier * Qty)
+                # We need to divide by Multiplier (50) and Qty to get the Price
+                contract_multiplier = 50  # ES multiplier
+                if avg_price > 20000: # Heuristic: ES price shouldn't be > 20k, so if it is, it's likely scaled
+                    avg_price = avg_price / contract_multiplier / abs(pos.position)
             except:
                 avg_price = current_price  # Fallback to current price
             
@@ -779,6 +974,14 @@ def generate_dashboard_html():
                 unrealized_pnl = getattr(pos, 'unrealizedPnl', None)
             if unrealized_pnl is None:
                 unrealized_pnl = getattr(pos, 'unrealized_pnl', None)
+            
+            # Manual Fallback Calculation if PnL is missing or 0
+            if (unrealized_pnl is None or unrealized_pnl == 0) and current_price > 0:
+                 # (Current - Entry) * Direction * Multiplier * Qty
+                 # But Direction is encoded in pos.position (positive/negative)
+                 # So: (Current - Entry) * Position * Multiplier
+                 unrealized_pnl = (current_price - avg_price) * pos.position * contract_multiplier
+            
             if unrealized_pnl is None:
                 unrealized_pnl = 0
             
@@ -878,12 +1081,56 @@ def generate_dashboard_html():
                 if risk_dollars and risk_dollars > 0 and reward_dollars:
                     risk_reward_ratio = reward_dollars / risk_dollars
             
+            # Calculate R-Multiple using Initial Stop Loss % (Assumed Initial Risk)
+            # This is robust because it doesn't rely on tracking the exact initial stop order if it was modified.
+            r_multiple = 0.0
+            initial_stop_pct = 0.0
+            
+            # Get from params
+            try:
+                # Look for 'Initial Stop Loss (%)' in params_dict
+                if 'Initial Stop Loss (%)' in params_dict:
+                     initial_stop_pct = params_dict['Initial Stop Loss (%)']['value']
+                elif 'Initial Stop Loss (%)' in grouped_params.get('Stop Loss Criteria', {}):
+                     initial_stop_pct = grouped_params['Stop Loss Criteria']['Initial Stop Loss (%)']['value']
+            except:
+                pass
+            
+            if initial_stop_pct > 0 and avg_price > 0:
+                # Initial Risk = Entry Price * (Stop % / 100) * Multiplier * Qty
+                initial_risk_dollars = avg_price * (initial_stop_pct / 100.0) * contract_multiplier * qty
+                
+                if initial_risk_dollars > 0:
+                    r_multiple = unrealized_pnl / initial_risk_dollars
+            
+            # Calculate Locked Profit (if stop is in the money)
+            locked_profit = 0.0
+            if stop_price and avg_price > 0:
+                if pos_direction == 1: # LONG
+                     if stop_price > avg_price:
+                         locked_profit = (stop_price - avg_price) * contract_multiplier * qty
+                else: # SHORT
+                     if stop_price < avg_price:
+                         locked_profit = (avg_price - stop_price) * contract_multiplier * qty
+            
+            # Calculate Initial Reward (Proxy using Current TP)
+            # If TP exists, Init Reward = |TP - Entry|
+            initial_reward_dollars = 0.0
+            if tp_price and avg_price > 0:
+                initial_reward_dollars = abs(tp_price - avg_price) * contract_multiplier * qty
+
             # Format display values
             stop_str = f"${stop_price:.2f}" if stop_price else "N/A"
             tp_str = f"${tp_price:.2f}" if tp_price else "N/A"
             risk_str = f"${risk_dollars:,.2f}" if risk_dollars is not None else "N/A"
             reward_str = f"${reward_dollars:,.2f}" if reward_dollars is not None else "N/A"
+            locked_str = f"${locked_profit:,.2f}" if locked_profit > 0 else "-"
+            # Initial Metrics Strings
+            init_risk_str = f"${initial_risk_dollars:,.2f}" if initial_risk_dollars > 0 else "N/A"
+            init_reward_str = f"${initial_reward_dollars:,.2f}" if initial_reward_dollars > 0 else "N/A"
+            
             rr_str = f"{risk_reward_ratio:.2f}:1" if risk_reward_ratio else "N/A"
+            r_mult_str = f"{r_multiple:+.2f}R" if initial_stop_pct > 0 else "N/A"
             
             html += f"""                <tr>
                     <td>{direction}</td>
@@ -892,10 +1139,14 @@ def generate_dashboard_html():
                     <td>${current_price:.2f}</td>
                     <td>{stop_str}</td>
                     <td>{tp_str}</td>
+                    <td class="negative">{init_risk_str}</td>
+                    <td class="positive">{init_reward_str}</td>
                     <td class="negative">{risk_str}</td>
                     <td class="positive">{reward_str}</td>
+                    <td class="positive"><strong>{locked_str}</strong></td>
                     <td>{rr_str}</td>
                     <td class="{'positive' if unrealized_pnl >= 0 else 'negative'}">${unrealized_pnl:,.2f}</td>
+                    <td class="{'positive' if r_multiple >= 0 else 'negative'}"><strong>{r_mult_str}</strong></td>
                     <td class="{'positive' if realized_pnl >= 0 else 'negative'}">${realized_pnl:,.2f}</td>
                 </tr>
 """
@@ -943,6 +1194,52 @@ def generate_dashboard_html():
     else:
         html += """        <p><em>No active orders</em></p>
 """
+
+    # Add Completed Trades Table
+    html += """
+        <h2>Completed Trades (Session)</h2>
+"""
+    
+    if completed_trades:
+        html += """        <table>
+            <thead>
+                <tr>
+                    <th class="tooltip" data-tooltip="Trade Exit Time">Exit Time</th>
+                    <th class="tooltip" data-tooltip="Long or Short">Type</th>
+                    <th class="tooltip" data-tooltip="Quantity">Qty</th>
+                    <th class="tooltip" data-tooltip="Entry Price">Entry</th>
+                    <th class="tooltip" data-tooltip="Exit Price">Exit</th>
+                    <th class="tooltip" data-tooltip="Realized Profit/Loss">PnL ($)</th>
+                    <th class="tooltip" data-tooltip="Performance Efficiency&#10;PnL / Initial Risk">R-Multiple</th>
+                    <th class="tooltip" data-tooltip="Trade Duration">Duration</th>
+                    <th class="tooltip" data-tooltip="Reason for Exit">Reason</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        # Show newest first
+        for trade in reversed(completed_trades):
+            r_mult_str = f"{trade['r_multiple']:+.2f}R" if trade['r_multiple'] != 0 else "N/A"
+            r_mult_class = "positive" if trade['r_multiple'] > 0 else "negative" if trade['r_multiple'] < 0 else ""
+            pnl_class = "positive" if trade['pnl'] > 0 else "negative" if trade['pnl'] < 0 else ""
+            
+            html += f"""                <tr>
+                    <td>{trade['exit_time'].strftime('%H:%M:%S')}</td>
+                    <td>{trade['direction']}</td>
+                    <td>{trade['qty']}</td>
+                    <td>${trade['entry_price']:.2f}</td>
+                    <td>${trade['exit_price']:.2f}</td>
+                    <td class="{pnl_class}">${trade['pnl']:,.2f}</td>
+                    <td class="{r_mult_class}"><strong>{r_mult_str}</strong></td>
+                    <td>{trade['duration']}</td>
+                    <td>{trade['reason']}</td>
+                </tr>
+"""
+        html += """            </tbody>
+        </table>
+"""
+    else:
+        html += """        <p>No completed trades in this session.</p>"""
     
     html += f"""
         <h2>Statistics</h2>
@@ -1269,8 +1566,12 @@ def log_all_open_orders(context=""):
 
 # Real-Time Bar Handler
 def on_bar_update(bars, hasNewBar):
-    global data, bar_count
+    global data, bar_count, last_data_receipt_time
+    last_data_receipt_time = datetime.now()
     try:
+        # Update liveness tracker
+        last_data_receipt_time = datetime.now()
+        
         if not hasNewBar:
             return
     
@@ -1305,7 +1606,7 @@ def on_bar_update(bars, hasNewBar):
         elif time_delay_seconds > 900:  # 15 minutes
             delay_indicator = " [DELAYED]"
     
-        logging.info(f"[5-sec bar] {bar_time.strftime('%H:%M:%S')}{delay_indicator} | "
+        logging.info(f"[1-min bar] {bar_time.strftime('%H:%M:%S')}{delay_indicator} | "
                     f"O: {bar.open:.2f} H: {bar.high:.2f} L: {bar.low:.2f} C: {bar.close:.2f} | "
                     f"Vol: {bar.volume:,.0f}")
     
@@ -1449,6 +1750,12 @@ def on_bar_update(bars, hasNewBar):
                 entry_criteria = ""
                 if len(data) >= strategy.bb_length and 'upper' in data.columns:
                     entry_criteria = log_entry_criteria_status(resampled_row_with_filters, data_with_filters)
+                    
+                    # Save to CSV for backtest comparison
+                    save_live_data_row(latest_resampled_idx, resampled_row_with_filters, data_with_filters)
+                    
+                    # Check entries using the RESAMPLED bar (essential for volume filters etc)
+                    check_entries(latest_resampled_idx, resampled_row_with_filters)
                 
                 # Store in bar_log for dashboard
                 global bar_log
@@ -1465,7 +1772,7 @@ def on_bar_update(bars, hasNewBar):
         # Only check entries/exits if we have enough data and indicators are calculated
         if len(data) >= strategy.bb_length and 'upper' in data.columns:
             latest_row = data.iloc[-1]
-            check_entries(data.index[-1], latest_row)
+            # check_entries was moved to resampled block to use correct aggregated data
             check_exits(data.index[-1], latest_row)
 
     except Exception as e:
@@ -1528,6 +1835,93 @@ def update_indicators():
             reindexed = data_with_filters[col].reindex(data.index, method='ffill')
             data[col] = reindexed.fillna(False)
 
+
+# CSV Recorder for Live Data Comparison
+def save_live_data_row(timestamp, row, full_df):
+    """
+    Save a single row of resampled data (OHLCV + Indicators) to CSV.
+    This creates a 'live_data.csv' file that matches the format expected by the backtester comparison tool.
+    """
+    csv_file = 'live_data.csv'
+    
+    # Define columns to save (matching backtest output + useful debug info)
+    columns = [
+        'datetime', 'open', 'high', 'low', 'close', 'volume',
+        'mid', 'upper', 'lower', 'atr_ts', 
+        'volume_ma', 'trend_ema', 'adx',
+        'in_rth', 'in_maintenance', 'volume_filter', 'atr_filter', 
+        'force_exit', 'force_exit_rth'
+    ]
+    
+    # Create row data dictionary
+    row_data = {
+        'datetime': timestamp,
+        'open': row.get('open', 0),
+        'high': row.get('high', 0),
+        'low': row.get('low', 0),
+        'close': row.get('close', 0),
+        'volume': row.get('volume', 0),
+        'mid': row.get('mid', 0),
+        'upper': row.get('upper', 0),
+        'lower': row.get('lower', 0),
+        'atr_ts': row.get('atr_ts', 0),
+        'volume_ma': row.get('avg_volume', row.get('volume_ma', 0)),
+        'trend_ema': row.get('trend_ema', 0) if 'trend_ema' in row else 0,
+        'adx': row.get('adx', 0) if 'adx' in row else 0,
+        'in_rth': row.get('in_rth', False),
+        'in_maintenance': row.get('in_maintenance', False),
+        'volume_filter': row.get('volume_filter', False),
+        'atr_filter': row.get('atr_filter', False),
+        'force_exit': row.get('force_exit', False),
+        'force_exit_rth': row.get('force_exit_rth', False)
+    }
+
+    # Calculate Signal State for Logging
+    # (Re-run check_entry logic to capture the boolean state for this row)
+    try:
+        if row.get('in_rth', True) and row.get('atr_filter', False) and row.get('volume_filter', False) and not row.get('in_maintenance', False):
+            # Only check if filters pass (to match strategy logic where signals are gated)
+            # OR check raw signals? Better to match "Trading Signal".
+            # strategy.check_entry returns Tuple (bool, bool)
+            el, es = strategy.check_entry(row, full_df)
+            row_data['entry_long'] = el
+            row_data['entry_short'] = es
+        else:
+            row_data['entry_long'] = False
+            row_data['entry_short'] = False
+    except Exception as e:
+         logging.error(f"Error calculating signals for CSV log: {e}")
+         row_data['entry_long'] = False
+         row_data['entry_short'] = False
+    
+    # Try to extract missing indicators from full_df if not in row
+    # (row is just the latest Series, might be missing some columns if not in result of apply_filters)
+    if 'avg_volume' not in row_data and 'avg_volume' in full_df.columns:
+        row_data['volume_ma'] = full_df.loc[timestamp, 'avg_volume']
+    elif 'volume_ma' not in row_data and 'volume_ma' in full_df.columns:
+        row_data['volume_ma'] = full_df.loc[timestamp, 'volume_ma']
+
+    if 'trend_ema' not in row_data and 'trend_ema' in full_df.columns:
+        row_data['trend_ema'] = full_df.loc[timestamp, 'trend_ema']
+    if 'adx' not in row_data and 'adx' in full_df.columns:
+        row_data['adx'] = full_df.loc[timestamp, 'adx']
+        
+    try:
+        # Check if file exists to write header
+        file_exists = os.path.isfile(csv_file)
+        
+        # Create DataFrame for single row
+        df_row = pd.DataFrame([row_data])
+        
+        # Append to CSV
+        df_row.to_csv(csv_file, mode='a', header=not file_exists, index=False)
+        
+        # Log occasionally (not every bar to avoid spam)
+        # logging.debug(f"Saved live data row to {csv_file}")
+            
+    except Exception as e:
+        logging.error(f"Failed to save live data row: {e}")
+
 # Entry Criteria Status Logging
 def log_entry_criteria_status(resampled_row, data_with_filters):
     """Log the status of all entry criteria for an aggregated bar."""
@@ -1549,9 +1943,9 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
         volume_filter = resampled_row.get('volume_filter', False)
         in_maintenance = resampled_row.get('in_maintenance', False)
         
-        # Calculate volume filter threshold
-        volume_ma = resampled_row.get('volume_ma', 0)
-        volume_threshold = volume_ma * strategy.max_volume_multiplier if volume_ma > 0 else 0
+        # Calculate volume filter threshold (use avg_volume, not volume_ma)
+        volume_ma = resampled_row.get('avg_volume', 0) 
+        volume_threshold = volume_ma * strategy.max_volume_multiplier_opt if volume_ma > 0 else 0
         
         # Check entry signals (only if filters pass)
         enter_long = False
@@ -1559,6 +1953,9 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
         long_reason = ""
         short_reason = ""
         
+        # Helper: Get correct ATR value for logging
+        atr_filter_val = resampled_row.get('atr_filter_values', atr_value)
+
         if max_trades_check and in_rth and atr_filter and volume_filter and not in_maintenance:
             # All filters pass - check entry signals
             enter_long, enter_short = strategy.check_entry(resampled_row, data_with_filters)
@@ -1622,11 +2019,11 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
                 long_reason = "Outside RTH"
                 short_reason = "Outside RTH"
             elif not atr_filter:
-                long_reason = f"ATR filter failed (ATR={atr_value:.2f})"
-                short_reason = f"ATR filter failed (ATR={atr_value:.2f})"
+                long_reason = f"ATR filter failed (ATR={atr_filter_val:.2f})"
+                short_reason = f"ATR filter failed (ATR={atr_filter_val:.2f})"
             elif not volume_filter:
-                long_reason = f"Volume filter failed (vol={volume:,.0f} < threshold={volume_threshold:,.0f})"
-                short_reason = f"Volume filter failed (vol={volume:,.0f} < threshold={volume_threshold:,.0f})"
+                long_reason = f"Volume filter failed (vol={volume:,.0f} > threshold={volume_threshold:,.0f})"
+                short_reason = f"Volume filter failed (vol={volume:,.0f} > threshold={volume_threshold:,.0f})"
             elif in_maintenance:
                 long_reason = "Maintenance period"
                 short_reason = "Maintenance period"
@@ -1635,7 +2032,7 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
         status_parts = []
         status_parts.append(f"Max Trades: {max_trades_status}")
         status_parts.append(f"RTH: {'✅' if in_rth else '❌'}")
-        status_parts.append(f"ATR Filter: {'✅' if atr_filter else f'❌ ({atr_value:.2f})'}")
+        status_parts.append(f"ATR Filter: {'✅' if atr_filter else f'❌ ({atr_filter_val:.2f})'}")
         status_parts.append(f"Vol Filter: {'✅' if volume_filter else f'❌ ({volume:,.0f} < {volume_threshold:,.0f})'}")
         status_parts.append(f"Maintenance: {'❌' if in_maintenance else '✅'}")
         status_parts.append(f"Long: {'✅' if enter_long else '❌'} ({long_reason})")
@@ -2900,6 +3297,36 @@ def check_exits(idx, latest_row):
             dashboard_stats['orders_filled'] += 1  # Exit order filled
             add_to_live_tracker('trade', f"TRADE CLOSE: {'LONG' if dir_==1 else 'SHORT'} {qty} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}, Reason: {reason}")
             
+            # Record completed trade for dashboard
+            try:
+                # Calculate R-Multiple
+                r_multiple = 0
+                if risk_dollars and risk_dollars > 0:
+                    r_multiple = pnl / risk_dollars
+                
+                trade_record = {
+                    'exit_time': exit_time,
+                    'entry_time': entry_time,
+                    'direction': 'LONG' if dir_ == 1 else 'SHORT',
+                    'qty': qty,
+                    'entry_price': entry_price,
+                    'exit_price': exit_price,
+                    'pnl': pnl,
+                    'r_multiple': r_multiple,
+                    'reason': reason,
+                    'duration': duration_str,
+                    'initial_risk': risk_dollars,
+                    'initial_reward': reward_dollars,
+                    'expected_risk': expected_risk,
+                    'expected_reward': expected_reward
+                }
+                completed_trades.append(trade_record)
+                # Keep last 50 trades
+                if len(completed_trades) > 50:
+                    completed_trades = completed_trades[-50:]
+            except Exception as e:
+                logging.error(f"Error recording completed trade: {e}")
+            
             # Cancel any orphaned orders from this bracket (e.g., standalone stop orders from trailing updates)
             try:
                 # Cancel the stop order if it's still active
@@ -3533,8 +3960,8 @@ def ensure_connected_and_subscribed():
     bars = ib.reqHistoricalData(
         contract,
         endDateTime='',
-        durationStr='5400 S',
-        barSizeSetting='5 secs',  # Using 5-second bars for accurate volume (matches TWS within ~2%)
+        durationStr='1 D',
+        barSizeSetting='1 min',  # Using 1-minute bars to match Historical Data (Backtest) Resolution
         whatToShow='TRADES',
         useRTH=False,
         formatDate=1,
@@ -3553,7 +3980,7 @@ def ensure_connected_and_subscribed():
         time_delay_seconds = (current_time - latest_bar_time).total_seconds()
         time_delay_minutes = time_delay_seconds / 60
         
-        logging.info(f"PRE-FILLED WITH {bar_count} HISTORICAL 5-SEC BARS. LATEST: {latest_bar_time}")
+        logging.info(f"PRE-FILLED WITH {bar_count} HISTORICAL 1-MIN BARS. LATEST: {latest_bar_time}")
         if time_delay_seconds < 10:
             logging.info(f"✅ Data appears LIVE (delay: {time_delay_seconds:.1f} seconds)")
         elif time_delay_minutes > 10:
@@ -3635,7 +4062,7 @@ async def main():
     global contract
     protection_task = None
     
-    global connection_start_time, total_uptime_seconds, dashboard_stats
+    global connection_start_time, total_uptime_seconds, dashboard_stats, last_data_receipt_time
     
     try:
         # Connect with retry logic
@@ -3732,6 +4159,14 @@ async def main():
                 loop_count += 1
                 if loop_count % 1 == 0:  # Update every 10 seconds (every iteration)
                     update_dashboard()
+
+                # DATA LIVENESS CHECK
+                time_since_last_data = (datetime.now() - last_data_receipt_time).total_seconds()
+                if time_since_last_data > 60:
+                    logging.warning(f"⚠️ DATA STALLED! No bars for {time_since_last_data:.1f}s. Force-restarting data...")
+                    add_to_live_tracker('warning', 'Data Stalled - Forcing Restart')
+                    ensure_connected_and_subscribed()
+                    last_data_receipt_time = datetime.now() # Reset to avoid loop
                 
                 await asyncio.sleep(10)
             except KeyboardInterrupt:

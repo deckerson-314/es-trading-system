@@ -105,7 +105,7 @@ def load_ga_params(ga_file, solution_idx):
         print(f"Error parse GA params: {e}")
         raise
 
-def run_backtest_v4(data_path, params_source, suppress_log=False):
+def run_backtest_v4(data_path, params_source, suppress_log=False, start_date=None, end_date=None):
     """
     Run detailed backtest using V4 strategy.
     
@@ -113,6 +113,8 @@ def run_backtest_v4(data_path, params_source, suppress_log=False):
         data_path (str): Path to market data
         params_source (str or dict): Path to params CSV OR dict of parameters
         suppress_log (bool): If True, minimizes console output
+        start_date (str, optional): Start date YYYY-MM-DD
+        end_date (str, optional): End date YYYY-MM-DD
         
     Returns:
         dict: Results including 'pnl', 'sortino', 'trades_df', etc.
@@ -145,6 +147,7 @@ def run_backtest_v4(data_path, params_source, suppress_log=False):
             df = pd.read_csv(data_path, parse_dates=True, index_col=0)
             df.columns = [str(c).lower().strip() for c in df.columns]
             
+            
             required_cols = ['open', 'high', 'low', 'close', 'volume']
             
             # Check if columns are missing
@@ -161,6 +164,20 @@ def run_backtest_v4(data_path, params_source, suppress_log=False):
             
             if not suppress_log:
                 log(f"Loaded {len(df)} bars from {data_path}", log_file)
+
+            # --- DATE FILTERING (Moved after load) ---
+            if start_date or end_date:
+                original_len = len(df)
+                if start_date:
+                    df = df.loc[start_date:]
+                if end_date:
+                    df = df.loc[:end_date]
+                
+                if not suppress_log:
+                    log(f"Date Filter Applied: {start_date} to {end_date}", log_file)
+                    log(f"Bars Reduced: {original_len} -> {len(df)}", log_file)
+            # ----------------------
+
         except Exception as e:
             log(f"ERROR loading data: {e}", log_file)
             return result_package
@@ -230,7 +247,10 @@ def run_backtest_v4(data_path, params_source, suppress_log=False):
                         'pnl_currency': (price - pos['entry_price']) * pos['direction'] * 50 - transaction_cost, 
                         'duration': duration,
                         'max_high': pos['max_high'],
-                        'min_low': pos['min_low']
+                        'min_low': pos['min_low'],
+                        'tp': pos.get('tp'),
+                        'sl': pos.get('stop'),
+                        'stop_history': pos.get('stop_history')
                     }
                     positions.append(trade)
                     open_positions.pop(i) 
@@ -276,7 +296,8 @@ def run_backtest_v4(data_path, params_source, suppress_log=False):
                 'max_dd': max_dd,
                 'sortino': sortino,
                 'trades_df': trades_df,
-                'equity_curve': equity_curve
+                'equity_curve': equity_curve,
+                'df': df  # Return dataframe for plotting
             }
 
             if not suppress_log:
@@ -300,7 +321,8 @@ def run_backtest_v4(data_path, params_source, suppress_log=False):
                 'max_dd': 0,
                 'sortino': 0,
                 'trades_df': trades_df,
-                'equity_curve': pd.Series(dtype=float)
+                'equity_curve': pd.Series(dtype=float),
+                'df': df # Return dataframe even if no trades
             }
     
     # Generate HTML Dashboard (if not suppressed)
@@ -335,12 +357,14 @@ def run_backtest_v4(data_path, params_source, suppress_log=False):
 
     return result_package
 
-def run_comparison_mode(data_path, ga_file, solutions):
+def run_comparison_mode(data_path, ga_file, solutions, start_date=None, end_date=None):
     """Run backtests for multiple solutions and compare results."""
     print(f"\n=== Running Comparison Mode ===")
     print(f"Data: {data_path}")
     print(f"GA File: {ga_file}")
     print(f"Solutions: {solutions}")
+    if start_date or end_date:
+        print(f"Date Filter: {start_date} to {end_date}")
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_results = []
@@ -351,7 +375,8 @@ def run_comparison_mode(data_path, ga_file, solutions):
         print(f"  > Processing Solution {sol_idx}...", end='', flush=True)
         # try:
         params, name = load_ga_params(ga_file, sol_idx)
-        res = run_backtest_v4(data_path, params, suppress_log=True)
+        # FIX: Pass date filters to backtester
+        res = run_backtest_v4(data_path, params, suppress_log=True, start_date=start_date, end_date=end_date)
 
         # Add to dashboard data
         solutions_data.append({
@@ -359,7 +384,7 @@ def run_comparison_mode(data_path, ga_file, solutions):
             'params': params,
             'trades_df': res['trades_df'],
             'equity_curve': res['equity_curve'],
-            'df': None # No OHLCV for comparison mode to save memory/speed
+            'df': res['df'] # FIX: Pass dataframe for plotting individual trade charts
         })
         
         summary_results.append({
@@ -411,11 +436,58 @@ def run_comparison_mode(data_path, ga_file, solutions):
         print(f"Comparison Plot: {plot_path}")
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ['?', '-?', '/?', '--help', '-h']:
+        print(f"""
+================================================================================
+             BOLLINGER BAND STRATEGY BACKTESTER (V4)
+================================================================================
+
+DESCRIPTION:
+  Runs a detailed backtest of the Bollinger Band Strategy (V4) using vectorization.
+  Can run in two modes:
+  1. Single Solution: Test one specific parameter set.
+  2. Comparison Mode: Test multiple solutions and compare them side-by-side.
+
+USAGE:
+  python BB_Strategy_v4.py [ARGUMENTS]
+
+CRITICAL ARGUMENTS:
+  --data FILE             Path to market data CSV (OHLCV).
+                          (Default: tries to find 'market_data.csv' or 'ES_full_1min_clean.csv').
+
+  --ga-file FILE          Path to Genetic Algorithm Results CSV (e.g. 'Bollinger/parameters/genetic_results_X.csv').
+                          * TIP: Use 'latest' to automatically find the newest results file.
+
+  --solutions LIST        Comma-separated list of Solution IDs to test.
+                          * Example: "0" (Best), "0,1,2" (Top 3), "5,10" (Specific).
+                          * REQUIRES --ga-file.
+
+  --params FILE           (Legacy) Path to a single parameter file (e.g. 'backtest_params.csv').
+                          Used if --ga-file is not provided.
+
+EXAMPLES:
+  Test Best Solution:     python BB_Strategy_v4.py --ga-file latest --solutions 0
+  Compare Top 3:          python BB_Strategy_v4.py --ga-file latest --solutions 0,1,2
+  Legacy Backtest:        python BB_Strategy_v4.py --params Bollinger/parameters/backtest_params.csv
+
+================================================================================
+""")
+        sys.exit(0)
+
+print_help_end = True # Marker
+
+if __name__ == "__main__":
+    # Remove the duplicate check if needed, but structure above is cleaner if we merge.
+    # Actually, I will replace the original main block header with this logic.
+    pass
+
     parser = argparse.ArgumentParser(description='Bollinger Band Strategy V4 Backtester')
     parser.add_argument('--data', type=str, default=DATA_FILE, help='Path to market data CSV')
     parser.add_argument('--params', type=str, default='Bollinger/parameters/backtest_params.csv', help='Path to parameters CSV (Legacy)')
     parser.add_argument('--ga-file', type=str, help='Path to GA results CSV (or "latest")')
     parser.add_argument('--solutions', type=str, help='Comma-separated list of solution IDs to test (e.g. "0,1,5")')
+    parser.add_argument('--start', type=str, help='Start Date (YYYY-MM-DD)')
+    parser.add_argument('--end', type=str, help='End Date (YYYY-MM-DD)')
     
     args = parser.parse_args()
     
@@ -453,14 +525,16 @@ if __name__ == "__main__":
             
         if len(sol_list) > 1:
             # Comparison Mode
-            run_comparison_mode(args.data, ga_file, sol_list)
+            run_comparison_mode(args.data, ga_file, sol_list, start_date=args.start, end_date=args.end)
         else:
             # Single Solution Mode
             sol_idx = sol_list[0]
             print(f"Running Single Backtest for Solution {sol_idx} from {ga_file}")
+            if args.start or args.end:
+                 print(f"Date Filter: {args.start} to {args.end}")
             try:
                 params, name = load_ga_params(ga_file, sol_idx)
-                run_backtest_v4(args.data, params)
+                run_backtest_v4(args.data, params, start_date=args.start, end_date=args.end)
             except Exception as e:
                 print(f"Error loading params: {e}")
                 
@@ -468,7 +542,9 @@ if __name__ == "__main__":
         # Legacy Mode (using --params file)
         if os.path.exists(args.params):
             print(f"Running Legacy Backtest with params: {args.params}")
-            run_backtest_v4(args.data, args.params)
+            if args.start or args.end:
+                 print(f"Date Filter: {args.start} to {args.end}")
+            run_backtest_v4(args.data, args.params, start_date=args.start, end_date=args.end)
         else:
             print(f"Error: Could not find params file '{args.params}'")
             print("Usage: python BB_Strategy_v4.py --data ... [--params ... OR --ga-file ...]")

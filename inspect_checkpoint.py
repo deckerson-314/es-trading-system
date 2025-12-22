@@ -1,91 +1,120 @@
+
 import pickle
 import sys
 import os
-import pandas as pd
-import numpy as np
 from deap import base, creator, tools
 
-# Define DEAP classes (required for unpickling)
-if hasattr(creator, "FitnessMulti"):
-    del creator.FitnessMulti
-if hasattr(creator, "Individual"):
-    del creator.Individual
-
-# Attempt to recreate Creator classes
-try:
+# Setup DEAP environment to allow unpickling
+if not hasattr(creator, "FitnessMulti"):
     creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0, 1.0, 1.0, 2.0, 2.0))
+if not hasattr(creator, "Individual"):
     creator.create("Individual", list, fitness=creator.FitnessMulti)
-except:
-    pass
 
-CHECKPOINT_FILE = r"c:\Trading\ga_diagnostics_v4\ga_checkpoint_v4.pkl"
-
-def analyze_checkpoint():
-    if not os.path.exists(CHECKPOINT_FILE):
-        print(f"Checkpoint file not found: {CHECKPOINT_FILE}")
+def inspect_checkpoint(filepath):
+    if not os.path.exists(filepath):
+        print(f"File not found: {filepath}")
         return
 
-    print(f"Analyzing Checkpoint: {os.path.basename(CHECKPOINT_FILE)}")
-    
     try:
-        with open(CHECKPOINT_FILE, 'rb') as f:
+        with open(filepath, "rb") as f:
             cp = pickle.load(f)
-            
-        print(f"Generation: {cp.get('generation', 'Unknown')}")
         
-        hof = cp.get('hall_of_fame', [])
-        print(f"Hall of Fame Size: {len(hof)}")
+        pop = cp.get("population", [])
+        gen = cp.get("generation", 0)
         
-        if not hof:
-            print("HOF is empty.")
+        print(f"Checkpoint Information:")
+        print(f"  Generation: {gen}")
+        print(f"  Population Size: {len(pop)}")
+        
+        if not pop:
+            print("  Population is empty.")
             return
 
-        # Extract data from HOF
-        data = []
-        for i, ind in enumerate(hof):
-            if hasattr(ind, 'fitness') and ind.fitness.valid:
+        # Check fitness values
+        # Fitness weights: (Sortino, DD, PF, Trades, PnL, PPT)
+        # We are interested in Sortino (Index 0) and PnL (Index 4)
+        
+        sortinos = []
+        pnls = []
+        
+        for ind in pop:
+            if ind.fitness.valid:
                 vals = ind.fitness.values
-                # vals order: Sortino, DD, PF, Trades, Total PnL, Avg PnL/Trade
-                
-                trade_val = vals[3] if len(vals) > 3 else 0
-                avg_pnl_trade_norm = vals[5] if len(vals) > 5 else 0
-                
-                row = {
-                    'Rank': i+1,
-                    'Sortino': vals[0],
-                    'MaxDD_Norm': vals[1],
-                    'ProfitFactor': vals[2],
-                    'TradeScore': trade_val,
-                    'TotalProfit_Norm': vals[4] if len(vals) > 4 else 0,
-                    'AvgProfitTrade_Norm': avg_pnl_trade_norm,
-                    'BB_Length': ind[0] if len(ind) > 0 else 0,
-                    'BB_StdDev': ind[1] if len(ind) > 1 else 0
-                }
-                data.append(row)
-        
-        df = pd.DataFrame(data)
-        
-        print("\n=== Top 10 Solutions (HOF) ===")
-        print(df.head(10).to_string(index=False))
-        
-        print("\n=== Performance Stats (HOF) ===")
-        print(df.describe())
-        
-        # Analyze Avg Profit Trade
-        print("\n=== Avg Profit/Trade Analysis ===")
-        print(f"Max Norm Score: {df['AvgProfitTrade_Norm'].max():.4f}")
-        print(f"Avg Norm Score: {df['AvgProfitTrade_Norm'].mean():.4f}")
-        
-        print("\n=== BB Length Distribution (Top 20) ===")
-        print(df.head(20)['BB_Length'].value_counts())
-        
-        print("\n=== BB StdDev Distribution (Top 20) ===")
-        print(df.head(20)['BB_StdDev'].value_counts())
+                # Note: fitness values in DEAP are stored as-is (unweighted? No, unweighted inputs).
+                # Wait, my code returns NORMALIZED values.
+                # So if I see negative values here, it confirms the fix.
+                sortinos.append(vals[0])
+                pnls.append(vals[4])
+
+        if sortinos:
+            print(f"  Best Sortino: {max(sortinos):.6f}")
+            print(f"  Worst Sortino: {min(sortinos):.6f}")
+            print(f"  Avg Sortino: {sum(sortinos)/len(sortinos):.6f}")
+            
+            print(f"  Best PnL (Norm): {max(pnls):.6f}")
+            print(f"  Worst PnL (Norm): {min(pnls):.6f}")
+            
+            # Count negatives
+            neg_sortinos = sum(1 for x in sortinos if x < 0)
+            print(f"  Negative Sortinos: {neg_sortinos} / {len(sortinos)}")
+            
+            # Diversity Check
+            unique_inds = set(tuple(ind) for ind in pop)
+            diversity_pct = (len(unique_inds) / len(pop)) * 100.0
+            print(f"  Population Diversity: {diversity_pct:.1f}% ({len(unique_inds)}/{len(pop)} unique)")
+            
+            # Print Top 3 Individuals
+            print("\n  Top 3 Candidates (by Sortino):")
+            # Sort by Sortino descending
+            sorted_pop = sorted(pop, key=lambda ind: ind.fitness.values[0], reverse=True)
+            
+            for i in range(min(3, len(sorted_pop))):
+                ind = sorted_pop[i]
+                try:
+                    # Try to get trades/day from fitness if available (index 3)
+                    trades_val = ind.fitness.values[3] if len(ind.fitness.values) > 3 else 0
+                    print(f"    #{i+1}: Sortino={ind.fitness.values[0]:.4f}, DD={ind.fitness.values[1]:.4f}, PnL={ind.fitness.values[4]:.4f}, Trades/Day={trades_val:.4f}")
+                    if i == 0:
+                        print(f"       Params: {ind}")
+                except Exception as e: # Corrected the syntax error in the original snippet's except block
+                     print(f"    #{i+1}: {ind.fitness.values} (Error: {e})")
 
     except Exception as e:
         print(f"Error reading checkpoint: {e}")
-        import traceback
-        traceback.print_exc()
 
 if __name__ == "__main__":
-    analyze_checkpoint()
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ['?', '-?', '/?', '--help', '-h']:
+            print(f"""
+================================================================================
+             GA CHECKPOINT INSPECTOR
+================================================================================
+
+DESCRIPTION:
+  Analyzes a binary Genetic Algorithm Checkpoint (.pkl) file and reports statistics
+  about the population, including:
+  - Best/Worst/Average Sortino Ratio
+  - Number of Negative/Invalid solutions
+  - Population Diversity (Uniqueness %)
+  - Top 3 Candidate Details (Sortino, DD, PnL, Trades/Day)
+
+USAGE:
+  python inspect_checkpoint.py [CHECKPOINT_FILE]
+
+ARGUMENTS:
+  CHECKPOINT_FILE   Path to the .pkl file to inspect.
+                    (Optional. If invalid or missing, defaults to latest hardcoded path).
+
+EXAMPLES:
+  Inspect Latest:   python inspect_checkpoint.py
+  Inspect Specific: python inspect_checkpoint.py ga_diagnostics_v4/ga_checkpoint_2025-12-13-1.pkl
+  Get Help:         python inspect_checkpoint.py ?
+
+================================================================================
+""")
+            sys.exit(0)
+        # Allow passing filename as argument
+        inspect_checkpoint(sys.argv[1])
+    else:
+        inspect_checkpoint("ga_diagnostics_v4/ga_checkpoint_2025-12-13-1.pkl")
+
