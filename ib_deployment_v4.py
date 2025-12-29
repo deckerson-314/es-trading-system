@@ -12,11 +12,22 @@ Revision History:
 """
 
 import os
+import sys
+
+# Force UTF-8 encoding for console output (fixes Windows emoji issues)
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass # Older python versions might not have reconfigure
+
 import argparse
 import pandas as pd
 import numpy as np
 import logging
 import smtplib
+import json
 from email.mime.text import MIMEText
 from datetime import datetime, time
 from threading import Timer
@@ -41,31 +52,67 @@ EMAIL_PWD = os.getenv('EMAIL_PASSWORD')
 if not all([EMAIL_FROM, EMAIL_TO, EMAIL_PWD]):
     raise RuntimeError("Missing Gmail credentials in .env")
 
+# =============================================================================
+# Parse Command Line Arguments
+# =============================================================================
+parser = argparse.ArgumentParser(
+    description='IB Live Trading Deployment Script',
+    formatter_class=argparse.RawTextHelpFormatter,
+    epilog="""
+EXAMPLES:
+  Paper Trading:
+    python ib_deployment_v4.py --port 7497 --mode PAPER --output_dir paper_logs --params Bollinger/parameters/paper_params.csv
+
+  Live Trading:
+    python ib_deployment_v4.py --port 7496 --mode LIVE --output_dir live_logs --params Bollinger/parameters/live_params.csv
+
+FAILURE MODES:
+  - If --port is not specified, script will exit.
+  - If output_dir does not exist, it will be created.
+"""
+)
+
+parser.add_argument('--port', type=int, required=True, help='IB TWS/Gateway Port (e.g., 7497 for Paper, 7496 for Live)')
+parser.add_argument('--mode', type=str, choices=['PAPER', 'LIVE'], default='PAPER', help='Trading Mode label for Dashboard (default: PAPER)')
+parser.add_argument('--params', type=str, default=r'Bollinger\parameters\live_params.csv', help='Path to parameter CSV file')
+parser.add_argument('--output_dir', type=str, default='paper_logs', help='Directory for logs and CSV data (default: paper_logs)')
+parser.add_argument('--dashboard', type=str, default='dashboard.html', help='Filename for HTML dashboard (saved in output_dir)')
+parser.add_argument('--client_id', type=int, default=100, help='Base Client ID for IB Connection')
+
+args = parser.parse_args()
+
+# Validate Output Directory
+if not os.path.exists(args.output_dir):
+    try:
+        os.makedirs(args.output_dir)
+        print(f"Created output directory: {args.output_dir}")
+    except OSError as e:
+        print(f"Error creating output directory: {e}")
+        exit(1)
+
+# =============================================================================
+# Setup Logging (After Args to use Output Dir)
+# =============================================================================
+log_file_path = os.path.join(args.output_dir, 'ib_execution.log')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
     handlers=[
-        logging.FileHandler('ib_deployment.log', encoding='utf-8'),
+        logging.FileHandler(log_file_path, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
-REVISION = "4.0"
-logging.info(f"Starting ib_deployment_v2.py - REVISION {REVISION}")
+REVISION = "4.1 (Multi-Account Support)"
+logging.info("="*60)
+logging.info(f"STARTING DEPLOYMENT - REV {REVISION}")
+logging.info(f"MODE: {args.mode}")
+logging.info(f"PORT: {args.port}")
+logging.info(f"LOGS: {args.output_dir}")
+logging.info("="*60)
 
-# =============================================================================
-# Load Parameters
-# =============================================================================
-# =============================================================================
-# Load Parameters
-# =============================================================================
-# Default path (can be overridden by CLI args)
-DEFAULT_PARAM_CSV = r'Bollinger\parameters\live_params.csv'
-
-# Parse Command Line Arguments
-parser = argparse.ArgumentParser(description='IB Live Trading Deployment')
-parser.add_argument('--params', type=str, default=DEFAULT_PARAM_CSV, help='Path to parameter CSV file')
-args = parser.parse_args()
+PARAM_CSV = args.params
 
 PARAM_CSV = args.params
 
@@ -286,11 +333,10 @@ def log_execution(trade, fill):
     """
     Callback to log execution details (fills) to a structured CSV.
     Captures: Time, Symbol, Side, Price, Shares, Commission, NetCost
-    target_file: 'live_trades.csv'
     """
     try:
         # 1. Define CSV path
-        csv_path = 'live_trades.csv'
+        csv_path = os.path.join(args.output_dir, 'live_trades.csv')
         file_exists = os.path.isfile(csv_path)
 
         # 2. Extract Data
@@ -461,9 +507,16 @@ dashboard_stats = {
 live_tracker = []  # List of recent events (max 200)
 bar_log = []  # List of aggregated bar logs with entry criteria (max 20)
 completed_trades = []  # List of completed trade records (max 50)
-HTML_DASHBOARD = 'ib_deployment_dashboard.html'
-WEB_DIR = os.path.join(os.getcwd(), 'web')  # Common web directory
-WEB_DASHBOARD = os.path.join(WEB_DIR, 'ib_deployment_dashboard.html')
+HTML_DASHBOARD = args.dashboard
+WEB_DIR = os.path.join(os.getcwd(), 'web') # Always use 'web' directory for easy access
+WEB_DASHBOARD = os.path.join(WEB_DIR, HTML_DASHBOARD)
+
+# Ensure web directory exists
+if not os.path.exists(WEB_DIR):
+    try:
+        os.makedirs(WEB_DIR)
+    except:
+        pass
 
 # Track realized PNL from portfolio updates (more accurate than positions)
 portfolio_realized_pnl = None  # Will be updated from updatePortfolio callback
@@ -866,7 +919,7 @@ def generate_dashboard_html():
 <body>
     <div class="container">
         <a href="index.html" class="return-button">← Back to Main Dashboard</a>
-        <h1>IB Deployment Live Trading Dashboard</h1>
+        <h1>IB Deployment Dashboard [{args.mode}] (Port: {args.port}) <span style="font-size: 0.8em; color: #aaa;">{contract.localSymbol if 'contract' in globals() and contract else 'N/A'}</span></h1>
         <p><strong>Last Updated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         
         <div class="status-bar {'disconnected' if not is_connected else ''}">
@@ -878,19 +931,15 @@ def generate_dashboard_html():
             </p>
         </div>
         
-        <h2>Account Summary</h2>
+        <h2>Account & Market Summary</h2>
         <div class="metric-grid">
+            <div class="metric-box">
+                <div class="label">Contract</div>
+                <div class="value">{contract.localSymbol if 'contract' in globals() and contract else 'N/A'}</div>
+            </div>
             <div class="metric-box">
                 <div class="label">Net Liquidation</div>
                 <div class="value">${account.get('NetLiquidation', 0):,.2f}</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Total Cash</div>
-                <div class="value">${account.get('TotalCashValue', 0):,.2f}</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Buying Power</div>
-                <div class="value">${account.get('BuyingPower', 0):,.2f}</div>
             </div>
             <div class="metric-box">
                 <div class="label">Unrealized PNL</div>
@@ -905,12 +954,24 @@ def generate_dashboard_html():
                 </div>
             </div>
             <div class="metric-box">
+                <div class="label">Current Price</div>
+                <div class="value">${current_price:.2f}</div>
+            </div>
+             <div class="metric-box">
+                <div class="label">Bar Volume ({strategy.timeframe}m)</div>
+                <div class="value">{bar_log[-1]['bar_info'].split('Vol: ')[1].split(' ')[0] if bar_log and 'Vol: ' in bar_log[-1]['bar_info'] else '0'}</div>
+            </div>
+            <div class="metric-box">
                 <div class="label">Open ES Positions</div>
                 <div class="value">{len(es_positions)}</div>
             </div>
             <div class="metric-box">
-                <div class="label">Current Price</div>
-                <div class="value">${current_price:.2f}</div>
+                <div class="label">Total Cash</div>
+                <div class="value">${account.get('TotalCashValue', 0):,.2f}</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Buying Power</div>
+                <div class="value">${account.get('BuyingPower', 0):,.2f}</div>
             </div>
         </div>
         
@@ -1289,7 +1350,7 @@ def generate_dashboard_html():
 """
     
     # Show last 20 bar logs (most recent at top)
-    global bar_log
+    # Show last 20 bar logs (most recent at top)
     if bar_log:
         for entry in reversed(bar_log):
             html += f"""                <div class="bar-log-entry">
@@ -1366,13 +1427,45 @@ def generate_dashboard_html():
     return html
 
 def update_dashboard():
-    """Update the dashboard HTML file."""
+    """
+    Update the dashboard HTML file and status.json.
+    """
     try:
+        # 1. Update HTML Dashboard
         html = generate_dashboard_html()
-        # Write directly to web directory as primary location
-        os.makedirs(WEB_DIR, exist_ok=True)
         with open(WEB_DASHBOARD, 'w', encoding='utf-8') as f:
             f.write(html)
+        
+        # 2. Update status.json for Index Page
+        try:
+            # Calculate metrics
+            account_summary = get_account_summary()
+            acct_val = account_summary.get('NetLiquidation', 0)
+            if isinstance(acct_val, str): acct_val = 0
+            
+            daily_pnl = account_summary.get('RealizedPNL', 0) + account_summary.get('UnrealizedPNL', 0)
+            
+            # Position Count
+            es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES']
+            pos_size = sum(p.position for p in es_positions)
+            
+            status_data = {
+                'mode': args.mode,
+                'port': args.port,
+                'connected': ib.isConnected(),
+                'net_liquidation': float(acct_val),
+                'pnl': float(daily_pnl),
+                'position': float(pos_size),
+                'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            json_path = os.path.join(args.output_dir, 'status.json')
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(status_data, f)
+                
+        except Exception as e:
+            logging.error(f"Error updating status.json: {e}")
+
         # Only log dashboard saves every 60 seconds to reduce log noise
         last_log_time = getattr(update_dashboard, '_last_log_time', None)
         if last_log_time is None or (datetime.now() - last_log_time).total_seconds() >= 60:
@@ -1572,31 +1665,30 @@ def on_bar_update(bars, hasNewBar):
         # Update liveness tracker
         last_data_receipt_time = datetime.now()
         
-        if not hasNewBar:
-            return
+        # NOTE: with keepUpToDate=True, we get updates for the CURRENT bar (hasNewBar=False)
+        # and notifications when a NEW bar is created (hasNewBar=True).
+        # We MUST process updates to capture developing volume/price actions within the minute.
+        
+        # Sync `data` DataFrame with `bars` list
+        # ib_insync keeps `bars` list updated automatically.
+        # Rebuilding DataFrame is safe and ensures synchronization.
+        # For performance, we could optimize, but for < ~2000 bars, this is negligible (~ms).
+        df = util.df(bars)
+        if df is not None and not df.empty:
+            df.rename(columns={'date': 'datetime'}, inplace=True)
+            df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_convert('US/Eastern')
+            df.set_index('datetime', inplace=True)
+            data = df[['open', 'high', 'low', 'close', 'volume']].copy()
+            bar_count = len(data)
+            
+            # Get the latest bar from data (which is now synced)
+            bar_time = data.index[-1]
+            latest_row = data.iloc[-1]
+        else:
+             return
+
     
-        bar = bars[-1]
-    
-        # Diagnostic: Check bar attributes to understand volume reporting
-        bar_time = bar.date.astimezone(pytz.timezone('US/Eastern'))
-        bar_seconds = bar_time.second
-        bar_minute = bar_time.minute
-    
-        new_row = pd.Series({
-            'open': bar.open,
-            'high': bar.high,
-            'low': bar.low,
-            'close': bar.close,
-            'volume': bar.volume
-        }, name=bar_time)
-    
-        data = data._append(new_row)
-        bar_count += 1
-    
-        # Log incoming bar (currently 5-second bars for volume investigation)
-        # NOTE: IB API volume may be filtered (excludes combo trades, block trades, etc.)
-        # TWS shows unfiltered volume, which can be 10x-20x higher
-        # bar.volume is per-bar volume for the bar period (not cumulative across bars)
+        # Log incoming bar update
         # Check if data is live or delayed by comparing bar time to current time
         current_time = datetime.now(pytz.timezone('US/Eastern'))
         time_delay_seconds = (current_time - bar_time).total_seconds()
@@ -1606,9 +1698,20 @@ def on_bar_update(bars, hasNewBar):
         elif time_delay_seconds > 900:  # 15 minutes
             delay_indicator = " [DELAYED]"
     
-        logging.info(f"[1-min bar] {bar_time.strftime('%H:%M:%S')}{delay_indicator} | "
-                    f"O: {bar.open:.2f} H: {bar.high:.2f} L: {bar.low:.2f} C: {bar.close:.2f} | "
-                    f"Vol: {bar.volume:,.0f}")
+        # Log update status (New Bar vs Update)
+        # Log update status (New Bar vs Update)
+        update_type = " [NEW]" if hasNewBar else " [UPD]"
+        log_msg = (f"[1-min bar]{update_type} {bar_time.strftime('%H:%M:%S')}{delay_indicator} | "
+                   f"O: {latest_row['open']:.2f} H: {latest_row['high']:.2f} L: {latest_row['low']:.2f} C: {latest_row['close']:.2f} | "
+                   f"Vol: {latest_row['volume']:,.0f}")
+        
+        if hasNewBar:
+            logging.info(log_msg)
+        else:
+            logging.debug(log_msg)
+
+    
+
     
         # Check if this bar completes a resampled period (for logging resampled bar)
         # Since we're receiving 5-second bars, we need to resample to target timeframe
@@ -1624,137 +1727,54 @@ def on_bar_update(bars, hasNewBar):
                 should_log_resampled = True
         elif strategy.timeframe > 1:
             # For multi-minute bars, log when minute % timeframe == 0 and second == 0
-            # This is when we receive the last 5-sec bar that completes the resampled period
-            if bar_time.minute % strategy.timeframe == 0 and bar_time.second == 0:
-                should_log_resampled = True
-    
+            # Trigger logging/checking only on NEW bars (Completed Periods)
+            # This avoids duplicate checks on intra-minute updates
+            if hasNewBar:
+                if strategy.timeframe == 1:
+                     should_log_resampled = True
+                elif strategy.timeframe > 1:
+                     # If the NEW bar starts a new N-minute chunk, the previous one ended
+                     if bar_time.minute % strategy.timeframe == 0:
+                         should_log_resampled = True
+
         update_indicators()
     
-        # Log resampled bar if timeframe > 1 and this bar completed a resampled period
-        # IMPORTANT: Only log if we actually have data up to (or very close to) the resampled bar timestamp
-        # This prevents logging incomplete resampled bars
-        if should_log_resampled and len(data) >= strategy.bb_length:
-            # Check if we have data up to the expected resampled bar timestamp
-            # For a 7-min bar, if current bar is at 12:08:00, we should have data up to 12:08:00
-            expected_resampled_time = bar_time.replace(second=0, microsecond=0)
-            # Allow up to 5 seconds of tolerance (one bar) - this handles the case where
-            # we receive the bar at 12:08:00 but the resampled bar timestamp is also 12:08:00
-            has_sufficient_data = len(data) > 0 and (data.index[-1] >= expected_resampled_time - pd.Timedelta(seconds=5))
-        
-            if has_sufficient_data:
-                # Get the resampled data (calculate_indicators is called in update_indicators, but we need it here for logging)
-                data_with_indicators = strategy.calculate_indicators(data.copy())
-                # Apply filters for entry criteria logging
-                data_with_filters = strategy.apply_filters(data_with_indicators)
-        
-                if len(data_with_indicators) > 0:
-                    latest_resampled_idx = data_with_indicators.index[-1]
-                    latest_resampled_row = data_with_indicators.iloc[-1]
-                    
-                    # Get the corresponding row from data_with_filters (for filter status)
-                    if len(data_with_filters) > 0 and latest_resampled_idx in data_with_filters.index:
-                        resampled_row_with_filters = data_with_filters.loc[latest_resampled_idx]
-                    else:
-                        # Fallback to data_with_indicators if filters not available
-                        resampled_row_with_filters = latest_resampled_row
+        # Log/Check Completed Bar
+        if should_log_resampled and len(data) >= max(2, strategy.bb_length):
+            
+            # Recalculate indicators to be safe (though update_indicators ran)
+            # We specifically want to access the COMPLETED bar at index -2
+            # (Because 'data' already contains the NEW bar at index -1)
+            data_with_indicators = strategy.calculate_indicators(data.copy())
+            data_with_filters = strategy.apply_filters(data_with_indicators)
+    
+            if len(data_with_indicators) >= 2:
+                # Select the COMPLETED bar (index -2) (The one that just finished)
+                latest_resampled_idx = data_with_indicators.index[-2]
+                latest_resampled_row = data_with_indicators.iloc[-2]
                 
-                    # Only log if we have data up to (or very close to) the resampled bar timestamp
-                    # This prevents logging incomplete resampled bars
-                    time_gap_to_resampled = (latest_resampled_idx - data.index[-1]).total_seconds()
-                    if time_gap_to_resampled > 60:  # More than 1 minute gap
-                        # Don't log - we don't have enough data for this resampled bar yet
-                        logging.debug(f"  Skipping resampled bar at {latest_resampled_idx} - only have data up to {data.index[-1]} (gap: {time_gap_to_resampled:.0f}s)")
-                        return
-            
-                # Calculate how many 5-sec bars were included in this resampled bar
-                # For a 7-minute bar, we need 7 minutes of 5-sec bars = 420 seconds / 5 = 84 bars
-                # The resampled bar at latest_resampled_idx represents data from (latest_resampled_idx - timeframe) to latest_resampled_idx
-                # With label='right' and closed='right', the bar at 11:54:00 includes data from 11:47:00 (exclusive) to 11:54:00 (inclusive)
-                # So we need bars from (11:47:00 + 5 seconds) to 11:54:00 (inclusive) = 84 bars
-                # Example: 11:47:05, 11:47:10, ..., 11:53:55, 11:54:00 = 84 bars
-                resample_start = latest_resampled_idx - pd.Timedelta(minutes=strategy.timeframe)
-                # With closed='right', the start time is exclusive, so we need bars AFTER resample_start
-                # The first bar included is resample_start + 5 seconds (the first 5-sec bar after the start)
-                resample_start_exclusive = resample_start + pd.Timedelta(seconds=5)
-            
-                # IMPORTANT: With label='right', the resampled bar timestamp (latest_resampled_idx) is the END of the period
-                # But we might not have data up to that exact timestamp yet. We need to find the actual
-                # last 5-second bar that was included in the resampling.
-                # The resampled bar at 12:08:00 should include bars from 12:01:00 (exclusive) to 12:08:00 (inclusive)
-                # But if the last 5-sec bar is only at 12:07:00, we only have 6 minutes of data
-            
-                # Find all bars that are <= latest_resampled_idx (the resampled bar end time)
-                available_bars_up_to_resampled = data[data.index <= latest_resampled_idx]
-            
-                if len(available_bars_up_to_resampled) == 0:
-                    # No bars available - shouldn't happen, but handle gracefully
-                    period_bars = pd.DataFrame()
+                # Get filters row (aligned with completed bar)
+                if len(data_with_filters) > 0 and latest_resampled_idx in data_with_filters.index:
+                     resampled_row_with_filters = data_with_filters.loc[latest_resampled_idx]
                 else:
-                    # Use the actual last 5-second bar timestamp as the end point
-                    actual_end_time = available_bars_up_to_resampled.index[-1]
-                
-                    # Check if we have enough data to reach the resampled bar timestamp
-                    time_gap_seconds = (latest_resampled_idx - actual_end_time).total_seconds()
-                    if time_gap_seconds > 10:  # More than 10 seconds gap
-                        # We're logging a resampled bar before we have all the data for it
-                        # This happens because we check at the start of the period, not the end
-                        logging.debug(f"  Note: Resampled bar timestamp ({latest_resampled_idx}) is {time_gap_seconds:.0f} seconds ahead of last 5-sec bar ({actual_end_time})")
-                
-                    # Get all bars in the resampled period (from resample_start_exclusive to actual_end_time)
-                    if resample_start_exclusive >= data.index[0]:
-                        # Get all bars in the range, including both endpoints
-                        period_bars = data.loc[resample_start_exclusive:actual_end_time]
-                    else:
-                        # If resample_start is before our data starts, use what we have
-                        period_bars = data.loc[:actual_end_time]
+                     resampled_row_with_filters = latest_resampled_row
             
-                num_bars = len(period_bars)
-            
-                # Expected number of bars: timeframe minutes * 60 seconds / 5 seconds per bar
-                expected_bars = (strategy.timeframe * 60) // 5
-            
-                # If we don't have enough history, the count will be less than expected
-                # This is normal during startup - the resampling still works correctly
-                if num_bars < expected_bars:
-                    # Calculate actual time span and log detailed debug info
-                    actual_start = period_bars.index[0] if len(period_bars) > 0 else None
-                    actual_end = period_bars.index[-1] if len(period_bars) > 0 else None
-                    if actual_start and actual_end:
-                        actual_span_minutes = (actual_end - actual_start).total_seconds() / 60
-                        logging.warning(f"  ⚠️ {strategy.timeframe}-min bar has {num_bars} bars (expected {expected_bars})")
-                        logging.warning(f"     Resampled bar time: {latest_resampled_idx}")
-                        logging.warning(f"     Calculated start: {resample_start}, exclusive start: {resample_start_exclusive}")
-                        logging.warning(f"     Actual period: {actual_start} to {actual_end} (span: {actual_span_minutes:.1f} min)")
-                        logging.warning(f"     Data range: {data.index[0]} to {data.index[-1]} (total: {len(data)} bars)")
-                        logging.warning(f"     Bars up to resampled time: {len(available_bars_up_to_resampled)}")
-            
-                # Always log the actual count (even if less than expected during startup)
-                if num_bars == expected_bars:
-                    bar_count_msg = f"sum of {num_bars} 5-sec bars"
-                else:
-                    bar_count_msg = f"sum of {num_bars} 5-sec bars (expected {expected_bars}, limited by available data)"
-                    # Log a debug message if the count doesn't match expected
-                    if num_bars == expected_bars + 1:
-                        # Common case: we're including the start boundary when we shouldn't
-                        logging.debug(f"  Note: Found {num_bars} bars (expected {expected_bars}) - likely including start boundary. Period: {resample_start} to {latest_resampled_idx}")
-                    else:
-                        logging.debug(f"  Note: Found {num_bars} bars, expected {expected_bars} for {strategy.timeframe}-min period (from {resample_start_exclusive} to {latest_resampled_idx})")
-            
+                # Log Bar Info (Simplified)
                 bar_info = f"[{strategy.timeframe}-min bar] {latest_resampled_idx.strftime('%H:%M:%S')} | " \
                            f"O: {latest_resampled_row.get('open', 0):.2f} H: {latest_resampled_row.get('high', 0):.2f} " \
                            f"L: {latest_resampled_row.get('low', 0):.2f} C: {latest_resampled_row.get('close', 0):.2f} | " \
-                           f"Vol: {latest_resampled_row.get('volume', 0):,.0f} ({bar_count_msg})"
+                           f"Vol: {latest_resampled_row.get('volume', 0):,.0f}"
                 logging.info(bar_info)
                 
-                # Log entry criteria status for this aggregated bar
+                # Log entry criteria status for this completed bar
                 entry_criteria = ""
-                if len(data) >= strategy.bb_length and 'upper' in data.columns:
+                if 'upper' in data.columns:
                     entry_criteria = log_entry_criteria_status(resampled_row_with_filters, data_with_filters)
                     
                     # Save to CSV for backtest comparison
                     save_live_data_row(latest_resampled_idx, resampled_row_with_filters, data_with_filters)
                     
-                    # Check entries using the RESAMPLED bar (essential for volume filters etc)
+                    # Check entries using the COMPLETED bar
                     check_entries(latest_resampled_idx, resampled_row_with_filters)
                 
                 # Store in bar_log for dashboard
@@ -1842,7 +1862,7 @@ def save_live_data_row(timestamp, row, full_df):
     Save a single row of resampled data (OHLCV + Indicators) to CSV.
     This creates a 'live_data.csv' file that matches the format expected by the backtester comparison tool.
     """
-    csv_file = 'live_data.csv'
+    csv_file = os.path.join(args.output_dir, 'live_data.csv')
     
     # Define columns to save (matching backtest output + useful debug info)
     columns = [
@@ -1896,14 +1916,27 @@ def save_live_data_row(timestamp, row, full_df):
     
     # Try to extract missing indicators from full_df if not in row
     # (row is just the latest Series, might be missing some columns if not in result of apply_filters)
-    if 'avg_volume' not in row_data and 'avg_volume' in full_df.columns:
+    # Try to extract missing indicators (prioritize 'row', then 'full_df')
+    # Use safe access to avoid KeyError if timestamp is slightly off in full_df index
+    
+    # 1. Volume MA
+    if 'avg_volume' in row:
+        row_data['volume_ma'] = row['avg_volume']
+    elif 'volume_ma' in row:
+        row_data['volume_ma'] = row['volume_ma']
+    elif timestamp in full_df.index and 'avg_volume' in full_df.columns:
         row_data['volume_ma'] = full_df.loc[timestamp, 'avg_volume']
-    elif 'volume_ma' not in row_data and 'volume_ma' in full_df.columns:
-        row_data['volume_ma'] = full_df.loc[timestamp, 'volume_ma']
-
-    if 'trend_ema' not in row_data and 'trend_ema' in full_df.columns:
+    
+    # 2. Trend EMA
+    if 'trend_ema' in row:
+        row_data['trend_ema'] = row['trend_ema']
+    elif timestamp in full_df.index and 'trend_ema' in full_df.columns:
         row_data['trend_ema'] = full_df.loc[timestamp, 'trend_ema']
-    if 'adx' not in row_data and 'adx' in full_df.columns:
+        
+    # 3. ADX
+    if 'adx' in row:
+        row_data['adx'] = row['adx']
+    elif timestamp in full_df.index and 'adx' in full_df.columns:
         row_data['adx'] = full_df.loc[timestamp, 'adx']
         
     try:
@@ -2033,7 +2066,12 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
         status_parts.append(f"Max Trades: {max_trades_status}")
         status_parts.append(f"RTH: {'✅' if in_rth else '❌'}")
         status_parts.append(f"ATR Filter: {'✅' if atr_filter else f'❌ ({atr_filter_val:.2f})'}")
-        status_parts.append(f"Vol Filter: {'✅' if volume_filter else f'❌ ({volume:,.0f} < {volume_threshold:,.0f})'}")
+        
+        # Vol Filter: Clearer message for failure (showing what triggered it)
+        # If failure (volume_filter is False), it means volume >= threshold (for max vol filter)
+        vol_fail_msg = f"❌ (Vol={volume:,.0f} > Max={volume_threshold:,.0f})"
+        status_parts.append(f"Vol Filter: {'✅' if volume_filter else vol_fail_msg}")
+        
         status_parts.append(f"Maintenance: {'❌' if in_maintenance else '✅'}")
         status_parts.append(f"Long: {'✅' if enter_long else '❌'} ({long_reason})")
         status_parts.append(f"Short: {'✅' if enter_short else '❌'} ({short_reason})")
@@ -2042,7 +2080,8 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
         if upper_bb > 0 and lower_bb > 0:
             pct_from_lower = ((current_price - lower_bb) / lower_bb * 100) if lower_bb > 0 else 0
             pct_from_upper = ((upper_bb - current_price) / upper_bb * 100) if upper_bb > 0 else 0
-            status_parts.append(f"BB: Lower={lower_bb:.2f} | Price={current_price:.2f} | Upper={upper_bb:.2f} | {pct_from_lower:+.2f}% from lower, {pct_from_upper:+.2f}% from upper")
+            # Increase precision to 4 decimals for tight bands
+            status_parts.append(f"BB: Lower={lower_bb:.2f} | Price={current_price:.2f} | Upper={upper_bb:.2f} | {pct_from_lower:+.4f}% from lower, {pct_from_upper:+.4f}% from upper")
         
         criteria_str = ' | '.join(status_parts)
         logging.info(f"  Entry Criteria: {criteria_str}")
@@ -2959,206 +2998,33 @@ def check_exits(idx, latest_row):
                                 tp_action = 'SELL' if dir_ == 1 else 'BUY'
                                 qty = abs(tp_order.totalQuantity) if hasattr(tp_order, 'totalQuantity') else 1
                                 
-                                # Create and place new TP order first
-                                new_tp_order = LimitOrder(
-                                    action=tp_action,
-                                    totalQuantity=qty,
-                                    lmtPrice=new_tp,
-                                    tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
-                                    transmit=True
-                                )
+                                # OPTION C: MODIFY EXISTING ORDER (Margin Safe)
+                                # Instead of creating a new order (which spikes margin), we modify the existing one
+                                # This is the standard professional way to update orders in IB
                                 
                                 try:
-                                    # Place new TP order
-                                    new_tp_trade = ib.placeOrder(contract, new_tp_order)
-                                    logging.info(f"Placed new TP order at {new_tp:.2f} (old TP: {current_tp:.2f})")
+                                    # 1. Update the PRICE of the existing order object
+                                    tp_order.lmtPrice = new_tp
                                     
-                                    # Wait for new order to be submitted and check status
-                                    ib.sleep(1.5)  # Give IB time to process
+                                    # 2. Ensure it's transmitted
+                                    tp_order.transmit = True
                                     
-                                    # Verify new TP order is active
-                                    new_tp_active = False
-                                    new_tp_trade_obj = None
+                                    # 3. Place the modified order (IB API treats same object/ID as modification)
+                                    ib.placeOrder(contract, tp_order)
                                     
-                                    # Method 1: Use the trade object returned by placeOrder
-                                    if new_tp_trade and new_tp_trade.order:
-                                        new_tp_trade_obj = new_tp_trade
-                                        if new_tp_trade.isActive() or (new_tp_trade.orderStatus and 
-                                            new_tp_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                            new_tp_active = True
-                                            if hasattr(new_tp_trade.order, 'permId') and new_tp_trade.order.permId != 0:
-                                                new_tp_order.permId = new_tp_trade.order.permId
-                                            if hasattr(new_tp_trade.order, 'orderId') and new_tp_trade.order.orderId != 0:
-                                                new_tp_order.orderId = new_tp_trade.order.orderId
+                                    logging.info(f"Updated TP order price to {new_tp:.2f} (Modified existing order)")
+                                    dashboard_stats['orders_modified'] = dashboard_stats.get('orders_modified', 0) + 1
+                                    add_to_live_tracker('order', f"Opposite BB TP Modified: New Target ${new_tp:.2f}")
                                     
-                                    # Method 2: Find by permId if available
-                                    if not new_tp_active and hasattr(new_tp_order, 'permId') and new_tp_order.permId != 0:
-                                        for trade in ib.trades():
-                                            if (trade.contract.conId == contract.conId and 
-                                                trade.order.permId == new_tp_order.permId):
-                                                new_tp_trade_obj = trade
-                                                if trade.isActive() or (trade.orderStatus and 
-                                                    trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                                    new_tp_active = True
-                                                break
+                                    # Brief sleep to ensure API processes the update
+                                    ib.sleep(0.5)
                                     
-                                    # Method 3: Find by matching characteristics
-                                    if not new_tp_active:
-                                        for trade in ib.trades():
-                                            if (trade.contract.conId == contract.conId and 
-                                                isinstance(trade.order, LimitOrder) and
-                                                trade.order.action == tp_action and
-                                                abs(getattr(trade.order, 'lmtPrice', 0) - new_tp) < 0.01):
-                                                new_tp_trade_obj = trade
-                                                if trade.isActive() or (trade.orderStatus and 
-                                                    trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                                    new_tp_active = True
-                                                    if hasattr(trade.order, 'permId') and trade.order.permId != 0:
-                                                        new_tp_order.permId = trade.order.permId
-                                                    if hasattr(trade.order, 'orderId') and trade.order.orderId != 0:
-                                                        new_tp_order.orderId = trade.order.orderId
-                                                break
-                                    
-                                    if new_tp_active:
-                                        # CRITICAL: Before cancelling old TP, check if it has a parentId
-                                        # If it does, cancelling it will also cancel the stop loss (they're in a bracket)
-                                        # We need to recreate the stop loss as standalone first
-                                        old_tp_has_parent = hasattr(tp_order, 'parentId') and tp_order.parentId != 0
-                                        
-                                        if old_tp_has_parent:
-                                            # Old TP is part of a bracket - cancelling it will cancel the stop loss too
-                                            # Recreate stop loss as standalone order first
-                                            stop_order = bracket.get('stopLoss')
-                                            if stop_order:
-                                                stop_price = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0))
-                                                if stop_price > 0:
-                                                    logging.info(f"Old TP has parentId - recreating stop loss as standalone before cancelling TP")
-                                                    stop_action = 'SELL' if dir_ == 1 else 'BUY'
-                                                    stop_qty = abs(stop_order.totalQuantity) if hasattr(stop_order, 'totalQuantity') else qty
-                                                    
-                                                    # Create new standalone stop order
-                                                    new_stop_order = StopOrder(
-                                                        action=stop_action,
-                                                        totalQuantity=stop_qty,
-                                                        stopPrice=stop_price,
-                                                        tif='GTC',
-                                                        transmit=True  # Standalone, no parent
-                                                    )
-                                                    
-                                                    try:
-                                                        new_stop_trade = ib.placeOrder(contract, new_stop_order)
-                                                        ib.sleep(1.0)  # Wait for submission
-                                                        
-                                                        # Verify new stop is active
-                                                        new_stop_active = False
-                                                        if new_stop_trade and new_stop_trade.order:
-                                                            if new_stop_trade.isActive() or (new_stop_trade.orderStatus and 
-                                                                new_stop_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                                                new_stop_active = True
-                                                                if hasattr(new_stop_trade.order, 'permId') and new_stop_trade.order.permId != 0:
-                                                                    new_stop_order.permId = new_stop_trade.order.permId
-                                                        
-                                                        if new_stop_active:
-                                                            # Update bracket with new standalone stop
-                                                            bracket['stopLoss'] = new_stop_order
-                                                            logging.info(f"Recreated stop loss as standalone order at {stop_price:.2f}")
-                                                            # Stop loss recreation succeeded, proceed with TP cancellation
-                                                            # Now safe to cancel old TP (stop loss is protected)
-                                                            try:
-                                                                ib.cancelOrder(tp_order)
-                                                                ib.sleep(0.5)
-                                                                logging.info(f"Cancelled old TP order at {current_tp:.2f}")
-                                                            except Exception as e:
-                                                                logging.warning(f"Error cancelling old TP order (new one is active): {e}")
-                                                                # Check if old order was auto-cancelled by IB
-                                                                old_tp_still_active = False
-                                                                for trade in ib.trades():
-                                                                    if (trade.order.permId == tp_order.permId and 
-                                                                        trade.isActive() and 
-                                                                        trade.contract.conId == contract.conId):
-                                                                        old_tp_still_active = True
-                                                                        break
-                                                                if not old_tp_still_active:
-                                                                    logging.info("Old TP order was automatically cancelled by IB")
-                                                            
-                                                            # Update the bracket with the new TP order
-                                                            bracket['takeProfit'] = new_tp_order
-                                                            logging.info(f"Successfully updated opposite BB TP to {new_tp:.2f}")
-                                                        else:
-                                                            logging.warning(f"Failed to recreate stop loss - new order not active. Aborting TP update.")
-                                                            # Abort TP update - cancel new TP order
-                                                            try:
-                                                                if new_tp_trade_obj:
-                                                                    ib.cancelOrder(new_tp_order)
-                                                            except:
-                                                                pass
-                                                    except Exception as stop_err:
-                                                        logging.error(f"Error recreating stop loss: {stop_err}")
-                                                        # Don't cancel old TP if we can't protect the stop
-                                                        logging.warning(f"Aborting TP update - cannot protect stop loss")
-                                                        try:
-                                                            if new_tp_trade_obj:
-                                                                ib.cancelOrder(new_tp_order)
-                                                        except:
-                                                            pass
-                                                        # Skip TP update - don't cancel old TP
-                                                else:
-                                                    logging.warning(f"Cannot recreate stop loss - stop price not found")
-                                                    # Abort TP update
-                                                    try:
-                                                        if new_tp_trade_obj:
-                                                            ib.cancelOrder(new_tp_order)
-                                                    except:
-                                                        pass
-                                            else:
-                                                logging.warning(f"Cannot recreate stop loss - stop order not found in bracket")
-                                                # Abort TP update
-                                                try:
-                                                    if new_tp_trade_obj:
-                                                        ib.cancelOrder(new_tp_order)
-                                                except:
-                                                    pass
-                                        else:
-                                            # Old TP doesn't have parentId - safe to cancel directly
-                                            try:
-                                                ib.cancelOrder(tp_order)
-                                                ib.sleep(0.5)
-                                                logging.info(f"Cancelled old TP order at {current_tp:.2f}")
-                                            except Exception as e:
-                                                logging.warning(f"Error cancelling old TP order (new one is active): {e}")
-                                                # Check if old order was auto-cancelled by IB
-                                                old_tp_still_active = False
-                                                for trade in ib.trades():
-                                                    if (trade.order.permId == tp_order.permId and 
-                                                        trade.isActive() and 
-                                                        trade.contract.conId == contract.conId):
-                                                        old_tp_still_active = True
-                                                        break
-                                                if not old_tp_still_active:
-                                                    logging.info("Old TP order was automatically cancelled by IB")
-                                            
-                                            # Update the bracket with the new TP order
-                                            bracket['takeProfit'] = new_tp_order
-                                            logging.info(f"Successfully updated opposite BB TP to {new_tp:.2f}")
-                                    else:
-                                        if new_tp_trade_obj:
-                                            status = new_tp_trade_obj.orderStatus.status if new_tp_trade_obj.orderStatus else "Unknown"
-                                            logging.warning(f"New TP order status: {status}. Keeping old TP active.")
-                                        else:
-                                            logging.warning(f"New TP order not found in trades. Keeping old TP active.")
-                                        
-                                        try:
-                                            if new_tp_trade_obj:
-                                                ib.cancelOrder(new_tp_order)
-                                        except:
-                                            pass
-                                        # Old TP order remains active as fallback
-                                        
                                 except Exception as e:
-                                    logging.error(f"Failed to update opposite BB TP: {e}")
-                                    import traceback
-                                    logging.error(f"Traceback: {traceback.format_exc()}")
-                                    # Old TP order remains active as fallback
+                                    logging.error(f"Failed to modify TP order: {e}")
+                                    logging.error(traceback.format_exc())
+                                    # Fallback: Do nothing, keep old TP active
+
+
                             else:
                                 logging.warning(f"TP order not active, skipping opposite BB TP update")
                         else:
@@ -3960,7 +3826,7 @@ def ensure_connected_and_subscribed():
     bars = ib.reqHistoricalData(
         contract,
         endDateTime='',
-        durationStr='1 D',
+        durationStr='4 D', # Increased to 4 D to ensure sufficient history (e.g. 155 Vol MA) even on Sunday evenings
         barSizeSetting='1 min',  # Using 1-minute bars to match Historical Data (Backtest) Resolution
         whatToShow='TRADES',
         useRTH=False,
@@ -4066,7 +3932,7 @@ async def main():
     
     try:
         # Connect with retry logic
-        await connect_with_retry('127.0.0.1', 7497, base_client_id=100)
+        await connect_with_retry('127.0.0.1', args.port, base_client_id=args.client_id)
         
         # Track connection start
         connection_start_time = datetime.now()
@@ -4136,7 +4002,7 @@ async def main():
                     dashboard_stats['reconnections'] += 1
                     
                     logging.warning("Connection lost, reconnecting...")
-                    await connect_with_retry('127.0.0.1', 7497, base_client_id=100)
+                    await connect_with_retry('127.0.0.1', args.port, base_client_id=args.client_id)
                     
                     # Track reconnection
                     connection_start_time = datetime.now()

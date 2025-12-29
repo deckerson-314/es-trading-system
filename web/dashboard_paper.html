@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>IB Deployment Live Dashboard</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
+        h2 { color: #555; margin-top: 30px; border-bottom: 2px solid #ddd; padding-bottom: 5px; }
+        h3 { color: #666; margin-top: 20px; }
+        .status-bar { background: #4CAF50; color: white; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .status-bar.disconnected { background: #f44336; }
+        .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
+        .metric-box { background: #e3f2fd; border-left: 4px solid #2196F3; padding: 15px; border-radius: 4px; }
+        .metric-box .label { font-size: 0.9em; color: #666; }
+        .metric-box .value { font-size: 1.5em; font-weight: bold; color: #2196F3; margin-top: 5px; }
+        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        th { background: #4CAF50; color: white; padding: 10px; text-align: left; }
+        td { padding: 8px; border: 1px solid #ddd; }
+        tr:nth-child(even) { background: #f9f9f9; }
+        .positive { color: green; font-weight: bold; }
+        .negative { color: red; font-weight: bold; }
+        .live-tracker { max-height: 400px; overflow-y: auto; background: #f9f9f9; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }
+        .live-tracker .entry { padding: 5px; margin: 2px 0; border-left: 3px solid #ddd; }
+        .live-tracker .entry.info { border-left-color: #2196F3; }
+        .live-tracker .entry.warning { border-left-color: #FF9800; }
+        .live-tracker .entry.error { border-left-color: #f44336; }
+        .live-tracker .entry.trade { border-left-color: #4CAF50; }
+        .live-tracker .entry.order { border-left-color: #9C27B0; }
+        .error-log { max-height: 300px; overflow-y: auto; background: #ffebee; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.85em; }
+        .error-entry { padding: 5px; margin: 2px 0; color: #c62828; }
+        .bar-log-container { margin: 20px 0; }
+        .bar-log-scroll { max-height: 500px; overflow-y: auto; background: #f5f5f5; padding: 10px; border-radius: 4px; border: 1px solid #ddd; font-family: monospace; font-size: 0.85em; }
+        .bar-log-entry { padding: 8px; margin: 5px 0; background: white; border-left: 3px solid #2196F3; border-radius: 3px; }
+        .bar-log-timestamp { font-weight: bold; color: #2196F3; margin-bottom: 3px; }
+        .bar-log-info { color: #333; margin-bottom: 3px; }
+        .bar-log-criteria { color: #666; font-size: 0.9em; padding-left: 10px; }
+        .params-section { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .params-group { background: #f9f9f9; padding: 15px; border-radius: 4px; }
+        .params-group h3 { margin-top: 0; color: #555; border-bottom: 1px solid #ddd; padding-bottom: 5px; }
+        .params-table { width: 100%; font-size: 0.9em; }
+        .params-table td { padding: 5px; }
+        .return-button { display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+        .return-button:hover { background: #5568d3; }
+        
+        /* Tooltip Styles */
+        .tooltip { position: relative; border-bottom: 1px dotted #fff; cursor: help; }
+        .tooltip:hover::after {
+            content: attr(data-tooltip);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #333;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            white-space: pre-wrap;
+            width: 250px;
+            text-align: center;
+            z-index: 1000;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        .tooltip:hover::before { /* Arrow */
+            content: '';
+            position: absolute;
+            top: -5px;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="index.html" class="return-button">← Back to Main Dashboard</a>
+        <h1>IB Deployment Dashboard [PAPER] (Port: 7497) <span style="font-size: 0.8em; color: #aaa;">ESH6</span></h1>
+        <p><strong>Last Updated:</strong> 2025-12-29 10:17:16</p>
+        
+        <div class="status-bar ">
+            <h2 style="margin: 0; color: white;">Connection Status: CONNECTED</h2>
+            <p style="margin: 5px 0 0 0;">
+                <strong>Total Uptime:</strong> 32h 56m | 
+                <strong>Current Session:</strong> 1h 10m |
+                <strong>Reconnections:</strong> 4822
+            </p>
+        </div>
+        
+        <h2>Account & Market Summary</h2>
+        <div class="metric-grid">
+            <div class="metric-box">
+                <div class="label">Contract</div>
+                <div class="value">ESH6</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Net Liquidation</div>
+                <div class="value">$0.00</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Unrealized PNL</div>
+                <div class="value positive">
+                    $0.00
+                </div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Realized PNL</div>
+                <div class="value negative">
+                    $-604.50
+                </div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Current Price</div>
+                <div class="value">$6950.50</div>
+            </div>
+             <div class="metric-box">
+                <div class="label">Bar Volume (2m)</div>
+                <div class="value">4,666</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Open ES Positions</div>
+                <div class="value">0</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Total Cash</div>
+                <div class="value">$831,139.70</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Buying Power</div>
+                <div class="value">$4,018,010.80</div>
+            </div>
+        </div>
+        
+        <h2>Active Positions</h2>
+        <p><em>No open positions</em></p>
+
+        <h2>Active Orders</h2>
+        <p><em>No active orders</em></p>
+
+        <h2>Completed Trades (Session)</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th class="tooltip" data-tooltip="Trade Exit Time">Exit Time</th>
+                    <th class="tooltip" data-tooltip="Long or Short">Type</th>
+                    <th class="tooltip" data-tooltip="Quantity">Qty</th>
+                    <th class="tooltip" data-tooltip="Entry Price">Entry</th>
+                    <th class="tooltip" data-tooltip="Exit Price">Exit</th>
+                    <th class="tooltip" data-tooltip="Realized Profit/Loss">PnL ($)</th>
+                    <th class="tooltip" data-tooltip="Performance Efficiency&#10;PnL / Initial Risk">R-Multiple</th>
+                    <th class="tooltip" data-tooltip="Trade Duration">Duration</th>
+                    <th class="tooltip" data-tooltip="Reason for Exit">Reason</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>09:45:01</td>
+                    <td>SHORT</td>
+                    <td>1.0</td>
+                    <td>$6946.50</td>
+                    <td>$6958.50</td>
+                    <td class="negative">$-600.00</td>
+                    <td class=""><strong>N/A</strong></td>
+                    <td>0:18:52</td>
+                    <td>Live Fill</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h2>Statistics</h2>
+        <div class="metric-grid">
+            <div class="metric-box">
+                <div class="label">Trades Opened</div>
+                <div class="value">1</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Trades Closed</div>
+                <div class="value">0</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Orders Placed</div>
+                <div class="value">3</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Orders Filled</div>
+                <div class="value">0</div>
+            </div>
+            <div class="metric-box">
+                <div class="label">Orders Cancelled</div>
+                <div class="value">0</div>
+            </div>
+        </div>
+        
+        <h2>Recent Errors</h2>
+        <div class="error-log">
+            <div class="error-entry">
+                <strong>2025-12-29 08:58:46</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 08:59:09</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 08:59:33</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 08:59:56</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:00:19</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:00:42</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:01:06</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:01:29</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:01:52</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:02:15</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:02:39</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:03:02</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:03:25</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:03:48</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:04:12</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:04:35</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:04:58</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:05:21</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:05:45</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="error-entry">
+                <strong>2025-12-29 09:06:08</strong>: Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+        </div>
+
+        <h2>Bar Log & Entry Criteria</h2>
+        <div class="bar-log-container">
+            <div class="bar-log-scroll">
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:14:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:14:00 | O: 6946.75 H: 6947.00 L: 6943.50 C: 6946.25 | Vol: 4,666</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (4.75) | Vol Filter: ❌ (Vol=4,666 > Max=4,282) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=4.75)) | Short: ❌ (ATR filter failed (ATR=4.75)) | BB: Lower=6945.62 | Price=6946.25 | Upper=6949.08 | +0.0090% from lower, +0.0407% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:12:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:12:00 | O: 6947.50 H: 6947.50 L: 6943.50 C: 6947.00 | Vol: 5,861</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.07) | Vol Filter: ❌ (Vol=5,861 > Max=4,199) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.07)) | Short: ❌ (ATR filter failed (ATR=5.07)) | BB: Lower=6946.01 | Price=6947.00 | Upper=6949.89 | +0.0142% from lower, +0.0415% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:10:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:10:00 | O: 6947.75 H: 6949.25 L: 6944.00 C: 6947.50 | Vol: 6,978</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.11) | Vol Filter: ❌ (Vol=6,978 > Max=4,096) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.11)) | Short: ❌ (ATR filter failed (ATR=5.11)) | BB: Lower=6945.17 | Price=6947.50 | Upper=6952.53 | +0.0336% from lower, +0.0724% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:08:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:08:00 | O: 6948.25 H: 6949.25 L: 6946.00 C: 6947.75 | Vol: 4,845</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.05) | Vol Filter: ❌ (Vol=4,845 > Max=3,974) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.05)) | Short: ❌ (ATR filter failed (ATR=5.05)) | BB: Lower=6944.44 | Price=6947.75 | Upper=6955.76 | +0.0476% from lower, +0.1151% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:06:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:06:00 | O: 6949.25 H: 6951.50 L: 6947.25 C: 6948.25 | Vol: 5,678</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.18) | Vol Filter: ❌ (Vol=5,678 > Max=3,888) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.18)) | Short: ❌ (ATR filter failed (ATR=5.18)) | BB: Lower=6945.60 | Price=6948.25 | Upper=6955.40 | +0.0382% from lower, +0.1029% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:04:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:04:00 | O: 6951.25 H: 6951.75 L: 6948.50 C: 6949.25 | Vol: 4,277</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.18) | Vol Filter: ❌ (Vol=4,277 > Max=3,788) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.18)) | Short: ❌ (ATR filter failed (ATR=5.18)) | BB: Lower=6946.93 | Price=6949.25 | Upper=6956.07 | +0.0333% from lower, +0.0980% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:02:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:02:00 | O: 6954.00 H: 6954.25 L: 6950.75 C: 6951.50 | Vol: 4,583</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.73) | Vol Filter: ❌ (Vol=4,583 > Max=3,713) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.73)) | Short: ❌ (ATR filter failed (ATR=5.73)) | BB: Lower=6948.50 | Price=6951.50 | Upper=6956.20 | +0.0432% from lower, +0.0676% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">10:00:00</div>
+                    <div class="bar-log-info">[2-min bar] 10:00:00 | O: 6949.75 H: 6954.00 L: 6948.50 C: 6953.75 | Vol: 4,746</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.71) | Vol Filter: ❌ (Vol=4,746 > Max=3,636) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.71)) | Short: ❌ (ATR filter failed (ATR=5.71)) | BB: Lower=6948.85 | Price=6953.75 | Upper=6956.25 | +0.0705% from lower, +0.0359% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:58:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:58:00 | O: 6953.25 H: 6954.75 L: 6949.75 C: 6949.75 | Vol: 3,611</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.84) | Vol Filter: ❌ (Vol=3,611 > Max=3,556) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.84)) | Short: ❌ (ATR filter failed (ATR=5.84)) | BB: Lower=6948.31 | Price=6949.75 | Upper=6957.39 | +0.0207% from lower, +0.1098% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:56:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:56:00 | O: 6953.75 H: 6955.25 L: 6952.00 C: 6953.25 | Vol: 4,852</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.88) | Vol Filter: ❌ (Vol=4,852 > Max=3,495) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.88)) | Short: ❌ (ATR filter failed (ATR=5.88)) | BB: Lower=6950.49 | Price=6953.25 | Upper=6956.11 | +0.0398% from lower, +0.0412% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:54:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:54:00 | O: 6952.50 H: 6957.50 L: 6951.25 C: 6953.50 | Vol: 6,012</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.79) | Vol Filter: ❌ (Vol=6,012 > Max=3,409) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.79)) | Short: ❌ (ATR filter failed (ATR=5.79)) | BB: Lower=6949.67 | Price=6953.50 | Upper=6958.23 | +0.0551% from lower, +0.0680% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:52:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:52:00 | O: 6955.25 H: 6955.50 L: 6950.25 C: 6952.50 | Vol: 7,907</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.54) | Vol Filter: ❌ (Vol=7,907 > Max=3,302) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.54)) | Short: ❌ (ATR filter failed (ATR=5.54)) | BB: Lower=6947.73 | Price=6952.50 | Upper=6962.87 | +0.0686% from lower, +0.1489% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:50:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:50:00 | O: 6951.75 H: 6958.25 L: 6951.25 C: 6955.25 | Vol: 7,639</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (5.32) | Vol Filter: ❌ (Vol=7,639 > Max=3,160) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=5.32)) | Short: ❌ (ATR filter failed (ATR=5.32)) | BB: Lower=6947.91 | Price=6955.25 | Upper=6966.69 | +0.1056% from lower, +0.1641% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:48:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:48:00 | O: 6956.50 H: 6959.00 L: 6951.75 C: 6952.00 | Vol: 8,960</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (4.96) | Vol Filter: ❌ (Vol=8,960 > Max=3,022) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=4.96)) | Short: ❌ (ATR filter failed (ATR=4.96)) | BB: Lower=6948.41 | Price=6952.00 | Upper=6969.29 | +0.0516% from lower, +0.2481% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:46:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:46:00 | O: 6960.25 H: 6960.25 L: 6952.25 C: 6956.50 | Vol: 10,656</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (4.62) | Vol Filter: ❌ (Vol=10,656 > Max=2,864) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=4.62)) | Short: ❌ (ATR filter failed (ATR=4.62)) | BB: Lower=6954.48 | Price=6956.50 | Upper=6968.02 | +0.0291% from lower, +0.1653% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:44:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:44:00 | O: 6962.50 H: 6962.50 L: 6958.00 C: 6960.25 | Vol: 4,944</div>
+                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (4.27) | Vol Filter: ❌ (Vol=4,944 > Max=2,680) | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=4.27)) | Short: ❌ (ATR filter failed (ATR=4.27)) | BB: Lower=6958.52 | Price=6960.25 | Upper=6967.68 | +0.0248% from lower, +0.1066% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:42:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:42:00 | O: 6963.00 H: 6963.50 L: 6959.00 C: 6962.50 | Vol: 8,237</div>
+                    <div class="bar-log-criteria">Max Trades: ❌ (1/1) | RTH: ✅ | ATR Filter: ❌ (4.46) | Vol Filter: ❌ (Vol=8,237 > Max=2,594) | Maintenance: ✅ | Long: ❌ (Max trades limit (1/1)) | Short: ❌ (Max trades limit (1/1)) | BB: Lower=6953.85 | Price=6962.50 | Upper=6970.65 | +0.1244% from lower, +0.1169% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:40:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:40:00 | O: 6964.25 H: 6965.75 L: 6960.75 C: 6963.00 | Vol: 7,230</div>
+                    <div class="bar-log-criteria">Max Trades: ❌ (1/1) | RTH: ✅ | ATR Filter: ❌ (4.36) | Vol Filter: ❌ (Vol=7,230 > Max=2,448) | Maintenance: ✅ | Long: ❌ (Max trades limit (1/1)) | Short: ❌ (Max trades limit (1/1)) | BB: Lower=6948.52 | Price=6963.00 | Upper=6972.48 | +0.2084% from lower, +0.1359% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:38:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:38:00 | O: 6965.75 H: 6967.75 L: 6963.50 C: 6964.00 | Vol: 14,012</div>
+                    <div class="bar-log-criteria">Max Trades: ❌ (1/1) | RTH: ✅ | ATR Filter: ❌ (4.11) | Vol Filter: ❌ (Vol=14,012 > Max=2,320) | Maintenance: ✅ | Long: ❌ (Max trades limit (1/1)) | Short: ❌ (Max trades limit (1/1)) | BB: Lower=6944.45 | Price=6964.00 | Upper=6972.25 | +0.2815% from lower, +0.1183% from upper</div>
+                </div>
+                <div class="bar-log-entry">
+                    <div class="bar-log-timestamp">09:36:00</div>
+                    <div class="bar-log-info">[2-min bar] 09:36:00 | O: 6956.25 H: 6965.75 L: 6954.75 C: 6965.75 | Vol: 10,097</div>
+                    <div class="bar-log-criteria">Max Trades: ❌ (1/1) | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ❌ (Vol=10,097 > Max=2,066) | Maintenance: ✅ | Long: ❌ (Max trades limit (1/1)) | Short: ❌ (Max trades limit (1/1)) | BB: Lower=6940.39 | Price=6965.75 | Upper=6970.01 | +0.3654% from lower, +0.0611% from upper</div>
+                </div>
+            </div>
+        </div>
+        
+        <h2>Strategy Parameters</h2>
+        <div class="params-section">
+            <div class="params-group">
+                <h3>Entry Criteria</h3>
+                <table class="params-table">
+                    <tr>
+                        <td><strong>ATR Length for Filter</strong></td>
+                        <td>14</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Bollinger Band Length</strong></td>
+                        <td>5</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Bollinger Band StdDev</strong></td>
+                        <td>2.2650</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Enable Long Trades</strong></td>
+                        <td>True</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Enable RTH Filter</strong></td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Enable Short Trades</strong></td>
+                        <td>True</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Long Entry on Body in Zone</strong></td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Long Entry on Wick Touch</strong></td>
+                        <td>1</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Long Trigger (% From Lower Band)</strong></td>
+                        <td>0.0000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Max ATR Filter (Points)</strong></td>
+                        <td>4.0189</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Max Open Trades</strong></td>
+                        <td>1</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Max Volume Multiplier</strong></td>
+                        <td>2.8447</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Min ATR Filter (Points)</strong></td>
+                        <td>1.4812</td>
+                    </tr>
+                    <tr>
+                        <td><strong>RTH End (HH:MM)</strong></td>
+                        <td>16:00</td>
+                    </tr>
+                    <tr>
+                        <td><strong>RTH Start (HH:MM)</strong></td>
+                        <td>09:30</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Short Entry on Body in Zone</strong></td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Short Entry on Wick Touch</strong></td>
+                        <td>1</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Short Trigger (% From Upper Band)</strong></td>
+                        <td>0.0000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Timeframe (minutes)</strong></td>
+                        <td>2</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Volume MA Length</strong></td>
+                        <td>155</td>
+                    </tr>
+                </table>
+            </div>
+            <div class="params-group">
+                <h3>Take Profit Criteria</h3>
+                <table class="params-table">
+                    <tr>
+                        <td><strong>ATR Length for TP</strong></td>
+                        <td>18</td>
+                    </tr>
+                    <tr>
+                        <td><strong>ATR Multiplier for TP</strong></td>
+                        <td>2.3233</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Fixed ATR TP</strong></td>
+                        <td>False</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Fixed BB at Entry TP</strong></td>
+                        <td>False</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Opposite Bollinger Band TP</strong></td>
+                        <td>True</td>
+                    </tr>
+                </table>
+            </div>
+            <div class="params-group">
+                <h3>Stop Loss Criteria</h3>
+                <table class="params-table">
+                    <tr>
+                        <td><strong>ATR Length for Trailing Stop</strong></td>
+                        <td>56</td>
+                    </tr>
+                    <tr>
+                        <td><strong>ATR Multiplier for Trailing Stop</strong></td>
+                        <td>0.5114</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Enable Trailing Stop</strong></td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Initial Stop Loss (%)</strong></td>
+                        <td>0.5000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Trailing Delay (bars)</strong></td>
+                        <td>18</td>
+                    </tr>
+                </table>
+            </div>
+            <div class="params-group">
+                <h3>GA Criteria</h3>
+                <table class="params-table">
+                    <tr>
+                        <td><strong>CX_PB</strong></td>
+                        <td>0.7000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>DATA_SIZE</strong></td>
+                        <td>0</td>
+                    </tr>
+                    <tr>
+                        <td><strong>DATA_SPLITS</strong></td>
+                        <td>0.6500</td>
+                    </tr>
+                    <tr>
+                        <td><strong>DD_WEIGHT</strong></td>
+                        <td>0.5000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MIN_TRADES_DAY</strong></td>
+                        <td>2.0000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MIN_TRADES_PEN_WEIGHT</strong></td>
+                        <td>-500.0000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MUT_MU</strong></td>
+                        <td>0.0000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MUT_PB</strong></td>
+                        <td>0.4000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>MUT_SIGMA</strong></td>
+                        <td>0.2500</td>
+                    </tr>
+                    <tr>
+                        <td><strong>NUM_GEN</strong></td>
+                        <td>100</td>
+                    </tr>
+                    <tr>
+                        <td><strong>NUM_SPLIT_PERIODS</strong></td>
+                        <td>5</td>
+                    </tr>
+                    <tr>
+                        <td><strong>POP_SIZE</strong></td>
+                        <td>150</td>
+                    </tr>
+                    <tr>
+                        <td><strong>TARGET_TRADES_DAY</strong></td>
+                        <td>5</td>
+                    </tr>
+                    <tr>
+                        <td><strong>TRADES_PENALTY_WEIGHT</strong></td>
+                        <td>0.3000</td>
+                    </tr>
+                    <tr>
+                        <td><strong>USE_INTERLEAVED_SPLIT</strong></td>
+                        <td>True</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+        
+        <h2>Live Event Tracker</h2>
+        <div class="live-tracker">
+            <div class="entry error">
+                <strong>2025-12-29 09:00:42</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:00:47</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:01:06</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:01:11</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:01:29</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:01:34</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:01:52</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:01:57</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:02:15</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:02:20</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:02:39</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:02:44</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:03:02</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:03:07</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:03:25</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:03:30</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:03:48</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:03:53</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:04:12</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:04:17</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:04:35</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:04:40</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:04:58</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:05:03</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:05:21</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:05:26</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:05:45</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:05:50</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry error">
+                <strong>2025-12-29 09:06:08</strong> [ERROR] Error in main loop: [WinError 1225] The remote computer refused the network connection
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:06:13</strong> [WARNING] Connection lost - attempting reconnection
+            </div>
+            <div class="entry info">
+                <strong>2025-12-29 09:06:46</strong> [INFO] Reconnected to Interactive Brokers API
+            </div>
+            <div class="entry warning">
+                <strong>2025-12-29 09:06:48</strong> [WARNING] Data Stalled - Forcing Restart
+            </div>
+            <div class="entry trade">
+                <strong>2025-12-29 09:26:08</strong> [TRADE] TRADE OPEN: SHORT 1 @ $6944.75, SL: $6979.50, TP: $6943.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:26:10</strong> [ORDER] Opposite BB TP Modified: New Target $6943.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:26:15</strong> [ORDER] Opposite BB TP Modified: New Target $6942.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:26:30</strong> [ORDER] Opposite BB TP Modified: New Target $6942.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:26:35</strong> [ORDER] Opposite BB TP Modified: New Target $6942.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:26:50</strong> [ORDER] Opposite BB TP Modified: New Target $6943.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:27:00</strong> [ORDER] Opposite BB TP Modified: New Target $6942.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:28:10</strong> [ORDER] Opposite BB TP Modified: New Target $6942.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:28:15</strong> [ORDER] Opposite BB TP Modified: New Target $6942.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:28:40</strong> [ORDER] Opposite BB TP Modified: New Target $6942.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:28:55</strong> [ORDER] Opposite BB TP Modified: New Target $6942.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:05</strong> [ORDER] Opposite BB TP Modified: New Target $6943.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:10</strong> [ORDER] Opposite BB TP Modified: New Target $6942.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:15</strong> [ORDER] Opposite BB TP Modified: New Target $6943.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:20</strong> [ORDER] Opposite BB TP Modified: New Target $6943.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:25</strong> [ORDER] Opposite BB TP Modified: New Target $6942.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:29</strong> [ORDER] Opposite BB TP Modified: New Target $6943.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:35</strong> [ORDER] Opposite BB TP Modified: New Target $6942.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:40</strong> [ORDER] Opposite BB TP Modified: New Target $6942.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:45</strong> [ORDER] Opposite BB TP Modified: New Target $6942.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:50</strong> [ORDER] Opposite BB TP Modified: New Target $6942.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:30:55</strong> [ORDER] Opposite BB TP Modified: New Target $6941.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:31:00</strong> [ORDER] Opposite BB TP Modified: New Target $6941.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:32:05</strong> [ORDER] Opposite BB TP Modified: New Target $6940.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:32:10</strong> [ORDER] Opposite BB TP Modified: New Target $6940.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:32:15</strong> [ORDER] Opposite BB TP Modified: New Target $6940.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:32:25</strong> [ORDER] Opposite BB TP Modified: New Target $6941.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:32:30</strong> [ORDER] Opposite BB TP Modified: New Target $6940.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:32:50</strong> [ORDER] Opposite BB TP Modified: New Target $6940.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:32:55</strong> [ORDER] Opposite BB TP Modified: New Target $6941.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:33:00</strong> [ORDER] Opposite BB TP Modified: New Target $6941.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:34:05</strong> [ORDER] Opposite BB TP Modified: New Target $6943.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:34:20</strong> [ORDER] Opposite BB TP Modified: New Target $6943.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:34:25</strong> [ORDER] Opposite BB TP Modified: New Target $6943.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:34:35</strong> [ORDER] Opposite BB TP Modified: New Target $6943.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:34:45</strong> [ORDER] Opposite BB TP Modified: New Target $6943.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:34:50</strong> [ORDER] Opposite BB TP Modified: New Target $6943.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:35:00</strong> [ORDER] Opposite BB TP Modified: New Target $6943.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:05</strong> [ORDER] Opposite BB TP Modified: New Target $6944.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:10</strong> [ORDER] Opposite BB TP Modified: New Target $6944.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:20</strong> [ORDER] Opposite BB TP Modified: New Target $6943.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:30</strong> [ORDER] Opposite BB TP Modified: New Target $6943.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:34</strong> [ORDER] Opposite BB TP Modified: New Target $6942.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:40</strong> [ORDER] Opposite BB TP Modified: New Target $6942.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:45</strong> [ORDER] Opposite BB TP Modified: New Target $6941.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:50</strong> [ORDER] Opposite BB TP Modified: New Target $6941.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:36:55</strong> [ORDER] Opposite BB TP Modified: New Target $6941.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:37:00</strong> [ORDER] Opposite BB TP Modified: New Target $6940.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:05</strong> [ORDER] Opposite BB TP Modified: New Target $6943.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:20</strong> [ORDER] Opposite BB TP Modified: New Target $6944.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:25</strong> [ORDER] Opposite BB TP Modified: New Target $6944.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:30</strong> [ORDER] Opposite BB TP Modified: New Target $6944.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:35</strong> [ORDER] Opposite BB TP Modified: New Target $6944.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:40</strong> [ORDER] Opposite BB TP Modified: New Target $6944.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:45</strong> [ORDER] Opposite BB TP Modified: New Target $6944.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:38:55</strong> [ORDER] Opposite BB TP Modified: New Target $6944.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:40:05</strong> [ORDER] Opposite BB TP Modified: New Target $6948.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:42:05</strong> [ORDER] Opposite BB TP Modified: New Target $6953.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:42:15</strong> [ORDER] Opposite BB TP Modified: New Target $6953.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:42:25</strong> [ORDER] Opposite BB TP Modified: New Target $6953.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:44:05</strong> [ORDER] Opposite BB TP Modified: New Target $6957.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:44:10</strong> [ORDER] Opposite BB TP Modified: New Target $6956.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:44:25</strong> [ORDER] Opposite BB TP Modified: New Target $6957.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:44:30</strong> [ORDER] Opposite BB TP Modified: New Target $6958.50
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:44:40</strong> [ORDER] Opposite BB TP Modified: New Target $6958.75
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:44:45</strong> [ORDER] Opposite BB TP Modified: New Target $6958.25
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:44:50</strong> [ORDER] Opposite BB TP Modified: New Target $6958.00
+            </div>
+            <div class="entry order">
+                <strong>2025-12-29 09:45:00</strong> [ORDER] Opposite BB TP Modified: New Target $6958.50
+            </div>
+        </div>
+    </div>
+</body>
+</html>
