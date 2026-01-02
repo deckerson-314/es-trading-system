@@ -432,6 +432,21 @@ def log_execution(trade, fill):
             duration = fill_dt - matched_fill['dt']
             duration_str = str(duration).split('.')[0]
             
+            # Determine Exit Reason (Live Fill, Stop Loss, Take Profit)
+            reason = 'Live Fill'
+            try:
+                # Check active positions to see if this permId belongs to a known Stop or TP
+                # Note: 'positions' is in global scope
+                for bracket in positions:
+                    if bracket.get('stopLoss') and bracket['stopLoss'].permId == perm_id:
+                        reason = 'Stop Loss'
+                        break
+                    if bracket.get('takeProfit') and bracket['takeProfit'].permId == perm_id:
+                        reason = 'Take Profit'
+                        break
+            except Exception as e:
+                logging.debug(f"Could not determine trade reason: {e}")
+
             completed_trades.append({
                 'exit_time': fill_dt, # keep obj for dashboard logic
                 'direction': direction,
@@ -441,7 +456,7 @@ def log_execution(trade, fill):
                 'pnl': pnl - comm - matched_fill['comm'], # Net PnL
                 'r_multiple': 0, # To be calc later if risk info available
                 'duration': duration_str,
-                'reason': 'Live Fill'
+                'reason': reason
             })
             
             # Send Email Notification
@@ -666,7 +681,7 @@ def get_account_summary():
             if tag and value is not None:
                 # Check for relevant tags (case-insensitive)
                 tag_upper = tag.upper() if tag else ''
-                if any(keyword in tag_upper for keyword in ['NETLIQUIDATION', 'CASH', 'BUYINGPOWER', 'GROSSPOSITION', 'AVAILABLEFUNDS']):
+                if any(keyword in tag_upper for keyword in ['NETLIQUIDATION', 'CASH', 'BUYINGPOWER', 'GROSSPOSITION', 'AVAILABLEFUNDS', 'REALIZEDPNL', 'UNREALIZEDPNL']):
                     try:
                         val = float(value) if value else 0.0
                         # Store with original tag
@@ -691,19 +706,48 @@ def get_account_summary():
         # Get positions for PNL calculation
         positions_list = ib.positions()
         es_positions = [p for p in positions_list if p.contract.symbol == 'ES']
-        # Calculate PNL with fallbacks for different attribute names
+        
+        # Get current price from global data for fallback calculation
+        current_price = 0
+        if len(data) > 0:
+            current_price = data['close'].iloc[-1]
+            
+        # Calculate PNL with fallbacks for different attribute names and manual calculation
         total_unrealized_pnl = 0
         total_realized_pnl = 0
+        
         for p in es_positions:
+            # --- UNREALIZED PNL ---
             unrealized = getattr(p, 'unrealizedPNL', None)
             if unrealized is None:
                 unrealized = getattr(p, 'unrealizedPnl', None)
             if unrealized is None:
                 unrealized = getattr(p, 'unrealized_pnl', None)
+            
+            # Manual Fallback: If PnL is missing or 0, calculate it manually
+            # This matches the dashboard's "Active Positions" table logic
+            if (unrealized is None or unrealized == 0) and current_price > 0:
+                try:
+                    avg_price = getattr(p, 'averageCost', 0)
+                    if avg_price is None or avg_price == 0:
+                        avg_price = getattr(p, 'avgCost', 0)
+                    
+                    # Fix for Futures: averageCost might be Total Cost
+                    contract_multiplier = 50
+                    if avg_price > 20000 and p.position != 0:
+                        avg_price = avg_price / contract_multiplier / abs(p.position)
+                    
+                    if avg_price > 0:
+                        # (Current - Avg) * Position (signed) * Multiplier
+                        unrealized = (current_price - avg_price) * p.position * contract_multiplier
+                except Exception as e:
+                    logging.debug(f"Error calculating manual PnL for position: {e}")
+
             if unrealized is None:
                 unrealized = 0
             total_unrealized_pnl += unrealized
             
+            # --- REALIZED PNL ---
             realized = getattr(p, 'realizedPNL', None)
             if realized is None:
                 realized = getattr(p, 'realizedPnl', None)
@@ -714,14 +758,20 @@ def get_account_summary():
             total_realized_pnl += realized
         
         # Use portfolio_realized_pnl if available (from updatePortfolio callback - more accurate)
-        # This is especially important when there are no open positions
         global portfolio_realized_pnl
         if portfolio_realized_pnl is not None:
             summary['RealizedPNL'] = portfolio_realized_pnl
         else:
             summary['RealizedPNL'] = total_realized_pnl
         
-        summary['UnrealizedPNL'] = total_unrealized_pnl
+        # PREFER OFFICIAL ACCOUNT VALUE FOR UNREALIZED PNL
+        # Only use our calculated total if the account value is missing or 0
+        account_unrealized = summary.get('UnrealizedPNL', 0)
+        if account_unrealized == 0 and total_unrealized_pnl != 0:
+             summary['UnrealizedPNL'] = total_unrealized_pnl
+        elif 'UnrealizedPNL' not in summary:
+             summary['UnrealizedPNL'] = total_unrealized_pnl
+        
         summary['ES_Positions'] = len(es_positions)
         
         return summary
@@ -843,6 +893,7 @@ def generate_dashboard_html():
 <html>
 <head>
     <title>IB Deployment Live Dashboard</title>
+    <meta charset="UTF-8">
     <meta http-equiv="refresh" content="5">
     <style>
         body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
@@ -2072,6 +2123,21 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
         vol_fail_msg = f"❌ (Vol={volume:,.0f} > Max={volume_threshold:,.0f})"
         status_parts.append(f"Vol Filter: {'✅' if volume_filter else vol_fail_msg}")
         
+        # ADX Filter
+        if strategy.enable_adx_filter:
+            adx_val = resampled_row.get('adx', 0)
+            adx_pass = adx_val < strategy.max_adx_threshold_opt
+            adx_msg = "✅" if adx_pass else f"❌ ({adx_val:.2f} >= {strategy.max_adx_threshold_opt:.2f})"
+            status_parts.append(f"ADX: {adx_msg}")
+            
+        # Trend Filter
+        if strategy.enable_trend_filter:
+            trend_val = resampled_row.get('trend_ema', 0)
+            trend_pass_long = current_price > trend_val
+            trend_pass_short = current_price < trend_val
+            trend_msg = f"✅ (L:{trend_pass_long}/S:{trend_pass_short}) [EMA:{trend_val:.2f}]"
+            status_parts.append(f"Trend: {trend_msg}")
+        
         status_parts.append(f"Maintenance: {'❌' if in_maintenance else '✅'}")
         status_parts.append(f"Long: {'✅' if enter_long else '❌'} ({long_reason})")
         status_parts.append(f"Short: {'✅' if enter_short else '❌'} ({short_reason})")
@@ -2684,235 +2750,27 @@ def check_exits(idx, latest_row):
                 
                 # Only update if stop actually changed
                 if (dir_ == 1 and new_stop > current_stop) or (dir_ == -1 and new_stop < current_stop):
-                    # SAFER APPROACH: Place new stop first, verify it's active, then cancel old one
-                    # This ensures position is always protected (minimal gap risk)
-                    stop_action = 'SELL' if dir_ == 1 else 'BUY'
-                    qty = abs(stop_order.totalQuantity)
+                    # SAFER APPROACH: Modify the existing order in-place (Option C)
+                    # This prevents double-margin requirements (Error 201) and is more reliable
                     
-                    # Log orders before update
-                    log_all_open_orders("Before trailing stop update")
-                    
-                    # Create and place new stop order first
-                    new_stop_order = StopOrder(
-                        action=stop_action,
-                        totalQuantity=qty,
-                        stopPrice=new_stop,
-                        tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
-                        transmit=True  # Ensure it's transmitted immediately
-                    )
+                    logging.info(f"Modifying trailing stop from {current_stop:.2f} to {new_stop:.2f}")
                     
                     try:
-                        # Place new stop order
-                        new_trade = ib.placeOrder(contract, new_stop_order)
-                        logging.info(f"Placed new stop order at {new_stop:.2f} (old stop: {current_stop:.2f})")
+                        # Update order object directly
+                        stop_order.auxPrice = new_stop
+                        stop_order.transmit = True # Ensure it transmits
                         
-                        # Wait for new order to be submitted and check status
-                        ib.sleep(1.5)  # Give IB time to process
+                        # Place updated order (IB treats as modification if orderId/permId matches)
+                        # The stop_order object in our bracket is the one IB knows about
+                        ib.placeOrder(contract, stop_order)
                         
-                        # Verify new order is active before canceling old one
-                        # Try multiple methods to find the new order:
-                        # 1. Use the trade object returned by placeOrder
-                        # 2. Find by orderId if available
-                        # 3. Find by permId if available
-                        # 4. Find by matching characteristics (stop price, action, type)
-                        new_order_active = False
-                        new_trade_obj = None
+                        logging.info(f"Trailing stop modification submitted.")
+                        add_to_live_tracker('order', f"Trailing stop updated: modified stop to ${new_stop:.2f}")
                         
-                        # Method 1: Use the trade object returned by placeOrder
-                        if new_trade and new_trade.order:
-                            new_trade_obj = new_trade
-                            # Check if it's active or in a valid pending state
-                            if new_trade.isActive() or (new_trade.orderStatus and 
-                                new_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                new_order_active = True
-                                # Update permId if available
-                                if hasattr(new_trade.order, 'permId') and new_trade.order.permId != 0:
-                                    new_stop_order.permId = new_trade.order.permId
-                                if hasattr(new_trade.order, 'orderId') and new_trade.order.orderId != 0:
-                                    new_stop_order.orderId = new_trade.order.orderId
-                        
-                        # Method 2: Find by orderId if not found yet
-                        if not new_order_active and hasattr(new_stop_order, 'orderId') and new_stop_order.orderId != 0:
-                            for trade in ib.trades():
-                                if (trade.contract.conId == contract.conId and 
-                                    trade.order.orderId == new_stop_order.orderId):
-                                    new_trade_obj = trade
-                                    if trade.isActive() or (trade.orderStatus and 
-                                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                        new_order_active = True
-                                        if hasattr(trade.order, 'permId') and trade.order.permId != 0:
-                                            new_stop_order.permId = trade.order.permId
-                                    break
-                        
-                        # Method 3: Find by permId if available
-                        if not new_order_active and hasattr(new_stop_order, 'permId') and new_stop_order.permId != 0:
-                            for trade in ib.trades():
-                                if (trade.contract.conId == contract.conId and 
-                                    trade.order.permId == new_stop_order.permId):
-                                    new_trade_obj = trade
-                                    if trade.isActive() or (trade.orderStatus and 
-                                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                        new_order_active = True
-                                    break
-                        
-                        # Method 4: Find by matching characteristics (stop price, action, type)
-                        if not new_order_active:
-                            for trade in ib.trades():
-                                if (trade.contract.conId == contract.conId and 
-                                    isinstance(trade.order, StopOrder) and
-                                    trade.order.action == stop_action):
-                                    trade_stop = getattr(trade.order, 'auxPrice', getattr(trade.order, 'stopPrice', 0))
-                                    if abs(trade_stop - new_stop) < 0.01:  # Match within 1 cent
-                                        new_trade_obj = trade
-                                        if trade.isActive() or (trade.orderStatus and 
-                                            trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                                            new_order_active = True
-                                            if hasattr(trade.order, 'permId') and trade.order.permId != 0:
-                                                new_stop_order.permId = trade.order.permId
-                                            if hasattr(trade.order, 'orderId') and trade.order.orderId != 0:
-                                                new_stop_order.orderId = trade.order.orderId
-                                        break
-                        
-                        if new_order_active:
-                            # New order is active, safe to cancel old one
-                            # Note: Brief period where both might be active, but only one can trigger
-                            log_all_open_orders("Before cancelling old stop (new one is active)")
-                            try:
-                                ib.cancelOrder(stop_order)
-                                ib.sleep(0.5)
-                                logging.info(f"Cancelled old stop order at {current_stop:.2f}")
-                                dashboard_stats['orders_cancelled'] += 1
-                                add_to_live_tracker('order', f"Trailing stop updated: cancelled old stop @ ${current_stop:.2f}, placed new stop @ ${new_stop:.2f}")
-                            except Exception as e:
-                                logging.warning(f"Error cancelling old stop order (new one is active): {e}")
-                                # Check if old order was auto-cancelled by IB
-                                old_still_active = False
-                                for trade in ib.trades():
-                                    if (trade.order.permId == stop_order.permId and 
-                                        trade.isActive() and 
-                                        trade.contract.conId == contract.conId):
-                                        old_still_active = True
-                                        break
-                                if not old_still_active:
-                                    logging.info("Old stop order was automatically cancelled by IB")
-                            
-                            # Update the bracket with the new stop order
-                            bracket['stopLoss'] = new_stop_order
-                            logging.info(f"Successfully updated trailing stop to {new_stop:.2f}")
-                            
-                            # Verify TP order is still active after trailing stop update
-                            if tp_order:
-                                tp_still_active = False
-                                for trade in ib.trades():
-                                    if (trade.order.permId == tp_order.permId and 
-                                        trade.contract.conId == contract.conId):
-                                        if trade.isActive() or (trade.orderStatus and 
-                                            trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit']):
-                                            tp_still_active = True
-                                        break
-                                
-                                if not tp_still_active:
-                                    logging.warning(f"WARNING: TP order (PermID: {tp_order.permId}) is no longer active after trailing stop update!")
-                                    logging.warning("TP may have been cancelled by IB when bracket was modified. Attempting to recreate...")
-                                    
-                                    # Recreate TP order
-                                    try:
-                                        tp_price = getattr(tp_order, 'lmtPrice', 0)
-                                        if tp_price > 0:
-                                            tp_action = 'SELL' if dir_ == 1 else 'BUY'
-                                            new_tp_order = LimitOrder(
-                                                action=tp_action,
-                                                totalQuantity=qty,
-                                                lmtPrice=tp_price,
-                                                tif='GTC',  # Good Till Canceled - allows after-hours execution for ES futures
-                                                transmit=True
-                                            )
-                                            tp_trade = ib.placeOrder(contract, new_tp_order)
-                                            ib.sleep(0.5)
-                                            
-                                            # Verify new TP order is active
-                                            # Use the trade object returned by placeOrder, or find by matching characteristics
-                                            new_tp_active = False
-                                            if tp_trade and tp_trade.order:
-                                                if tp_trade.isActive() or (tp_trade.orderStatus and 
-                                                    tp_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit']):
-                                                    new_tp_active = True
-                                                    # Update the order object with permId if assigned
-                                                    if hasattr(tp_trade.order, 'permId') and tp_trade.order.permId != 0:
-                                                        new_tp_order.permId = tp_trade.order.permId
-                                            else:
-                                                # Fallback: find by matching LimitOrder with same price and action
-                                                for trade in ib.trades():
-                                                    if (trade.contract.conId == contract.conId and 
-                                                        isinstance(trade.order, LimitOrder) and
-                                                        trade.order.action == tp_action and
-                                                        abs(getattr(trade.order, 'lmtPrice', 0) - tp_price) < 0.01):
-                                                        if trade.isActive() or (trade.orderStatus and 
-                                                            trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit']):
-                                                            new_tp_active = True
-                                                            if hasattr(trade.order, 'permId') and trade.order.permId != 0:
-                                                                new_tp_order.permId = trade.order.permId
-                                                            break
-                                            
-                                            if new_tp_active:
-                                                bracket['takeProfit'] = new_tp_order
-                                                logging.info(f"Successfully recreated TP order at {tp_price:.2f}")
-                                            else:
-                                                logging.error(f"Failed to recreate TP order - new order is not active")
-                                        else:
-                                            logging.error(f"Cannot recreate TP order - original TP price not found")
-                                    except Exception as e:
-                                        logging.error(f"Error recreating TP order: {e}")
-                                else:
-                                    logging.debug(f"TP order (PermID: {tp_order.permId}) is still active after trailing stop update")
-                            
-                            # Log orders after trailing stop update
-                            ib.sleep(0.5)  # Brief wait for cleanup
-                            log_all_open_orders("After trailing stop update")
-                        else:
-                            # New order didn't activate - could be rejected or pending
-                            if new_trade_obj:
-                                status = new_trade_obj.orderStatus.status if new_trade_obj.orderStatus else "Unknown"
-                                why_held = getattr(new_trade_obj.orderStatus, 'whyHeld', '') if new_trade_obj.orderStatus else ''
-                                logging.warning(f"New stop order status: {status} (whyHeld: {why_held}). Keeping old stop active.")
-                                
-                                # Log order details for debugging
-                                if hasattr(new_trade_obj.order, 'orderId'):
-                                    logging.warning(f"  OrderID: {new_trade_obj.order.orderId}")
-                                if hasattr(new_trade_obj.order, 'permId'):
-                                    logging.warning(f"  PermID: {new_trade_obj.order.permId}")
-                                
-                                # If order is in PreSubmitted with trigger, it's waiting for market open - that's OK
-                                if status == 'PreSubmitted' and 'trigger' in why_held.lower():
-                                    logging.info("Order is waiting for market open (PreSubmitted with trigger). Will activate when market opens.")
-                                    # Don't cancel - let it activate when market opens
-                                    # Update bracket with new order anyway so we track it
-                                    bracket['stopLoss'] = new_stop_order
-                                    if hasattr(new_trade_obj.order, 'permId') and new_trade_obj.order.permId != 0:
-                                        new_stop_order.permId = new_trade_obj.order.permId
-                            else:
-                                logging.warning(f"New stop order not found in trades. Keeping old stop active.")
-                                logging.warning(f"  Attempted to place stop at {new_stop:.2f}, but order not found after placement.")
-                                # Log all active orders to help debug
-                                log_all_open_orders("After failed order placement")
-                            
-                            # Cancel the new order if it exists but isn't active (unless it's waiting for market open)
-                            try:
-                                if new_trade_obj and new_trade_obj.orderStatus:
-                                    status = new_trade_obj.orderStatus.status
-                                    why_held = getattr(new_trade_obj.orderStatus, 'whyHeld', '')
-                                    if not (status == 'PreSubmitted' and 'trigger' in why_held.lower()):
-                                        ib.cancelOrder(new_stop_order)
-                                        logging.info("Cancelled new stop order that failed to activate")
-                            except Exception as cancel_err:
-                                logging.debug(f"Error cancelling new order: {cancel_err}")
-                            # Old stop order remains active as protection
-                            
                     except Exception as e:
-                        logging.error(f"Failed to place new stop order: {e}")
-                        import traceback
-                        logging.error(f"Traceback: {traceback.format_exc()}")
-                        # Old stop order remains active as fallback protection
+                        logging.error(f"Error modifying trailing stop: {e}")
+                            
+
             
             # Update dynamic TP (Opposite BB TP) if enabled and position is still open
             if position_still_open and strategy.opposite_bb_tp and tp_order:
@@ -3414,7 +3272,7 @@ def protect_existing_positions():
     if not es_positions:
         return
     
-    logging.info(f"Found {len(es_positions)} existing ES position(s). Checking protection...")
+    logging.debug(f"Found {len(es_positions)} existing ES position(s). Checking protection...")
     
     for pos in es_positions:
         position_size = pos.position
@@ -3792,7 +3650,7 @@ async def periodic_protection_check():
                 protect_existing_positions()
                 check_and_recreate_tp_orders()  # Check and recreate missing TP orders
                 # Log orders periodically to monitor for excessive orders
-                log_all_open_orders("Periodic check")
+                # log_all_open_orders("Periodic check")
             except Exception as e:
                 logging.error(f"Error in periodic protection check: {e}")
 
@@ -3817,22 +3675,54 @@ def ensure_connected_and_subscribed():
     if contract is None:
         contract = get_front_es_contract()
     
-    if bars:
-        bars.updateEvent -= on_bar_update
-        ib.cancelHistoricalData(bars)
-        bars = None
-        ib.sleep(1)
+    # Retry logic for Historical Data (handles HMDS Error 162 after maintenance)
+    max_retries = 5
+    retry_delay = 2
     
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime='',
-        durationStr='4 D', # Increased to 4 D to ensure sufficient history (e.g. 155 Vol MA) even on Sunday evenings
-        barSizeSetting='1 min',  # Using 1-minute bars to match Historical Data (Backtest) Resolution
-        whatToShow='TRADES',
-        useRTH=False,
-        formatDate=1,
-        keepUpToDate=True
-    )
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"Requesting Historical Data (Attempt {attempt+1}/{max_retries})...")
+            
+            # Cancel existing bars if any
+            if bars:
+                try:
+                    bars.updateEvent -= on_bar_update
+                    ib.cancelHistoricalData(bars)
+                except:
+                    pass
+                bars = None
+                ib.sleep(1)
+            
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime='',
+                durationStr='4 D', # Increased to 4 D to ensure sufficient history
+                barSizeSetting='1 min',
+                whatToShow='TRADES',
+                useRTH=False,
+                formatDate=1,
+                keepUpToDate=True
+            )
+            
+            # Wait for data to populate
+            ib.sleep(2)
+            
+            hist_df = util.df(bars)
+            
+            if hist_df is not None and not hist_df.empty:
+                logging.info(f"Historical Data received successfully on attempt {attempt+1}")
+                break
+            else:
+                logging.warning(f"Historical Data empty on attempt {attempt+1}. Retrying in {retry_delay}s...")
+                
+        except Exception as e:
+            logging.error(f"Error requesting Historical Data (Attempt {attempt+1}): {e}")
+        
+        if attempt < max_retries - 1:
+            ib.sleep(retry_delay)
+            retry_delay *= 2  # Exponential backoff: 2, 4, 8, 16, 32
+        else:
+            logging.error("Max retries reached. Proceeding without initial historical data (Indicators will be NaN).")
     
     hist_df = util.df(bars)
     if hist_df is not None and not hist_df.empty:
@@ -3963,10 +3853,10 @@ async def main():
         logging.info("Checking for orphaned positions and closing them...")
         close_orphaned_positions()
         logging.info("Checking for existing positions and ensuring protection...")
-        log_all_open_orders("On startup (before protection check)")
+        # log_all_open_orders("On startup (before protection check)")
         protect_existing_positions()
         check_and_recreate_tp_orders()  # Check and recreate missing TP orders
-        log_all_open_orders("On startup (after protection check)")
+        # log_all_open_orders("On startup (after protection check)")
         
         # Generate initial dashboard
         update_dashboard()
@@ -4018,7 +3908,7 @@ async def main():
                     close_orphaned_positions()  # Close any positions that don't match tracked brackets
                     protect_existing_positions()  # Ensure remaining positions are protected
                     check_and_recreate_tp_orders()  # Check and recreate missing TP orders
-                    log_all_open_orders("After reconnection cleanup")
+                    # log_all_open_orders("After reconnection cleanup")
                     # Note: check_disconnect_status() will send reconnection email on next iteration
                 
                 # Update dashboard every 5 seconds (every other loop iteration)
