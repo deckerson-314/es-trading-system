@@ -199,7 +199,10 @@ class BollingerBandStrategyV4:
             target_bar_seconds = self.timeframe * 60
             
             if incoming_bar_seconds < target_bar_seconds:
-                df_resampled = df.resample(f'{self.timeframe}T', label='right', closed='right').agg({
+                # Use closed='left' for Start-Time Indexed bars (standard for IB/Pandas)
+                # Bin 13:00 (End Label) should contain interval [12:58, 13:00)
+                # This ensures we don't include the 13:00 Start Time (New Partial Bar) in the 13:00 bucket
+                df_resampled = df.resample(f'{self.timeframe}T', label='right', closed='left').agg({
                     'open': 'first',
                     'high': 'max',
                     'low': 'min',
@@ -229,6 +232,12 @@ class BollingerBandStrategyV4:
         
         # ADX
         df['adx'] = calculate_adx(df, self.adx_period)
+        
+        # Calculate Previous Region Bands (for High Fidelity Exit)
+        # Live Trading checks Price against the Band calculated at the START of the bar (or previous close).
+        # To match this, Backtest should compare High[t] vs Upper[t-1].
+        df['upper_prev'] = df['upper'].shift(1)
+        df['lower_prev'] = df['lower'].shift(1)
         
         return df
 
@@ -362,13 +371,29 @@ class BollingerBandStrategyV4:
         if not (in_rth and atr_filter and vol_filter and not in_maintenance):
             return False, False
 
+        # ADX Filter
+        if self.enable_adx_filter:
+            adx_val = getattr(row, 'adx', 0) if hasattr(row, 'Index') else (row['adx'] if 'adx' in row else 0)
+            if adx_val >= self.max_adx_threshold_opt:
+                return False, False
+
+        # Trend Filter
+        trend_long = True
+        trend_short = True
+        if self.enable_trend_filter:
+            trend_ema_val = getattr(row, 'trend_ema', 0) if hasattr(row, 'Index') else (row['trend_ema'] if 'trend_ema' in row else 0)
+            close_val = getattr(row, 'close', 0) if hasattr(row, 'Index') else row['close']
+            
+            trend_long = (close_val > trend_ema_val)
+            trend_short = (close_val < trend_ema_val)
+
         enter_long = enter_short = False
-        if self.enable_long:
+        if self.enable_long and trend_long:
             trig = lower * (1 - self.long_trigger_pct / 100)
             if (self.long_wick_touch and low <= trig) or (self.long_body_zone and close <= trig):
                 enter_long = True
         
-        if self.enable_short:
+        if self.enable_short and trend_short:
             trig = upper * (1 + self.short_trigger_pct / 100)
             if (self.short_wick_touch and high >= trig) or (self.short_body_zone and close >= trig):
                 enter_short = True
@@ -401,7 +426,18 @@ class BollingerBandStrategyV4:
         if self.fixed_atr_tp and atr_tp is not None and not pd.isna(atr_tp):
             tp = entry_price + direction * atr_tp * self.atr_mult_tp
         elif self.fixed_bb_entry_tp:
-            tp = upper if direction == 1 else lower
+            # Use 'upper_prev' (Signal Bar Band) to match Live Execution and avoid Lookahead Bias
+            # Live System sets TP immediately at Entry (Open of bar), so it can only see Previous Bar's Band.
+            u_prev = getattr(row, 'upper_prev', upper) if hasattr(row, 'Index') else row.get('upper_prev', upper)
+            l_prev = getattr(row, 'lower_prev', lower) if hasattr(row, 'Index') else row.get('lower_prev', lower)
+            
+            # Handle NaN overlap
+            if pd.isna(u_prev): u_prev = upper
+            if pd.isna(l_prev): l_prev = lower
+            
+            tp = u_prev if direction == 1 else l_prev
+            
+            
         elif self.opposite_bb_tp:
             tp = upper if direction == 1 else lower
             
@@ -504,11 +540,24 @@ class BollingerBandStrategyV4:
         candidates = []
         
         # Opposite BB TP
+        # Uses Previous Bar's Band to match Live Trading Fidelity (Avoids Lookahead Bias of using Current Close Band)
         if self.opposite_bb_tp:
-            if dir_ == 1 and high >= upper:
-                candidates.append(('TP Opp BB', upper))
-            elif dir_ == -1 and low <= lower:
-                candidates.append(('TP Opp BB', lower))
+            # Use 'upper_prev' if available, else fall back to 'upper'
+            if hasattr(row, 'Index'):
+                check_upper = getattr(row, 'upper_prev', upper)
+                check_lower = getattr(row, 'lower_prev', lower)
+            else:
+                check_upper = row.get('upper_prev', upper)
+                check_lower = row.get('lower_prev', lower)
+            
+            # Handle NaN at start of data
+            if pd.isna(check_upper): check_upper = upper
+            if pd.isna(check_lower): check_lower = lower
+
+            if dir_ == 1 and high >= check_upper:
+                candidates.append(('TP Opp BB', check_upper))
+            elif dir_ == -1 and low <= check_lower:
+                candidates.append(('TP Opp BB', check_lower))
                 
         # Fixed ATR TP
         if self.fixed_atr_tp and position['tp'] is not None:

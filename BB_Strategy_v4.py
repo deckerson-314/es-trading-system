@@ -221,25 +221,38 @@ def run_backtest_v4(data_path, params_source, suppress_log=False, start_date=Non
         
         positions = [] 
         open_positions = [] 
+        pending_entry = None # Track pending entry for Next Bar Open execution
         
         rows = df.itertuples()
         
         # Get Transaction Cost
         transaction_cost = params_dict.get('Transaction Cost (Per Trade)', {'value': 20.0})['value']
-
+        
         for row in rows:
-            # Check Exits
+            # 1. Process Pending Entry (Execute at Open of THIS bar)
+            if pending_entry:
+                direction = pending_entry['direction']
+                # Use OPEN price of proper next bar
+                # Note: setup_position logic should use row.open
+                pos = strategy.setup_position(row.open, direction, row, df)
+                open_positions.append(pos)
+                pending_entry = None
+
+            # 2. Check Exits (on existing positions)
             for i, pos in enumerate(open_positions[:]):
                 strategy.update_trailing_stop(pos, row, df)
                 should_exit, reason, price = strategy.check_exit(pos, row, df)
                 
                 if should_exit:
-                    duration = (row.Index - pos['entry_time'])
+                    # Set Exit Time to END of bar to represent duration
+                    # (Avoids 0-second duration for same-bar exits)
+                    exit_time = row.Index + pd.Timedelta(minutes=strategy.timeframe)
+                    duration = (exit_time - pos['entry_time'])
                     trade = {
                         'entry_time': pos['entry_time'],
                         'entry_price': pos['entry_price'],
                         'direction': pos['direction'],
-                        'exit_time': row.Index,
+                        'exit_time': exit_time,
                         'exit_price': price,
                         'reason': reason,
                         'pnl_points': (price - pos['entry_price']) * pos['direction'],
@@ -255,14 +268,13 @@ def run_backtest_v4(data_path, params_source, suppress_log=False, start_date=Non
                     positions.append(trade)
                     open_positions.pop(i) 
             
-            # Check Entries
-            if len(open_positions) < strategy.max_open_trades:
+            # 3. Check Entries (Generate Signal for NEXT bar)
+            # Only if we don't have a pending entry and haven't maxed out
+            if len(open_positions) < strategy.max_open_trades and pending_entry is None:
                 if row.entry_long_signal:
-                    pos = strategy.setup_position(row.close, 1, row, df)
-                    open_positions.append(pos)
+                    pending_entry = {'direction': 1}
                 elif row.entry_short_signal:
-                    pos = strategy.setup_position(row.close, -1, row, df)
-                    open_positions.append(pos)
+                    pending_entry = {'direction': -1}
         
         # 6. Reporting
         if not suppress_log:
@@ -339,7 +351,7 @@ def run_backtest_v4(data_path, params_source, suppress_log=False, start_date=Non
             # Prepare single solution package
             sol_data = [{
                 'name': 'Backtest',
-                'params': params,
+                'params': params_dict,
                 'trades_df': trades_df,
                 'equity_curve': eq_curve,
                 'df': df

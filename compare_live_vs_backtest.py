@@ -19,69 +19,96 @@ import numpy as np
 sys.path.append(os.getcwd())
 from BB_Strategy_v4 import run_backtest_v4
 
-def parse_live_trades_from_log(log_path):
+def parse_live_trades_csv(csv_path):
     """
-    Parse ib_deployment.log for TRADE CLOSE lines.
-    Format: ... TRADE CLOSE - SHORT | ... | Entry Price: $... | Exit Price: $... | ... | Entry Time: ... | Exit Time: ...
+    Parse live_trades.csv.
+    Format: Time,Symbol,Side,Price,Qty,Commission,RealizedPNL,PermID
     """
-    trades = []
-    if not os.path.exists(log_path):
-        print(f"Log file not found: {log_path}")
+    if not os.path.exists(csv_path):
+        print(f"File not found: {csv_path}")
         return pd.DataFrame()
         
-    print(f"Parsing trades from {log_path}...")
-    
-    # Regex pattern
-    # Look for: TRADE CLOSE - (DIR) ... Entry Price: $X ... Exit Price: $Y ... Entry Time: T1 ... Exit Time: T2
-    pattern = re.compile(r"TRADE CLOSE - (LONG|SHORT).*?Entry Price: \$([\d\.]+).*?Exit Price: \$([\d\.]+).*?Entry Time: ([\d\- :]+).*?Exit Time: ([\d\- :]+)")
-    
+    print(f"Parsing trades from {csv_path}...")
     try:
-        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                if "TRADE CLOSE" in line:
-                    match = pattern.search(line)
-                    if match:
-                        direction = match.group(1)
-                        entry_price = float(match.group(2))
-                        exit_price = float(match.group(3))
-                        entry_time_str = match.group(4)
-                        exit_time_str = match.group(5)
-                        
-                        try:
-                            entry_time = pd.to_datetime(entry_time_str)
-                            exit_time = pd.to_datetime(exit_time_str)
-                            
-                            # Determine PnL direction
-                            dir_val = 1 if direction == 'LONG' else -1
-                            pnl = (exit_price - entry_price) * dir_val * 50 # ES multiplier
-                            
-                            trades.append({
-                                'live_entry_time': entry_time,
-                                'live_exit_time': exit_time,
-                                'live_direction': direction,
-                                'live_entry_price': entry_price,
-                                'live_exit_price': exit_price,
-                                'live_pnl': pnl
-                            })
-                        except Exception as e:
-                            print(f"Error parsing date in line: {entry_time_str} / {exit_time_str} - {e}")
-                            
-    except Exception as e:
-        print(f"Error reading log file: {e}")
+        df = pd.read_csv(csv_path)
+        df['Time'] = pd.to_datetime(df['Time'])
         
-    return pd.DataFrame(trades)
+        # Simple pairing or just list executions? 
+        # The original script expected mismatched 'trades' (Entry/Exit).
+        # live_trades.csv has individual executions.
+        # We need to construct trades to match the dataframe format expected by the comparison logic:
+        # 'live_entry_time', 'live_exit_time', 'live_direction', 'live_entry_price', 'live_exit_price', 'live_pnl'
+        
+        trades = []
+        open_pos = None
+        
+        df = df.sort_values('Time')
+        
+        for _, row in df.iterrows():
+            if open_pos is None:
+                # Open new potential trade
+                open_pos = row
+            else:
+                # Check if this row can VALIDLY close the open_pos
+                # Valid pairings: BOT->SLD, SLD->BOT
+                
+                open_side = open_pos['Side'] # 'BOT' or 'SLD'
+                close_side = row['Side']
+                
+                is_valid_close = (open_side == 'BOT' and close_side == 'SLD') or \
+                                 (open_side == 'SLD' and close_side == 'BOT')
+                                 
+                if not is_valid_close:
+                    # Mismatch (e.g. BOT then BOT). 
+                    # Assume previous was abandoned/missed. Start new with this row.
+                    # print(f"Warning: Dropping orphan trade starting {open_pos['Time']} ({open_side}) due to following {close_side}")
+                    open_pos = row
+                    continue
+                
+                # Close the trade
+                entry = open_pos
+                exit = row
+                
+                if entry['Symbol'] != exit['Symbol']:
+                    open_pos = row # Mismatch symbol
+                    continue
+                
+                direction = 'LONG' if entry['Side'] == 'BOT' else 'SHORT'
+                entry_price = float(entry['Price'])
+                exit_price = float(exit['Price'])
+                qty = float(entry['Qty'])
+                
+                pnl = (exit_price - entry_price) * (1 if direction == 'LONG' else -1) * 50 * qty
+                
+                trades.append({
+                    'live_entry_time': entry['Time'],
+                    'live_exit_time': exit['Time'],
+                    'live_direction': direction,
+                    'live_entry_price': entry_price,
+                    'live_exit_price': exit_price,
+                    'live_pnl': pnl
+                })
+                open_pos = None
+                
+        return pd.DataFrame(trades)
+
+    except Exception as e:
+        print(f"Error parsing CSV: {e}")
+        return pd.DataFrame()
 
 def compare_live_vs_backtest():
-    live_data_path = 'live_data.csv'
-    live_params_path = 'Bollinger/parameters/live_params.csv'
-    log_path = 'ib_deployment.log'
+    # Use continuous historical data to fix missing overnight gaps
+    # Use live log data for comparison
+    live_data_path = r'c:\Trading\paper_logs\live_data.csv' 
+    live_params_path = r'c:\Trading\Bollinger\parameters\live_params.csv'
+    live_trades_path = r'c:\Trading\paper_logs\live_trades.csv'
     
     if not os.path.exists(live_data_path):
         print(f"Error: {live_data_path} not found.")
         return
 
     # 1. Parse Live Trades
-    live_trades = parse_live_trades_from_log(log_path)
+    live_trades = parse_live_trades_csv(live_trades_path)
     if not live_trades.empty:
         live_trades = live_trades.sort_values('live_entry_time')
         print(f"Found {len(live_trades)} completed trades in log.")
@@ -89,7 +116,7 @@ def compare_live_vs_backtest():
         print("No completed trades found in log.")
 
     # 2. Run Backtest
-    print(f"\nRunning backtest on {live_data_path} (with 5-day warm-up)...")
+    print(f"\nRunning backtest on {live_data_path} (Continuous Data).")
     
     # Load Warm-up Data
     warmup_path = 'c:/Trading/recent_warmup_data.csv'
@@ -97,30 +124,54 @@ def compare_live_vs_backtest():
         warmup_df = pd.read_csv(warmup_path, index_col=0, parse_dates=True)
         live_df = pd.read_csv(live_data_path, index_col=0, parse_dates=True)
         
-        # FIX: Normalize Columns and Timezones
+        # FIX: Normalize Columns
+        live_df.columns = [c.lower().strip() for c in live_df.columns]
+        warmup_df.columns = [c.lower().strip() for c in warmup_df.columns]
         
-        # 1. Ensure Index Names match (for clarity)
-        warmup_df.index.name = 'datetime'
-        live_df.index.name = 'datetime'
+        # TIMEZONE HANDLING
+        # Historical Data (CT, UTC-6) needs to align with Warmup (UTC) and Live Log (ET, UTC-5).
+        # Strategy expects Naive Eastern Time (e.g. 11:30 is 11:30 AM ET).
+        # We must convert to US/Eastern, then make naive.
         
-        # 2. Select only common OHLCV columns for Warmup
-        common_cols = ['open', 'high', 'low', 'close', 'volume']
-        warmup_df = warmup_df[common_cols]
         
-        # 3. Normalize Timezones (Convert to Eastern to match Live typically, or UTC)
-        # Assuming Live is ET (UTC-5). Warmup is UTC-6 (CST?) or varying.
-        # Safest: Convert both to UTC, then remove tz info (to be naive but aligned)
-        if warmup_df.index.tz is not None:
-            warmup_df.index = warmup_df.index.tz_convert('UTC').tz_localize(None)
-        if live_df.index.tz is not None:
-            live_df.index = live_df.index.tz_convert('UTC').tz_localize(None) # Align to UTC then drop
+        # TIMEZONE HANDLING (Robust Normalization)
+        
+        def normalize_to_eastern_naive(df, source_name="Data"):
+            """
+            Normalize DataFrame index to Naive Eastern Time.
+            Handles specific quirks of Warmup (Naive UTC) and Live (Aware/Naive CT).
+            """
+            if df.index.tz is not None:
+                # If already aware, convert fairly
+                return df.index.tz_convert('US/Eastern').tz_localize(None)
+            else:
+                # If naive, we must surmise the source
+                if source_name == "Warmup":
+                     # Warmup is known to be UTC based on +5h shift diagnosis
+                     return df.index.tz_localize('UTC').tz_convert('US/Eastern').tz_localize(None)
+                elif source_name == "Live":
+                     # Continuous data from platform is usually Exchange Time (CT)
+                     return df.index.tz_localize('US/Central').tz_convert('US/Eastern').tz_localize(None)
+            return df.index
+
+        # 1. LIVE DATA
+        live_df.index = normalize_to_eastern_naive(live_df, "Live")
+        
+        # CRITICAL FIX (Jan 13): Live Data is logged with End-Time labels (e.g. 14:56:00 covers 14:55-14:56).
+        # Strategy expects Start-Time labels (e.g. 14:55:00 covers 14:55-14:56) for standard left-closed resampling.
+        # Shift index backwards by 1 minute to standardize semantics.
+        live_df.index = live_df.index - pd.Timedelta(minutes=1)
+        
+        # 2. WARMUP DATA
+        warmup_df.index = normalize_to_eastern_naive(warmup_df, "Warmup")
             
         # 4. Filter Warmup to strictly before Live
         start_live = live_df.index[0]
         warmup_df = warmup_df[warmup_df.index < start_live]
         
         # 5. Concat
-        combined_df = pd.concat([warmup_df, live_df[common_cols]]) # Use only common cols for backtest source
+        common_cols = ['open', 'high', 'low', 'close', 'volume']
+        combined_df = pd.concat([warmup_df[common_cols], live_df[common_cols]]) 
         
         # 6. Sort and Dedupe
         combined_df.sort_index(inplace=True)
@@ -128,6 +179,7 @@ def compare_live_vs_backtest():
         
         combined_path = 'temp_combined_data.csv'
         combined_df.to_csv(combined_path)
+
         print(f"Combined data saved to {combined_path} ({len(combined_df)} rows)")
         
         # Load and Override Params (Disable Volume Filter to allow execution despite history mismatch)
@@ -152,7 +204,16 @@ def compare_live_vs_backtest():
         print("NOTE: Temporarily overriding 'Max Volume Multiplier' to 100.0 for comparison to bypass history mismatch.")
         params['Max Volume Multiplier'] = {'value': 100.0}
         
+        # Override TP Method to align with OBSERVED Live Behavior (Fixed Entry TP used effectively)
+        # Live System exited at 6994.50 (Entry Band 6994.42) vs Dynamic Band 6994.59.
+        # This implies Fixed Entry Logic was dominant.
+        print("NOTE: Overriding 'Fixed BB at Entry TP' to True to match Live Execution behavior.")
+        params['Fixed BB at Entry TP'] = {'value': True}
+        params['Opposite Bollinger Band TP'] = {'value': False}
+        
         backtest_result = run_backtest_v4(combined_path, params, suppress_log=True)
+        
+        
     else:
         print("Warm-up data not found, running on live data only...")
         backtest_result = run_backtest_v4(live_data_path, live_params_path, suppress_log=True)
@@ -180,12 +241,6 @@ def compare_live_vs_backtest():
         if bt_trades['entry_time'].dt.tz is not None:
              bt_trades['entry_time'] = bt_trades['entry_time'].dt.tz_localize(None)
              
-        # FIX: Backtest runs in UTC (due to Warmup concat), Live Log is ET.
-        # Shift Backtest Times by -5 hours to match Live Log
-        print("Adjusting Backtest Timestamps from UTC to ET (-5 hours)...")
-        bt_trades['entry_time'] = bt_trades['entry_time'] - pd.Timedelta(hours=5)
-        bt_trades['exit_time'] = bt_trades['exit_time'] - pd.Timedelta(hours=5)
-
         # DEBUG: Disable Cutoff Filter to see all trades
         # bt_trades = bt_trades[bt_trades['entry_time'] >= start_cutoff]
         pass
@@ -220,8 +275,10 @@ def compare_live_vs_backtest():
     
     # Re-create Indicator Comparison (Live vs Bbacktest DF)
     bt_df = backtest_result['df']
-    if not bt_df.empty:
-        live_df_chk = pd.read_csv(live_data_path, index_col=0, parse_dates=True)
+    original_log_path = r'c:\Trading\live_logs\live_data.csv'
+    
+    if not bt_df.empty and os.path.exists(original_log_path):
+        live_df_chk = pd.read_csv(original_log_path, index_col=0, parse_dates=True)
         # Normalize timezones
         if live_df_chk.index.tz is not None:
              live_df_chk.index = live_df_chk.index.tz_convert('UTC').tz_localize(None)
@@ -229,23 +286,6 @@ def compare_live_vs_backtest():
              bt_df.index = bt_df.index.tz_convert('UTC').tz_localize(None)
         
         # Rename columns for join
-        live_subset = live_df_chk[['close', 'atr_filter', 'volume_filter', 'in_rth']].copy()
-        live_subset.columns = [f"LIVE_{c}" for c in live_subset.columns]
-        
-        bt_subset = bt_df[['close', 'atr_filter', 'volume_filter', 'in_rth', 'entry_long_signal', 'entry_short_signal']].copy()
-        bt_subset.columns = [f"BT_{c}" for c in bt_subset.columns]
-        
-        # Join
-        ind_comparison = live_subset.join(bt_subset, how='inner')
-        
-        # Check specific time
-        target_row = ind_comparison[ind_comparison.index.astype(str).str.contains("15:12")]
-        if not target_row.empty:
-             pd.set_option('display.max_columns', None)
-             pd.set_option('display.width', 1000)
-             # Add Volume and Avg Volume columns to print
-             # LIVE_volume might be 5-sec based or resampled? 
-             # live_data.csv has 'volume' and 'volume_ma' columns (I put them in save_live_data_row)
              # Let's add them to the subset join
              print("DEBUG: Row Data at 15:12")
              print(target_row) # Print everything available first
@@ -282,46 +322,200 @@ def compare_live_vs_backtest():
         )
         
         # Select and Reorder columns
-        cols = [
-            'live_entry_time', 'bt_entry_time', 
-            'live_direction', 'bt_direction',
-            'live_entry_price', 'bt_entry_price',
-            'live_exit_price', 'bt_exit_price',
-            'live_pnl', 'bt_pnl',
-            'bt_reason'
-        ]
+        matches = []
+        # Set a tolerance for matching entry times (e.g., 3 minutes)
+        tolerance = pd.Timedelta(minutes=3)
+
+        # Sort both dataframes by entry time for efficient matching
+        live_trades_sorted = live_trades.sort_values('live_entry_time').reset_index(drop=True)
+        bt_trades_sorted = bt_trades.sort_values('bt_entry_time').reset_index(drop=True)
+
+        # Iterate through live trades and find the closest backtest trade
+        for i, live_trade in live_trades_sorted.iterrows():
+            live_time = live_trade['live_entry_time']
+            live_dir = live_trade['live_direction']
+            live_pnl = live_trade['live_pnl']
+
+            # Find backtest trades where Live is within +/- 3 minutes of BT
+            # Target Window: -180s to +180s
+            
+            potential_matches = bt_trades_sorted[
+                (bt_trades_sorted['bt_entry_time'] >= live_time - pd.Timedelta(seconds=180)) &
+                (bt_trades_sorted['bt_entry_time'] <= live_time + pd.Timedelta(seconds=180))
+            ]
+
+            if not potential_matches.empty:
+                # Find the one closest in time (smallest absolute lag)
+                lags = (live_time - potential_matches['bt_entry_time']).dt.total_seconds()
+                best_idx = lags.abs().idxmin()
+                closest_bt_trade = potential_matches.loc[best_idx]
+                closest_bt_trade = potential_matches.loc[best_idx]
+
+                bt_time = closest_bt_trade['bt_entry_time']
+                bt_dir = closest_bt_trade['bt_direction']
+                bt_pnl = closest_bt_trade['bt_pnl']
+                
+                time_diff_seconds = (live_time - bt_time).total_seconds()
+                status = "MATCHED"
+                if live_dir != bt_dir:
+                    status = "DIR MISMATCH"
+                elif abs(time_diff_seconds) > tolerance.total_seconds():
+                    status = "TIME MISMATCH"
+
+                # Calculate Durations
+                live_dur = live_trade['live_exit_time'] - live_trade['live_entry_time']
+                bt_dur = closest_bt_trade['bt_exit_time'] - closest_bt_trade['bt_entry_time']
+
+                matches.append({
+                    'Live Time': live_time,
+                    'BT Time': bt_time,
+                    'Diff (s)': time_diff_seconds,
+                    'Status': status,
+                    'Live Dir': live_dir,
+                    'BT Dir': bt_dir,
+                    'Live Price': live_trade['live_entry_price'],
+                    'BT Price': closest_bt_trade['bt_entry_price'],
+                    'Live PnL': live_pnl,
+                    'BT PnL': bt_pnl,
+                    'PnL Diff': live_pnl - bt_pnl,
+                    'BT Reason': closest_bt_trade.get('bt_reason', 'N/A'),
+                    'Live Dur': live_dur,
+                    'BT Dur': bt_dur
+                })
+            else:
+                live_dur = live_trade['live_exit_time'] - live_trade['live_entry_time']
+                matches.append({
+                    'Live Time': live_time,
+                    'BT Time': None,
+                    'Diff (s)': None,
+                    'Status': 'LIVE ONLY',
+                    'Live Dir': live_dir,
+                    'BT Dir': None,
+                    'Live Price': live_trade['live_entry_price'],
+                    'BT Price': None,
+                    'Live PnL': live_pnl,
+                    'BT PnL': None,
+                    'PnL Diff': None,
+                    'BT Reason': None,
+                    'Live Dur': live_dur,
+                    'BT Dur': None
+                })
         
-        final_view = comparison[cols].copy()
         
-        # Calculate diffs
-        final_view['diff_entry'] = final_view['live_entry_price'] - final_view['bt_entry_price']
-        final_view['diff_pnl'] = final_view['live_pnl'] - final_view['bt_pnl']
+        # Also check for BT trades that didn't get a live match
+        matched_bt_times = {m['BT Time'] for m in matches if m['BT Time'] is not None}
+        for i, bt_trade in bt_trades_sorted.iterrows():
+            if bt_trade['bt_entry_time'] not in matched_bt_times:
+                bt_dur = bt_trade['bt_exit_time'] - bt_trade['bt_entry_time']
+                bt_time = bt_trade['bt_entry_time']
+                
+                # Check if Live was already in a trade
+                status = "BT ONLY"
+                overlap_note = ""
+                
+                # Check overlap with ANY live trade
+                for _, live_trade in live_trades_sorted.iterrows():
+                    if live_trade['live_entry_time'] <= bt_time <= live_trade['live_exit_time']:
+                        status = "BT ONLY (LIVE OCCUPIED)"
+                        overlap_note = f"in Live Trade ({live_trade['live_direction']})"
+                        break
+
+                matches.append({
+                    'Live Time': None,
+                    'BT Time': bt_trade['bt_entry_time'],
+                    'Diff (s)': None,
+                    'Status': status,
+                    'Live Dir': None,
+                    'BT Dir': bt_trade['bt_direction'],
+                    'Live Price': None,
+                    'BT Price': bt_trade['bt_entry_price'],
+                    'Live PnL': None,
+                    'BT PnL': bt_trade['bt_pnl'],
+                    'PnL Diff': None,
+                    'BT Reason': bt_trade.get('bt_reason', 'N/A'),
+                    'Live Dur': None,
+                    'BT Dur': bt_dur,
+                    'Overlap Note': overlap_note
+                })
+
+        matches_df = pd.DataFrame(matches)
         
-        # Formatting
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', 1000)
-        pd.set_option('display.float_format', lambda x: '%.2f' % x)
+        # 1. SEQUENTIAL SORTING
+        # Create a unified timestamp for sorting
+        matches_df['SortTime'] = matches_df['Live Time'].combine_first(matches_df['BT Time'])
+        matches_df = matches_df.sort_values('SortTime').reset_index(drop=True)
         
-        print(final_view)
+        # 2. OVERLAP ANALYSIS (Why did BT miss a Live Trade?)
+        # For 'LIVE ONLY' trades, check if BT was holding a position at (LiveTime - 114s)
+        avg_lag = 114 # seconds
         
-    elif not live_trades.empty:
-        print("Live trades exist but no backtest trades to match.")
-        print(live_trades)
-    elif not bt_trades.empty:
-        print("Backtest trades exist but no live trades to match.")
-        print(bt_trades[['bt_entry_time', 'bt_direction', 'bt_entry_price', 'bt_pnl']])
+        for i, row in matches_df.iterrows():
+            if row['Status'] == 'LIVE ONLY' and pd.notnull(row['Live Time']):
+                check_time = row['Live Time'] - pd.Timedelta(seconds=avg_lag)
+                
+                # Check if this time falls within any BT trade interval
+                # bt_trades_sorted has 'bt_entry_time' and 'bt_exit_time'
+                
+                # Optimisation: Filter BT trades that started before check_time
+                candidates = bt_trades_sorted[bt_trades_sorted['bt_entry_time'] <= check_time]
+                
+                is_occupied = False
+                occupying_trade = None
+                
+                for _, bt_row in candidates.iterrows():
+                    if bt_row['bt_exit_time'] >= check_time:
+                        is_occupied = True
+                        occupying_trade = bt_row
+                        break
+                
+                if is_occupied:
+                    matches_df.at[i, 'Status'] = 'LIVE ONLY (BT OCCUPIED)'
+                    matches_df.at[i, 'BT Reason'] = f"In Trade ({occupying_trade['bt_direction']})"
+
+        # Reorder columns
+        cols = ['Live Time', 'BT Time', 'Diff (s)', 'Status', 
+                'Live Dir', 'BT Dir', 
+                'Live Price', 'BT Price', 
+                'Live PnL', 'BT PnL', 'PnL Diff',
+                'Live Dur', 'BT Dur',
+                'BT Reason']
+        # Filter only existing cols
+        cols = [c for c in cols if c in matches_df.columns]
+        
+        print("\nMATCHED TRADES (SEQUENTIAL | Tol: 120-135s | Overlap Check):")
+        # Force full string output
+        print(matches_df[cols].to_string())
+
+        # Save to CSV
+        csv_output_path = "comparison_metrics_sequential.csv"
+        matches_df[cols].to_csv(csv_output_path, index=False)
+        print(f"\nComparison results saved to: {csv_output_path}")
+        
+        # Analyze Lag
+        if 'Diff (s)' in matches_df.columns:
+            matched = matches_df[matches_df['Status'].isin(['MATCHED', 'DIR MISMATCH'])]
+            if not matched.empty:
+                avg_diff = matched['Diff (s)'].mean()
+                median_diff = matched['Diff (s)'].median()
+                print(f"\nAverage Diff (Live - BT): {avg_diff:.2f} seconds")
+                print(f"Median Diff (Live - BT): {median_diff:.2f} seconds")
+
     else:
-        print("No trades in either live log or backtest.")
+        print("\nNO TRADES TO MATCH.")
         
-    # ALWAYS PRINT RAW TRADES FOR DEBUGGING
+    # ALWAYS PRINT RAW TRADES FOR DEBUGGING - FULL LIST
     print("\n" + "="*50)
-    print("DEBUG: RAW TRADE LISTS")
+    print("DEBUG: RAW TRADE LISTS (FULL - NO TRUNCATION)")
     print("="*50)
+    
     print("LIVE TRADES:")
-    print(live_trades[['live_entry_time', 'live_direction', 'live_entry_price', 'live_pnl']])
+    print(live_trades[['live_entry_time', 'live_direction', 'live_entry_price', 'live_pnl']].to_string())
+    
     print("\nBACKTEST TRADES:")
     if not bt_trades.empty:
-        print(bt_trades[['bt_entry_time', 'bt_direction', 'bt_entry_price', 'bt_pnl']])
+        # Sort for readability
+        bt_trades = bt_trades.sort_values('bt_entry_time') # Changed from 'entry_time' to 'bt_entry_time' to match new column name
+        print(bt_trades[['bt_entry_time', 'bt_direction', 'bt_entry_price', 'bt_pnl', 'bt_reason']].to_string()) # Added reason
 
 if __name__ == "__main__":
     compare_live_vs_backtest()
