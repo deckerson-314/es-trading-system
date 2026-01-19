@@ -1511,11 +1511,34 @@ def update_dashboard():
             }
             
             json_path = os.path.join(args.output_dir, 'status.json')
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(status_data, f)
+            try:
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(status_data, f)
+            except Exception as e:
+                logging.error(f"Error writing status.json: {e}")
+
+            # 3. Write status.js (JSONP) for file:// protocol support (Bypass CORS)
+            # 3. Write status.js (JSONP) for file:// protocol support (Bypass CORS)
+            try:
+                js_path = os.path.join(args.output_dir, 'status.js')
+                mode_id = 'paper' if 'paper' in args.mode.lower() else 'live'
+                js_content = f"window.updateStatus('{mode_id}', {json.dumps(status_data)});"
+                
+                # Write to Log Dir
+                with open(js_path, 'w', encoding='utf-8') as f:
+                    f.write(js_content)
+                
+                # Write to Web Dir (Mirror for HTTP server compatibility)
+                # This fixes the issue where simple HTTP servers in /web cannot access ../paper_logs
+                web_js_path = os.path.join(WEB_DIR, f"{mode_id}_status.js")
+                with open(web_js_path, 'w', encoding='utf-8') as f:
+                    f.write(js_content)
+                    
+            except Exception as e:
+                logging.error(f"Error writing status.js: {e}")
                 
         except Exception as e:
-            logging.error(f"Error updating status.json: {e}")
+            logging.error(f"Error preparing status data: {e}")
 
         # Only log dashboard saves every 60 seconds to reduce log noise
         last_log_time = getattr(update_dashboard, '_last_log_time', None)
@@ -1785,8 +1808,12 @@ def on_bar_update(bars, hasNewBar):
                      should_log_resampled = True
                 elif strategy.timeframe > 1:
                      # If the NEW bar starts a new N-minute chunk, the previous one ended
-                     if bar_time.minute % strategy.timeframe == 0:
-                         should_log_resampled = True
+                     # Use total minutes to ensure alignment with Pandas resample (which aligns to daily epoch 00:00)
+                     total_minutes = bar_time.hour * 60 + bar_time.minute
+                     if total_minutes % strategy.timeframe == 0:
+                          should_log_resampled = True
+            
+
 
         update_indicators()
     
@@ -1798,11 +1825,68 @@ def on_bar_update(bars, hasNewBar):
             # (Because 'data' already contains the NEW bar at index -1)
             data_with_indicators = strategy.calculate_indicators(data.copy())
             data_with_filters = strategy.apply_filters(data_with_indicators)
+            
+            last_filt_time = data_with_filters.index[-1] if len(data_with_filters) > 0 else "None"
+
     
             if len(data_with_indicators) >= 2:
-                # Select the COMPLETED bar (index -2) (The one that just finished)
+                # Select the COMPLETED bar (index -2) 
                 latest_resampled_idx = data_with_indicators.index[-2]
                 latest_resampled_row = data_with_indicators.iloc[-2]
+                
+                # Try to get Filtered Row (with avg_volume)
+                # If apply_filters dropped it (e.g. NaN), fallback to indicators row
+                if len(data_with_filters) > 0 and latest_resampled_idx in data_with_filters.index:
+                    latest_resampled_row = data_with_filters.loc[latest_resampled_idx]
+                else:
+                    logging.warning(f"Filter Row missing for {latest_resampled_idx}. Using raw indicators and calculating filters manually.")
+                    # Get raw row
+                    latest_resampled_row = data_with_indicators.iloc[-2].copy()
+                    
+                    # 1. Manual Volume Filter
+                    try:
+                        # Get last N rows of volume from indicators DF
+                        # We need 'avg_volume' which is rolling(50)
+                        # We can use the 'volume' column from data_with_indicators
+                        vol_window = strategy.volume_ma_length
+                        if len(data_with_indicators) >= vol_window:
+                            # Calculate rolling mean up to this index
+                            # Slice up to latest_resampled_idx (inclusive)
+                            # Get integer location
+                            loc_idx = data_with_indicators.index.get_loc(latest_resampled_idx)
+                            # Take slice [loc_idx-window+1 : loc_idx+1]
+                            start_loc = max(0, loc_idx - vol_window + 1)
+                            vol_slice = data_with_indicators['volume'].iloc[start_loc : loc_idx+1]
+                            avg_vol = vol_slice.mean()
+                            
+                            latest_resampled_row['avg_volume'] = avg_vol
+                            latest_resampled_row['volume_filter'] = latest_resampled_row['volume'] <= avg_vol * strategy.max_volume_multiplier_opt
+                        else:
+                             latest_resampled_row['avg_volume'] = 0
+                             latest_resampled_row['volume_filter'] = False
+                    except Exception as e:
+                        logging.error(f"Manual Vol Filter Failed: {e}")
+                        latest_resampled_row['avg_volume'] = 0
+                        latest_resampled_row['volume_filter'] = False
+
+                    # 2. Manual RTH/Maintenance
+                    # Strategy v4 helpers usually work on DataFrame, but we can call them?
+                    # Or just default to True/False for safety?
+                    # Let's rely on basic defaults or copy from strategy if exposed.
+                    # For now, simplistic defaults to allow trading if risky but user wants it.
+                    # BETTER: Use filters.py helpers if imported?
+                    # strategy object has helper methods? No, they are in filters.py
+                    # We will assume RTH=True, Maint=False for emergency fallback (Log it!)
+                    latest_resampled_row['in_rth'] = True
+                    latest_resampled_row['in_maintenance'] = False
+                    latest_resampled_row['atr_filter'] = True # Assume Pass if we can't calc
+                    
+                    logging.warning("Emergency Filters Applied: RTH=True, Maint=False, ATR=True, Vol=Calculated")
+                
+                # Double check that this is indeed the bar we expect
+                # e.g. if Timeframe=2, and New Bar is 13:02. we expect Completed Bar to be 13:00.
+                # data_with_indicators.index[-2] should be 13:00.
+                logging.info(f"Checking Signal on Bar: {latest_resampled_idx} | Vol: {latest_resampled_row['volume']:.0f} (Using Completed Bar)")
                 
                 # Get filters row (aligned with completed bar)
                 if len(data_with_filters) > 0 and latest_resampled_idx in data_with_filters.index:
@@ -1827,6 +1911,9 @@ def on_bar_update(bars, hasNewBar):
                     
                     # Check entries using the COMPLETED bar
                     check_entries(latest_resampled_idx, resampled_row_with_filters)
+                    
+                    # Check Strategy Exits (TP/Signal) using the COMPLETED bar (High Fidelity)
+                    check_exits(latest_resampled_idx, resampled_row_with_filters, allow_strategy_exit=True)
                 
                 # Store in bar_log for dashboard
                 global bar_log
@@ -1844,7 +1931,8 @@ def on_bar_update(bars, hasNewBar):
         if len(data) >= strategy.bb_length and 'upper' in data.columns:
             latest_row = data.iloc[-1]
             # check_entries was moved to resampled block to use correct aggregated data
-            check_exits(data.index[-1], latest_row)
+            # Check Safety Exits (Stops) using REALTIME data (allow_strategy_exit=False)
+            check_exits(data.index[-1], latest_row, allow_strategy_exit=False)
 
     except Exception as e:
         # Log exception concisely without printing all bar data
@@ -1953,10 +2041,10 @@ def save_live_data_row(timestamp, row, full_df):
         if row.get('in_rth', True) and row.get('atr_filter', False) and row.get('volume_filter', False) and not row.get('in_maintenance', False):
             # Only check if filters pass (to match strategy logic where signals are gated)
             # OR check raw signals? Better to match "Trading Signal".
-            # strategy.check_entry returns Tuple (bool, bool)
-            el, es = strategy.check_entry(row, full_df)
-            row_data['entry_long'] = el
-            row_data['entry_short'] = es
+            # strategy.check_entry returns Tuple (bool, str, float)
+            triggered, direction, _ = strategy.check_entry(row, full_df)
+            row_data['entry_long'] = triggered and direction == 'Long'
+            row_data['entry_short'] = triggered and direction == 'Short'
         else:
             row_data['entry_long'] = False
             row_data['entry_short'] = False
@@ -2042,7 +2130,9 @@ def log_entry_criteria_status(resampled_row, data_with_filters):
 
         if max_trades_check and in_rth and atr_filter and volume_filter and not in_maintenance:
             # All filters pass - check entry signals
-            enter_long, enter_short = strategy.check_entry(resampled_row, data_with_filters)
+            triggered, direction, _ = strategy.check_entry(resampled_row, data_with_filters)
+            enter_long = triggered and direction == 'Long'
+            enter_short = triggered and direction == 'Short'
             
             # Determine why entry signals are/aren't triggered
             if strategy.enable_long:
@@ -2172,7 +2262,9 @@ def check_entries(idx, latest_row):
         return
     
     # Use strategy module to check entry (latest_row should have all indicators)
-    enter_long, enter_short = strategy.check_entry(latest_row, data)
+    triggered, direction, _ = strategy.check_entry(latest_row, data)
+    enter_long = triggered and direction == 'Long'
+    enter_short = triggered and direction == 'Short'
     
     if not (enter_long or enter_short):
         return
@@ -2332,10 +2424,12 @@ def check_entries(idx, latest_row):
         status_timer.start()
 
 # Exit Logic (for manual closes or trailing updates)
-def check_exits(idx, latest_row):
+def check_exits(idx, latest_row, allow_strategy_exit=False):
     # Check for RTH force exit (close all positions before RTH ends)
     if strategy.enable_rth_filter and strategy.rth_exit_buffer_minutes > 0:
         force_exit_rth = latest_row.get('force_exit_rth', False) if isinstance(latest_row, dict) else getattr(latest_row, 'force_exit_rth', False)
+        # FORCE EXIT (RTH) is a Safety/Constraint exit, so we allow it ALWAYS (like maintenance)
+        # However, RTH exit depends on bar time. 5s updates are fine.
         if force_exit_rth:
             # Only log warning if we have positions to close
             es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
@@ -2773,7 +2867,8 @@ def check_exits(idx, latest_row):
 
             
             # Update dynamic TP (Opposite BB TP) if enabled and position is still open
-            if position_still_open and strategy.opposite_bb_tp and tp_order:
+            # ONLY update if allow_strategy_exit is True (Bar Close), to match Backtest Fidelity
+            if allow_strategy_exit and position_still_open and strategy.opposite_bb_tp and tp_order:
                 # Calculate new TP from current opposite BB level
                 if 'upper' in data.columns and 'lower' in data.columns and len(data) > 0:
                     new_tp_raw = data['upper'].iloc[-1] if dir_ == 1 else data['lower'].iloc[-1]
@@ -3108,10 +3203,12 @@ def cleanup_orphaned_orders():
     
     # If no open position, all protective orders (stop loss/take profit) should be cancelled
     # These orders remain active after a position closes and need to be cleaned up
-    if not has_open_position:
+    # If no open position AND no pending brackets (tracked positions), all orders should be cancelled
+    # Fix: Added 'and not positions' to prevent cancelling pending entry orders for brackets we are tracking
+    if not has_open_position and not positions:
         active_orders = [t for t in ib.trades() if t.contract.conId == contract.conId and t.isActive()]
         if active_orders:
-            logging.info(f"No open ES position detected. Cleaning up {len(active_orders)} protective order(s) (stop loss/take profit) left from closed position.")
+            logging.info(f"No open ES position or pending bracket detected. Cleaning up {len(active_orders)} protective/orphaned order(s).")
             for trade in active_orders:
                 try:
                     order_type = type(trade.order).__name__

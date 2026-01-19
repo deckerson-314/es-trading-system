@@ -94,13 +94,14 @@ def download_futures_data_chunked(host, port, symbol='ES', exchange='CME', curre
         all_bars_df.rename(columns={'date': 'datetime', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
         all_bars_df.set_index('datetime', inplace=True)
 
-        base_dir = "/content/drive/MyDrive/TradingStrategyOptimization"
-        data_dir = os.path.join(base_dir, "data")
+        # base_dir = "/content/drive/MyDrive/TradingStrategyOptimization"
+        # data_dir = os.path.join(base_dir, "data")
+        data_dir = r"c:\Trading"
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
             
         timestamp = datetime.datetime.now().strftime("%Y%m%d")
-        filename = f"{symbol}_1min_90D_{timestamp}.csv"
+        filename = f"{symbol}_1min_Dec29_31_{timestamp}.csv"
         filepath = os.path.join(data_dir, filename)
         
         all_bars_df.to_csv(filepath)
@@ -114,103 +115,24 @@ def download_futures_data_chunked(host, port, symbol='ES', exchange='CME', curre
             ib.disconnect()
 
 def download_overlap_check(host, port, symbol='ES', exchange='CME', currency='USD'):
-    """
-    Downloads a 1-hour chunk of data overlapping with the known end date (2025-10-10 16:55:00)
-    to verify data consistency.
-    Target: 1 Hour ending 2025-10-10 17:00:00 (should cover the 16:55 bar).
-    """
-    ib = IB()
-    try:
-        print(f"Connecting to IBKR for OVERLAP CHECK at {host}:{port}...")
-        ib.connect(host, port, clientId=2, timeout=20)
-        
-        contract = Future(symbol=symbol, exchange=exchange, currency=currency)
-        contracts = ib.reqContractDetails(contract)
-        if not contracts:
-            print("Error: Contract not found.")
-            return
-
-        # Find contract matching the date? Or just use front month and hope continuous?
-        # Actually, if we ask for historical data for Oct 2025, we might need the specific contract for that time 
-        # OR just mapping the continuous.
-        # Let's use the explicit request logic with 'TRADES'.
-        
-        # NOTE: 2025-10-10 is likely the contract expiration related? 
-        # Check active contract for that date?
-        # We will try the first returned contract (front month) but specifing endDateTime far in past might require 'CONTFUT'?
-        # Or let's assume 'ES' continuous mapping works if we request it.
-        # But `reqHistoricalData` on a specific contract object usually requires that contract to be valid for that date.
-        
-        # Let's try using the 'Continuous Future' if possible, or just the front month and request old date.
-        # The original script does: front_month_contract = sorted(...)[0].contract
-        
-        target_contract = sorted(contracts, key=lambda c: c.contract.lastTradeDateOrContractMonth)[0].contract
-        print(f"Using contract: {target_contract.localSymbol}")
-
-        end_time_str = "20251010 17:00:00" 
-        print(f"Requesting 1 Hour of data ending {end_time_str}...")
-        
-        bars = ib.reqHistoricalData(
-            target_contract,
-            endDateTime=end_time_str,
-            durationStr="3600 S", # 1 Hour
-            barSizeSetting="1 min",
-            whatToShow="TRADES",
-            useRTH=False,
-            formatDate=1
-        )
-        
-        if not bars:
-            print("Error: No data returned from IBKR for this period.")
-            return
-
-        print(f"Received {len(bars)} bars.")
-        df = util.df(bars)
-        if df is not None:
-            df.rename(columns={'date': 'datetime', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-            df.set_index('datetime', inplace=True)
-            
-            # Save to temp file
-            out_file = "c:\\Trading\\overlap_test_ibkr.csv"
-            df.to_csv(out_file)
-            print(f"Overlap data saved to: {out_file}")
-            print("Please inspect this file and compare with your main data.")
-            print(df.tail())
-            
-    except Exception as e:
-        print(f"Overlap Check Error: {e}")
-    finally:
-        if ib.isConnected():
-            ib.disconnect()
+    pass # Skipped for now
 
 if __name__ == '__main__':
     util.patchAsyncio()
     
-    print("Please provide the ngrok connection details from your terminal.")
-    # ngrok_host = input("Enter ngrok host (e.g., 0.tcp.ngrok.io): ")
-    # ngrok_port = int(input("Enter ngrok port (e.g., 12345): "))
+    # args = sys.argv # Could use args but hardcoding is faster for this task
+    host = "127.0.0.1"
+    port = 7496 # TWS Default
     
-    # download_futures_data_chunked(ngrok_host, ngrok_port)
+    # We need data ending NOW (Dec 31) back to Dec 29.
+    # Duration: 3 days.
+    # End Date: Now (or hardcoded to Dec 31 end of day if looking back)
+    # Actually, reqHistoricalData with EndDateTime='' gets until now.
+    # If we want 3 days back from now, that covers Dec 29-31.
     
-    # Hardcoded local for testing if needed, or prompt
-    print("--- MODE SELECTION ---")
-    print("1. Standard Download")
-    print("2. Overlap Check (1 Hour)")
-    mode = input("Select Mode (1/2): ")
+    total_days = 4 # 29, 30, 31 + little buffer
+    chunk_days = 2
     
-    host = input("Enter Host (default 127.0.0.1): ") or "127.0.0.1"
-    port = input("Enter Port (default 7496 for TWS, 4001 for Gateway): ") or "7496"
-    port = int(port)
-        
-    if mode == '2':
-        download_overlap_check(host, port)
-    else:
-        # Calculate days from 2025-10-10 to NOW
-        start_date = datetime.datetime(2025, 10, 10)
-        now = datetime.datetime.now()
-        days_diff = (now - start_date).days + 5 # +buffer
-        print(f"Calculated Gap: {days_diff} days (from {start_date.date()} to Now)")
-        
-        chunk = 5 # Safety for chunks
-        download_futures_data_chunked(host, port, total_days=days_diff, chunk_days=chunk)
+    print(f"Downloading last {total_days} days of ES data...")
+    download_futures_data_chunked(host, port, total_days=total_days, chunk_days=chunk_days)
 

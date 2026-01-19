@@ -244,7 +244,7 @@
             </a>
 
             <!-- Comparison Charts -->
-            <a href="../comparison_charts" class="card" target="_blank">
+            <a href="../comparison_charts/index.html" class="card" target="_blank">
                 <div class="card-icon">📊</div>
                 <div class="card-title">Comparison Charts</div>
                 <div class="card-desc">
@@ -254,7 +254,7 @@
             </a>
 
             <!-- System Info -->
-            <a href="../system_architecture.md" class="card" target="_blank">
+            <a href="system_architecture.html" class="card" target="_blank">
                 <div class="card-icon">🏗️</div>
                 <div class="card-title">System Architecture</div>
                 <div class="card-desc">
@@ -269,15 +269,9 @@
     </div>
 
     <script>
-        // Fetch Function
-        async function fetchStatus(url, prefix) {
+        // JSONP Callback Function
+        window.updateStatus = function (prefix, data) {
             try {
-                // Add timestamp to prevent caching
-                const response = await fetch(url + '?t=' + new Date().getTime());
-                if (!response.ok) throw new Error('Network response was not ok');
-
-                const data = await response.json();
-
                 // Update Badge
                 const badge = document.getElementById(prefix + '-conn');
                 if (data.connected) {
@@ -301,21 +295,32 @@
                 document.getElementById(prefix + '-last-update').innerText = 'Last: ' + data.last_update;
 
             } catch (error) {
-                // Set offline if fetch fails
-                const badge = document.getElementById(prefix + '-conn');
-                badge.className = 'status-badge status-offline';
-                badge.innerText = 'OFFLINE';
+                console.error("Error updating status UI:", error);
             }
+        };
+
+        // Script Injection for JSONP (Bypasses CORS)
+        function injectScript(src) {
+            const script = document.createElement('script');
+            script.src = src + '?t=' + new Date().getTime(); // Bust cache
+            script.onload = () => script.remove(); // Clean up
+            script.onerror = () => {
+                script.remove();
+                // Optional: Handle offline state here if needed
+            };
+            document.body.appendChild(script);
         }
 
         function updateStats() {
-            // Assume relative paths based on standard directory structure
-            fetchStatus('../paper_logs/status.json', 'paper');
-            fetchStatus('../live_logs/status.json', 'live');
+            // Inject scripts to fetch status via JSONP
+            // Now points to local files mirrored in the web folder for better HTTP server compatibility
+            injectScript('paper_status.js');
+            injectScript('live_status.js');
         }
 
         // Initial Load + Interval
-        updateStats();
+        // Wait 1s for initial load to allow page render
+        setTimeout(updateStats, 1000);
         setInterval(updateStats, 5000); // Poll every 5 seconds
     </script>
 </body>

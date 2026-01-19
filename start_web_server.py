@@ -24,6 +24,18 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
     
     def end_headers(self):
+        # Explicitly set charset for HTML and JSON to ensure Unicode displays correctly
+        # This fixes the issue with missing emojis (âœ… vs âŒ) in the dashboard
+        path = self.path.lower()
+        if path.endswith('.html') or path.endswith('.htm'):
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+        elif path.endswith('.json'):
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+        elif path.endswith('.js'):
+            self.send_header('Content-Type', 'application/javascript; charset=utf-8')
+        elif path.endswith('.css'):
+            self.send_header('Content-Type', 'text/css; charset=utf-8')
+            
         # Add CORS headers for cross-origin requests
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')

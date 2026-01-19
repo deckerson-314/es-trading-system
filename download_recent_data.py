@@ -5,12 +5,24 @@ import os
 
 def download_recent_data():
     ib = IB()
+    ports = [7497, 7496, 4002, 4001]
+    connected = False
+    
     try:
-        print("Connecting to download recent data (Client ID 101)...")
-        # Use clientId 101 to avoid conflict with live script (100)
-        ib.connect('127.0.0.1', 7497, clientId=101, timeout=20)
-        print("Connected.")
-        
+        for port in ports:
+            try:
+                print(f"Attempting connection on port {port} (Client ID 101)...")
+                ib.connect('127.0.0.1', port, clientId=101, timeout=10)
+                print(f"Connected on port {port}.")
+                connected = True
+                break
+            except Exception:
+                continue
+                
+        if not connected:
+            print("Could not connect to any standard IBKR port.")
+            return
+
         contract = Future(symbol='ES', exchange='CME', currency='USD')
         details = ib.reqContractDetails(contract)
         if not details:

@@ -82,6 +82,17 @@ def refactor_html():
     new_code.append('    html_content += "<h2>Pareto Size</h2>\\n"\n')
     new_code.append(f'    html_content += f"{{paretosize_div}}\\n"\n')
     
+    # Deep Dive Analysis Links (New for V4 Upgrade)
+    new_code.append('    html_content += "<h2>Deep Dive Analysis (New V4)</h2>\\n"\n')
+    new_code.append('    html_content += "<div class=\'info-section\'>\\n"\n')
+    new_code.append('    html_content += "  <p>View detailed parameter analysis reports (generated separately):</p>\\n"\n')
+    new_code.append('    html_content += "  <ul>\\n"\n')
+    new_code.append('    html_content += "    <li><a href=\'parameter_analysis/parameter_correlation.html\' target=\'_blank\'>Correlation Heatmap (Parameters vs Metrics)</a></li>\\n"\n')
+    new_code.append('    html_content += "    <li><a href=\'parameter_analysis/parameter_importance_TotalPnL.html\' target=\'_blank\'>Parameter Importance (Total PnL)</a></li>\\n"\n')
+    new_code.append('    html_content += "    <li><a href=\'parameter_analysis/parameter_interactions.html\' target=\'_blank\'>Parameter Interactions (Scatter Matrix)</a></li>\\n"\n')
+    new_code.append('    html_content += "  </ul>\\n"\n')
+    new_code.append('    html_content += "</div>\\n"\n')
+    
     # OOS, Comparison, All Solutions
     new_code.append('    html_content += "<h2>Data Split Information</h2>\\n"\n')
     new_code.append('    html_content += "<div class=\'info-section\'>Data split into IS and OOS periods.</div>\\n"\n')

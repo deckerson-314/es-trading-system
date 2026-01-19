@@ -211,6 +211,12 @@ def run_backtest_v4(data_path, params_source, suppress_log=False, start_date=Non
         
         if not suppress_log:
             log("Generating signals (Vectorized)...", log_file)
+            
+        # DEBUG DUMP
+        try:
+             df.to_csv('c:\\Trading\\debug_processed_df.csv')
+        except: pass
+        
         entry_long_signals, entry_short_signals = strategy.calculate_entry_signals(df)
         df['entry_long_signal'] = entry_long_signals
         df['entry_short_signal'] = entry_short_signals
@@ -228,9 +234,23 @@ def run_backtest_v4(data_path, params_source, suppress_log=False, start_date=Non
         # Get Transaction Cost
         transaction_cost = params_dict.get('Transaction Cost (Per Trade)', {'value': 20.0})['value']
         
+        # DEBUG PRE-LOOP
+        log(f"DEBUG: df length before loop: {len(df)}", log_file)
+        check_ts = pd.Timestamp("2026-01-15 09:12:00")
+        if check_ts in df.index:
+             log(f"DEBUG: 09:12 IS IN INDEX! Row: {df.loc[check_ts]}", log_file)
+        else:
+             log(f"DEBUG: 09:12 IS NOT IN INDEX!", log_file)
+        
         for row in rows:
+            # DEBUG ZOMBIE / SIGNAL
+            if str(row.Index).startswith('2026-01-15 09'):
+                log(f"[DEBUG LOOP] {row.Index} (Type={type(row.Index)}) - OpenPos={len(open_positions)} ShortSig={getattr(row, 'entry_short_signal', 'MISSING')}", log_file)
+
             # 1. Process Pending Entry (Execute at Open of THIS bar)
             if pending_entry:
+                if str(row.Index).startswith('2026-01-15 09:1'):
+                    log(f"[DEBUG LOOP] EXECUTING PENDING at {row.Index}", log_file)
                 direction = pending_entry['direction']
                 # Use OPEN price of proper next bar
                 # Note: setup_position logic should use row.open
@@ -268,13 +288,32 @@ def run_backtest_v4(data_path, params_source, suppress_log=False, start_date=Non
                     positions.append(trade)
                     open_positions.pop(i) 
             
-            # 3. Check Entries (Generate Signal for NEXT bar)
-            # Only if we don't have a pending entry and haven't maxed out
-            if len(open_positions) < strategy.max_open_trades and pending_entry is None:
-                if row.entry_long_signal:
-                    pending_entry = {'direction': 1}
-                elif row.entry_short_signal:
-                    pending_entry = {'direction': -1}
+            # 3. Check Entries
+            if not open_positions:
+                 if row.entry_long_signal:
+                     pending_entry = {'direction': 1, 'signal_time': row.Index}
+                     if str(row.Index).startswith('2026-01-15 09:1'):
+                         log(f"[DEBUG LOOP] PENDING LONG SET at {row.Index}", log_file)
+                 elif row.entry_short_signal:
+                     pending_entry = {'direction': -1, 'signal_time': row.Index}
+                     if str(row.Index).startswith('2026-01-15 09:1'):
+                         log(f"[DEBUG LOOP] PENDING SHORT SET at {row.Index}", log_file)
+            
+            # 1. Process Pending Entry (Execute at Open of THIS bar)
+            # (Note: This block is at START of loop, so it executes for PREVIOUS bar's signal)
+            # But here in Python loop, we are at step i.
+            # If pending_entry was set at step i-1, it should execute at step i.
+            
+            # WAIT! The Pending Entry block is at the TOP of the loop (Line 232).
+            # The Check Entries block is at the BOTTOM (Line 251).
+            # So:
+            # Iteration 09:12 (Step i):
+            #   Top: pending_entry is None.
+            #   Bottom: entry_short_signal True. pending_entry set.
+            # Iteration 09:14 (Step i+1):
+            #   Top: pending_entry is NOT None. Execute.
+            
+            # Let's verify execution block print.
         
         # 6. Reporting
         if not suppress_log:

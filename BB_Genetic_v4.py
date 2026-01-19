@@ -10,7 +10,11 @@ import multiprocessing
 import signal
 import time
 import glob
+import array
 from datetime import datetime, timedelta
+
+# Import Restoration Script for Interactive Dashboard
+from restore_param_analysis import generate_interactive_analysis, extract_chart_html
 
 import hashlib
 
@@ -266,6 +270,7 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     # Simulation (Optimized Loop)
     positions = []
     trades = []
+    pending_entry = None # Track pending entry
     
     # Pre-calculate signals (already in columns)
     # Using itertuples is efficient enough for Python loop
@@ -274,27 +279,38 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     transaction_cost = param_dict_local.get('Transaction Cost (Per Trade)', {'value': 20.0})['value']
     
     for row in df.itertuples():
-        # Check exits first
+        # 1. Process Pending (Execute at Next Open)
+        if pending_entry:
+            dir_ = pending_entry['direction']
+            # Execute at OPEN
+            positions.append(strategy.setup_position(row.open, dir_, row, df))
+            pending_entry = None
+
+        # 2. Check exits first
         for pos in positions[:]:
             strategy.update_trailing_stop(pos, row, df)
             should_exit, reason, price = strategy.check_exit(pos, row, df)
             
             if should_exit:
                 pnl = (price - pos['entry_price']) * pos['direction'] * 50 - transaction_cost
+                # Use End of Bar for Exit Time to match BB_Strategy_v4.py logic
+                exit_time = row.Index + pd.Timedelta(minutes=strategy.timeframe)
                 trades.append(pos | {
-                    'exit_time': row.Index,
+                    'exit_time': exit_time,
                     'exit_price': price,
                     'pnl': pnl,
                     'reason': reason
                 })
                 positions.remove(pos)
         
-        # Check entries (Vectorized lookup)
-        if len(positions) < strategy.max_open_trades:
+        # 3. Check entries (Vectorized lookup)
+        # Note: If we just executed a pending entry, we CANNOT generate another signal in the same bar (usually)
+        # But even if we could, we would just set pending_entry again for the NEXT bar.
+        if len(positions) < strategy.max_open_trades and pending_entry is None:
             if row.entry_long_signal:
-                positions.append(strategy.setup_position(row.close, 1, row, df))
+                pending_entry = {'direction': 1}
             elif row.entry_short_signal:
-                positions.append(strategy.setup_position(row.close, -1, row, df))
+                pending_entry = {'direction': -1}
     
     # Final cleanup (close open positions at end)
     for pos in positions:
@@ -1272,9 +1288,13 @@ def generate_parameter_analysis(hof, param_keys, param_dict, current_gen):
                     std = df_analysis[col].std()
                     importance[col] = std / p_range
     
-    # Get all parameters sorted by importance (User requested ALL parameters)
-    top_params = sorted(importance.items(), key=lambda x: x[1], reverse=True)
-    top_param_names = [p[0] for p in top_params]
+    # Get all parameters sorted by CSV order (param_keys) as requested
+    # Filter to include only those present in analysis
+    top_param_names = [p for p in param_keys if p in df_analysis.columns and p in param_dict]
+
+    # Use importance only for logging or fallback
+    # top_params = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+    # top_param_names = [p[0] for p in top_params]
     
     if not top_param_names:
         return "<p>Not enough variation to analyze parameters.</p>", ""
@@ -1306,14 +1326,28 @@ def generate_parameter_analysis(hof, param_keys, param_dict, current_gen):
         # Add simpler trendline if enough points
         if len(df_analysis) > 5:
              try:
-                 z = np.polyfit(df_analysis[param], df_analysis['Sortino'], 1)
-                 p = np.poly1d(z)
-                 x_range = np.linspace(df_analysis[param].min(), df_analysis[param].max(), 10)
-                 fig.add_trace(
-                     go.Scatter(x=x_range.tolist(), y=p(x_range).tolist(), mode='lines', line=dict(color='red', width=2, dash='dash'), showlegend=False),
-                     row=row, col=col
-                 )
-             except:
+                 x_fit = df_analysis[param]
+                 y_fit = df_analysis['Sortino']
+                 
+                 # Drop NaNs/Infs
+                 mask = np.isfinite(x_fit) & np.isfinite(y_fit)
+                 x_fit = x_fit[mask]
+                 y_fit = y_fit[mask]
+                 
+                 # Robust check: Variance > 0 and enough points
+                 if len(x_fit) > 1 and x_fit.std() > 1e-9:
+                     z = np.polyfit(x_fit, y_fit, 1)
+                     p = np.poly1d(z)
+                     x_range = np.linspace(x_fit.min(), x_fit.max(), 10)
+                     fig.add_trace(
+                         go.Scatter(x=x_range.tolist(), y=p(x_range).tolist(), mode='lines', line=dict(color='red', width=2, dash='dash'), showlegend=False),
+                         row=row, col=col
+                     )
+                 else:
+                     fig.add_trace(go.Scatter(x=[], y=[], mode='lines', line=dict(color='red'), showlegend=False), row=row, col=col)
+             except Exception:
+                # Add empty trace to maintain index sync for dropdown updates
+                fig.add_trace(go.Scatter(x=[], y=[], mode='lines', line=dict(color='red'), showlegend=False), row=row, col=col)
                 # Add empty trace to maintain index sync for dropdown updates
                 fig.add_trace(go.Scatter(x=[], y=[], mode='lines', line=dict(color='red'), showlegend=False), row=row, col=col)
         else:
@@ -1381,11 +1415,20 @@ def generate_parameter_analysis(hof, param_keys, param_dict, current_gen):
                     # Robust polyfit
                     x_vals = df_analysis[param]
                     y_vals = df_analysis[m_col]
-                    z = np.polyfit(x_vals, y_vals, 1)
-                    p = np.poly1d(z)
-                    x_range = np.linspace(x_vals.min(), x_vals.max(), 10)
-                    trend_y = p(x_range).tolist()
-                    update_y.append(trend_y)
+                    
+                    # Drop NaNs
+                    mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+                    x_vals = x_vals[mask]
+                    y_vals = y_vals[mask]
+
+                    if len(x_vals) > 1 and x_vals.std() > 1e-9:
+                        z = np.polyfit(x_vals, y_vals, 1)
+                        p = np.poly1d(z)
+                        x_range = np.linspace(x_vals.min(), x_vals.max(), 10)
+                        trend_y = p(x_range).tolist()
+                        update_y.append(trend_y)
+                    else:
+                         update_y.append([])
                 except:
                     update_y.append([]) # Empty trend
             else:
@@ -2152,7 +2195,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     if generate_param_analysis:
         try:
              # Pass current generation number for context
-             p_div, p_script = generate_parameter_analysis(hof, param_keys, param_dict, current_gen)
+             p_div, p_script = generate_interactive_analysis(hof, param_keys, param_dict, current_gen)
              param_analysis_html = p_div
              param_analysis_scripts = p_script
         except Exception as e:
@@ -2633,6 +2676,18 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     html_content += f"{pareto2d_div}\n"
     html_content += "<h2>Pareto Size</h2>\n"
     html_content += f"{paretosize_div}\n"
+
+    # Deep Dive Analysis Links (New for V4 Upgrade)
+    html_content += "<h2>Deep Dive Analysis</h2>\n"
+    html_content += "<div class='info-section'>\n"
+    html_content += "  <p>View detailed parameter analysis reports (generated separately):</p>\n"
+    html_content += "  <ul>\n"
+    html_content += "    <li><a href='parameter_analysis/parameter_correlation.html' target='_blank'>Correlation Heatmap (Parameters vs Metrics)</a></li>\n"
+    html_content += "    <li><a href='parameter_analysis/parameter_importance_TotalPnL.html' target='_blank'>Parameter Importance (Total PnL)</a></li>\n"
+    html_content += "    <li><a href='parameter_analysis/parameter_interactions.html' target='_blank'>Parameter Interactions (Scatter Matrix)</a></li>\n"
+    html_content += "  </ul>\n"
+    html_content += "</div>\n"
+
     html_content += "<h2>Data Split Information</h2>\n"
     html_content += "<div class='info-section'>Data split into IS and OOS periods.</div>\n"
     

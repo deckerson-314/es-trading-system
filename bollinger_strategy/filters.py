@@ -229,12 +229,21 @@ def apply_maintenance_filter(df, enable_maintenance_filter,
     daily_start_with_buffer = time_add_minutes(daily_start, -buffer_minutes)
     daily_end_with_buffer = time_add_minutes(daily_end, buffer_minutes)
     
+
+    
     # Check daily maintenance
     if daily_start <= daily_end:
         # Normal case: maintenance doesn't span midnight
         in_daily_maintenance = df['time_of_day'].between(daily_start, daily_end, inclusive='both')
         in_daily_block = df['time_of_day'].between(daily_start_with_buffer, daily_end_with_buffer, inclusive='both')
         force_daily_exit = df['time_of_day'].between(daily_start_with_buffer, daily_start, inclusive='left')
+        
+        
+        # DEBUG CHECK
+        # debug_check = force_daily_exit & (df['time_of_day'].apply(lambda x: x.hour == 11))
+        # if debug_check.any():
+        #      print("DEBUG: FOUND 11 AM EXIT TRIGGERS!")
+        #      print(df[debug_check][['time_of_day']].head())
     else:
         # Maintenance spans midnight
         in_daily_maintenance = (df['time_of_day'] >= daily_start) | (df['time_of_day'] <= daily_end)

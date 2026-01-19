@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Architecture - Bollinger Strategy</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 2rem;
+            background: #f8fafc;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        h1 {
+            color: #2563eb;
+            text-align: center;
+        }
+
+        .mermaid {
+            display: flex;
+            justify-content: center;
+            margin-top: 2rem;
+        }
+
+        .desc {
+            margin-top: 2rem;
+            line-height: 1.6;
+            color: #475569;
+        }
+    </style>
+    <!-- Load Mermaid -->
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Bollinger Platform Architecture</h1>
+        <div class="mermaid">
+            graph TD
+            %% Styles
+            classDef logic fill:#f9f,stroke:#333,stroke-width:2px;
+            classDef script fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
+            classDef data fill:#fff9c4,stroke:#fbc02d,stroke-width:2px,shape:cylinder;
+            classDef output fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+            classDef trigger stroke-dasharray: 5 5;
+
+            %% --- 1. CORE LOGIC ---
+            subgraph Core["Shared Strategy Core"]
+            StratLogic[("BollingerBandStrategyV4<br />(bollinger_strategy pkg)")]:::logic
+            end
+
+            %% --- 2. OPTIMIZATION (GA) ---
+            subgraph Optimization["Optimization Engine"]
+            GA["ga_runner_v4.py<br />(Genetic Algorithm)"]:::script
+            HistData[("Historical Data<br />(c:/Trading/data/*.csv)")]:::data
+
+            GA -->|Run| StratLogic
+            GA -->|Read| HistData
+            GA -->|Generate| SolJSON[("solutions.json")]:::data
+            GA -->|Export Best| LiveParams[("live_params.csv")]:::data
+            end
+
+            %% --- 3. LIVE TRADING ---
+            subgraph LiveTrading["Live Execution"]
+            IBLive["ib_deployment_v4.py<br />(IBKR Connection)"]:::script
+            IBKR[("Interactive Brokers<br />(TWS/Gateway)")]
+
+            IBLive -->|Load Config| LiveParams
+            IBLive -->|Execute| StratLogic
+            IBLive <-->|Order/Data| IBKR
+
+                IBLive -->|Log Exec| LiveTradesCSV[("live_trades.csv")]:::data
+                IBLive -->|Log Market| LiveDataCSV[("live_data.csv")]:::data
+                IBLive -->|Log Text| LogFile[("ib_deployment.log")]:::data
+                IBLive -->|Log Status| StatusJS[("status.js")]:::data
+                end
+
+                %% --- 4. BACKTESTING & DASHBOARD ---
+                subgraph Backtesting["Backtesting Engine"]
+                Backtester["run_backtest_v4<br />(Simulation)"]:::script
+                Reporter["reporting.py<br />(Dashboard Gen)"]:::script
+
+                Backtester -->|Simulate| StratLogic
+                Backtester -->|Read| HistData
+                Backtester -->|Generate| BTTrades[("backtest_trades.csv")]:::data
+                Backtester -->|Call| Reporter
+                Reporter -->|Output| Dashboard[("dashboard.html")]:::output
+                end
+
+                %% --- 5. VERIFICATION ---
+                subgraph Verification["Verification Suite"]
+                Comparator["compare_live_vs_backtest.py"]:::script
+                Plotter["plot_comparison.py"]:::script
+
+                Comparator -->|Read| LiveTradesCSV
+                Comparator -->|Read| LiveDataCSV
+                Comparator -->|Read| HistData
+
+                Comparator -->|Re-Run Logic| StratLogic
+                Comparator -- "Compare" --> BTTrades
+
+                Comparator -->|Generate| CompReport[("comparison_result.txt")]:::output
+                Comparator -->|Call| Plotter
+                Plotter -->|Generate| OverlayCharts[("comparison_charts/*.html")]:::output
+                end
+
+                %% Key Relationships
+                LiveParams -.->|Defines Behavior| IBLive
+                LiveParams -.->|Defines Behavior| Backtester
+                LiveTradesCSV -.->|Source of Truth| Comparator
+                StatusJS -.->|Updates UI| Dashboard
+        </div>
+
+        <div class="desc">
+            <h3>Component Descriptions</h3>
+            <ol>
+                <li><strong>Shared Strategy Core (`bollinger_strategy`):</strong> The "Brain". Contains the exact logic
+                    for Entry, Exit, Filters, and Indicators. It is imported by GA, Backtester, and Live Script to
+                    ensure logic parity.</li>
+                <li><strong>Optimization Engine (`ga_runner_v4`):</strong> Evolves parameters against historical data to
+                    find the best configuration, saving it to `live_params.csv`.</li>
+                <li><strong>Live Execution (`ib_deployment_v4`):</strong> Runs the strategy in real-time. It reads
+                    `live_params.csv`, connects to IBKR, and executes trades. It logs data/trades and updates
+                    `status.js` for the dashboard.</li>
+                <li><strong>Verification Suite (`compare_live_vs_backtest`):</strong> The "Auditor". It takes the logs
+                    from the Live session and acts as a forensic tool. It re-runs the Backtester using the exact Live
+                    Data and Parameters to verify that the code did exactly what it was supposed to do.</li>
+            </ol>
+        </div>
+    </div>
+</body>
+
+</html>

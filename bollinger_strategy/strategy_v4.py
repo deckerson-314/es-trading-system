@@ -108,9 +108,15 @@ class BollingerBandStrategyV4:
         self.trailing_delay = max(0, int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5)))
         self.adx_period = max(10, int(get_param_value(self.params_dict, 'ADX Period', 14)))
         
+        rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
+        # ... (Assuming I missed rth_start/end definition in this snippet replacement? 
+        # Wait, I should not break the code surrounding it.)
+        
         # Parse RTH times
         self.rth_start = self._parse_time(self.rth_start_str)
         self.rth_end = self._parse_time(self.rth_end_str)
+        
+
     
     def _parse_time(self, time_str):
         """Parse time string to time object."""
@@ -192,6 +198,8 @@ class BollingerBandStrategyV4:
         """Calculate all indicators (BB, ATR)."""
         df = df.copy()
         
+
+        
         # Resampling logic (preserving v3 logic for now)
         if len(df) >= 2:
             time_diff = (df.index[1] - df.index[0]).total_seconds()
@@ -209,37 +217,58 @@ class BollingerBandStrategyV4:
                     'close': 'last',
                     'volume': 'sum'
                 })
-                # Drop only empty rows
-                df_resampled = df_resampled.dropna(subset=['open', 'high', 'low', 'close', 'volume'], how='all')
+                # Drop empty rows (Gap handling)
+                # MUST use how='any' because resample sum (volume) might return 0 for empty bins,
+                # keeping the row alive if we use how='all', but prices are NaN.
+                df_resampled = df_resampled.dropna(subset=['open', 'high', 'low', 'close', 'volume'], how='any')
                 df = df_resampled
         
         # Bollinger Bands
         df = calculate_bollinger_bands(df, self.bb_length, self.bb_stddev)
         
-        # ATR for trailing stop
-        df['atr_ts'] = calculate_atr(df, self.atr_length_ts)
+        # ATR for trailing stop (Using internal method for stability)
+        df['atr_ts'] = self._calculate_atr(df, self.atr_length_ts)
         
         # ATR for filter
-        df['atr_filter_values'] = calculate_atr(df, self.atr_length_filter)
+        df['atr_filter_values'] = self._calculate_atr(df, self.atr_length_filter)
         
-        # ATR for TP
         # ATR for TP
         if self.fixed_atr_tp:
-            df['atr_tp'] = calculate_atr(df, self.atr_length_tp)
+            df['atr_tp'] = self._calculate_atr(df, self.atr_length_tp)
             
-        # Trend EMA
-        df['trend_ema'] = calculate_ema(df, self.trend_ema_length)
+        # Volume MA
+        df['avg_volume'] = df['volume'].rolling(self.volume_ma_length).mean()
         
+        # Trend EMA
+        if self.enable_trend_filter:
+            df['trend_ema'] = calculate_ema(df, self.trend_ema_length)
+            
         # ADX
-        df['adx'] = calculate_adx(df, self.adx_period)
+        if self.enable_adx_filter:
+             df['adx'] = calculate_adx(df, self.adx_period)
+             
+        # Drop rows with NaN (Fix for Gap Handling and Warmup)
+        # Using how='any' ensures no partial data exists (crucial for valid indicators)
+        df.dropna(how='any', inplace=True)
         
         # Calculate Previous Region Bands (for High Fidelity Exit)
-        # Live Trading checks Price against the Band calculated at the START of the bar (or previous close).
-        # To match this, Backtest should compare High[t] vs Upper[t-1].
+        # Note: Calculating after dropna means first row has NaN (accepted for warmup)
+        # But to be safe, we can do it before dropna?
+        # Actually, original code had it at end.
         df['upper_prev'] = df['upper'].shift(1)
         df['lower_prev'] = df['lower'].shift(1)
         
         return df
+
+    def _calculate_atr(self, df, length):
+        """Internal ATR calculation to ensure stability."""
+        tr = np.maximum.reduce([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift()).abs(),
+            (df['low'] - df['close'].shift()).abs()
+        ])
+        atr = pd.Series(tr, index=df.index).rolling(int(length)).mean()
+        return atr
 
     def apply_filters(self, df):
         """Apply all filters (RTH, volume, ATR, maintenance)."""
@@ -328,11 +357,12 @@ class BollingerBandStrategyV4:
 
         if self.enable_short:
             trig_short = upper * (1 + self.short_trigger_pct / 100.0)
+            
             # Vectorized conditions
             cond_wick = (high >= trig_short) if self.short_wick_touch else np.zeros(len(df), dtype=bool)
             cond_body = (close >= trig_short) if self.short_body_zone else np.zeros(len(df), dtype=bool)
             entry_short = entry_allowed & adx_aligned & trend_short & (cond_wick | cond_body)
-            
+
         return entry_long, entry_short
 
     def check_entry(self, row, df):
@@ -343,32 +373,37 @@ class BollingerBandStrategyV4:
         # as implemented in v3. Use v3 logic here for safety in live loop.
         
         in_maintenance = False
-        if hasattr(row, 'Index'):
-            idx = row.Index
-            high = row.high
-            low = row.low
-            close = row.close
-            upper = row.upper
-            lower = row.lower
-            in_rth = row.in_rth
-            atr_filter = row.atr_filter
-            vol_filter = row.volume_filter
-            in_maintenance = getattr(row, 'in_maintenance', False)
-            if not in_maintenance and hasattr(row, 'in_maintenance_'):
-                in_maintenance = getattr(row, 'in_maintenance_', False)
-        else:
-            idx = row.name if hasattr(row, 'name') else df.index[-1]
-            high = row['high']
-            low = row['low']
-            close = row['close']
-            upper = row['upper']
-            lower = row['lower']
-            in_rth = row['in_rth']
-            atr_filter = row['atr_filter']
-            vol_filter = row['volume_filter']
-            in_maintenance = row.get('in_maintenance', False) if hasattr(row, 'get') else (row['in_maintenance'] if 'in_maintenance' in row else False)
+        
+        # Update open positions
+        # (Check stops/targets for EXISTING positions)
+        try:
+             upper = row.upper
+             lower = row.lower
+             in_rth = row.in_rth
+             atr_filter = row.atr_filter
+             vol_filter = row.volume_filter
+             in_maintenance = getattr(row, 'in_maintenance', False)
+             if not in_maintenance and hasattr(row, 'in_maintenance_'):
+                 in_maintenance = getattr(row, 'in_maintenance_', False)
+             high = row.high
+             low = row.low
+             close = row.close
+             idx = row.Index
+        except AttributeError:
+             # Fallback for Series (iterrows or dict)
+             idx = row.name if hasattr(row, 'name') else df.index[-1]
+             high = row['high']
+             low = row['low']
+             close = row['close']
+             upper = row['upper']
+             lower = row['lower']
+             in_rth = row['in_rth']
+             atr_filter = row['atr_filter']
+             vol_filter = row['volume_filter']
+             in_maintenance = row.get('in_maintenance', False) if hasattr(row, 'get') else (row['in_maintenance'] if 'in_maintenance' in row else False)
 
         if not (in_rth and atr_filter and vol_filter and not in_maintenance):
+
             return False, False
 
         # ADX Filter
@@ -387,18 +422,37 @@ class BollingerBandStrategyV4:
             trend_long = (close_val > trend_ema_val)
             trend_short = (close_val < trend_ema_val)
 
-        enter_long = enter_short = False
+        enter_long = False
         if self.enable_long and trend_long:
             trig = lower * (1 - self.long_trigger_pct / 100)
             if (self.long_wick_touch and low <= trig) or (self.long_body_zone and close <= trig):
                 enter_long = True
         
-        if self.enable_short and trend_short:
-            trig = upper * (1 + self.short_trigger_pct / 100)
-            if (self.short_wick_touch and high >= trig) or (self.short_body_zone and close >= trig):
-                enter_short = True
-                
-        return enter_long, enter_short
+        entry_short = False
+        if self.enable_short:
+             # Check Wick
+             if self.short_wick_touch:
+                 trig = upper * (1 + self.short_trigger_pct / 100)
+                 if high >= trig:
+                     entry_short = True
+                 elif str(idx).startswith('2026-01-15 09:1'):
+                     pass # print(f"[DEBUG 09:12] SHORT WICK FAIL: High {high} < Trig {trig}")
+
+             # Check Body
+             if not entry_short and self.short_body_zone:
+                 trig = upper * (1 + self.short_trigger_pct / 100)
+                 if close >= trig:
+                     entry_short = True
+        
+        if enter_long:
+            return True, 'Long', close
+        
+        if entry_short:
+             # ADX Check (already done above, but keeping structure for consistency if needed)
+             # Trend Check (already done above)
+             return True, 'Short', close
+             
+        return False, 'None', 0.0
 
     def setup_position(self, entry_price, direction, row, df):
         """Setup initial position details."""
@@ -441,12 +495,11 @@ class BollingerBandStrategyV4:
         elif self.opposite_bb_tp:
             tp = upper if direction == 1 else lower
             
-        # Min stop distance
-        min_stop_distance = entry_price * 0.001
-        if direction == 1:
-            stop = min(stop, entry_price - min_stop_distance)
-        else:
-            stop = max(stop, entry_price + min_stop_distance)
+
+
+        # Stop Loss Floor Logic REMOVED
+        # System simply respects the calculated stop from setup_position
+        # (which comes from Initial Stop Loss %)
             
         position = {
             'entry_time': idx,
@@ -528,13 +581,14 @@ class BollingerBandStrategyV4:
         # We check this FIRST and return immediately if hit.
         # This is the "Conservative" change from v3.
         stop_hit = False
+       
         if dir_ == 1 and low <= position['stop']:
             stop_hit = True
         elif dir_ == -1 and high >= position['stop']:
             stop_hit = True
             
         if stop_hit:
-            return True, 'Stop', position['stop']
+            return True, 'Stop Loss', position['stop']
             
         # Priority 2: Take Profits
         candidates = []

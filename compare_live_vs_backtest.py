@@ -12,6 +12,8 @@ import pandas as pd
 import sys
 import os
 import re
+import json
+import argparse
 from datetime import datetime, timedelta
 import numpy as np
 
@@ -96,7 +98,7 @@ def parse_live_trades_csv(csv_path):
         print(f"Error parsing CSV: {e}")
         return pd.DataFrame()
 
-def compare_live_vs_backtest():
+def compare_live_vs_backtest(start_date=None, end_date=None):
     # Use continuous historical data to fix missing overnight gaps
     # Use live log data for comparison
     live_data_path = r'c:\Trading\paper_logs\live_data.csv' 
@@ -111,7 +113,16 @@ def compare_live_vs_backtest():
     live_trades = parse_live_trades_csv(live_trades_path)
     if not live_trades.empty:
         live_trades = live_trades.sort_values('live_entry_time')
-        print(f"Found {len(live_trades)} completed trades in log.")
+        
+        # Apply Date Filter (Live)
+        if start_date:
+            s_ts = pd.Timestamp(start_date)
+            live_trades = live_trades[live_trades['live_entry_time'] >= s_ts]
+        if end_date:
+            e_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1) # End of day
+            live_trades = live_trades[live_trades['live_entry_time'] <= e_ts]
+
+        print(f"Found {len(live_trades)} completed trades in log (filtered).")
     else:
         print("No completed trades found in log.")
 
@@ -136,14 +147,17 @@ def compare_live_vs_backtest():
         
         # TIMEZONE HANDLING (Robust Normalization)
         
-        def normalize_to_eastern_naive(df, source_name="Data"):
+        def normalize_to_eastern_naive(df, source_name):
             """
             Normalize DataFrame index to Naive Eastern Time.
             Handles specific quirks of Warmup (Naive UTC) and Live (Aware/Naive CT).
             """
+            print(f"DEBUG NORMALIZE {source_name}: TZ={df.index.tz} Head={df.index[0]}")
             if df.index.tz is not None:
                 # If already aware, convert fairly
-                return df.index.tz_convert('US/Eastern').tz_localize(None)
+                res = df.index.tz_convert('US/Eastern').tz_localize(None)
+                print(f"DEBUG NORMALIZE {source_name}: Converted Aware -> {res[0]}")
+                return res
             else:
                 # If naive, we must surmise the source
                 if source_name == "Warmup":
@@ -151,27 +165,67 @@ def compare_live_vs_backtest():
                      return df.index.tz_localize('UTC').tz_convert('US/Eastern').tz_localize(None)
                 elif source_name == "Live":
                      # Continuous data from platform is usually Exchange Time (CT)
-                     return df.index.tz_localize('US/Central').tz_convert('US/Eastern').tz_localize(None)
+                     res = df.index.tz_localize('US/Central').tz_convert('US/Eastern').tz_localize(None)
+                     print(f"DEBUG NORMALIZE {source_name}: Converted Naive CT -> {res[0]}")
+                     return res
             return df.index
 
         # 1. LIVE DATA
         live_df.index = normalize_to_eastern_naive(live_df, "Live")
         
-        # CRITICAL FIX (Jan 13): Live Data is logged with End-Time labels (e.g. 14:56:00 covers 14:55-14:56).
-        # Strategy expects Start-Time labels (e.g. 14:55:00 covers 14:55-14:56) for standard left-closed resampling.
-        # Shift index backwards by 1 minute to standardize semantics.
-        live_df.index = live_df.index - pd.Timedelta(minutes=1)
+        # Apply Date Filter (Live Data for Backtest)
+        if start_date:
+            s_ts = pd.Timestamp(start_date)
+            # Ensure we include enough warmup if cutting strictly? 
+            # Actually, standard logic stitches warmup anyway.
+            # But let's filter the CORE live data to the requested period.
+            live_df = live_df[live_df.index >= s_ts]
+            
+        if end_date:
+            e_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            live_df = live_df[live_df.index <= e_ts]
+        
+        print(f"DEBUG LIVE DATA filtered range: {live_df.index.min()} to {live_df.index.max()}")
+        
+        # CRITICAL FIX (Jan 13/15): Live Data is 2-min aggregated (End-Time labeled).
+        # Standard Strategy expects Start-Time labels.
+        # Shift index backwards by 2 minutes (Timeframe) to standardize semantics.
+        # -1 min caused Odd-Minute misalignment (09:11 start), breaking indicator fidelity.
+        live_df.index = live_df.index - pd.Timedelta(minutes=2)
+        
+        print(f"DEBUG LIVE HEAD: {live_df.index[:3]}")
+        print(f"DEBUG LIVE TAIL: {live_df.index[-3:]}")
         
         # 2. WARMUP DATA
         warmup_df.index = normalize_to_eastern_naive(warmup_df, "Warmup")
             
         # 4. Filter Warmup to strictly before Live
         start_live = live_df.index[0]
-        warmup_df = warmup_df[warmup_df.index < start_live]
+        # 165: CRITICAL FIX: Shift Live Data -2 min (Already done above)
         
-        # 5. Concat
+        # CONTIGUITY CHECK (User-Requested Generic Fix)
+        # Check gap between Warmup End and Live Start.
+        # If Gap > 4 Hours, discard Warmup to prevent "Ghost Volatility" from stitching stale data.
+        if not warmup_df.empty:
+             warmup_end = warmup_df.index[-1]
+             live_start = live_df.index[0]
+             gap = live_start - warmup_end
+             
+             print(f"Data Gap Detection: Warmup Ends {warmup_end}, Live Starts {live_start}. Gap: {gap}")
+             
+             gap_threshold = pd.Timedelta(hours=4)
+             if gap > gap_threshold:
+                  print(f"WARNING: Gap {gap} > {gap_threshold}. Discarding STALE Warmup Data to prevent volatility artifacts.")
+                  warmup_df = pd.DataFrame() # Clear warmup
+             else:
+                  print("Gap Check Passed. Stitching Warmup + Live.")
+        
+        # 5. Concat (Safe if warmup is empty)
         common_cols = ['open', 'high', 'low', 'close', 'volume']
-        combined_df = pd.concat([warmup_df[common_cols], live_df[common_cols]]) 
+        if not warmup_df.empty:
+             combined_df = pd.concat([warmup_df[common_cols], live_df[common_cols]])
+        else:
+             combined_df = live_df[common_cols].copy()
         
         # 6. Sort and Dedupe
         combined_df.sort_index(inplace=True)
@@ -182,34 +236,19 @@ def compare_live_vs_backtest():
 
         print(f"Combined data saved to {combined_path} ({len(combined_df)} rows)")
         
-        # Load and Override Params (Disable Volume Filter to allow execution despite history mismatch)
-        # We need to import load_params or implement it. 
-        # Since imports are tricky with dot-notation in this environment, we'll use a local simple loader.
-        def local_load_params(filepath):
-            import csv
-            p = {}
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    for row in csv.DictReader(f):
-                        try:
-                            val = row['Value']
-                            if row['Type'] == 'int': val = int(val)
-                            elif row['Type'] == 'float': val = float(val)
-                            elif row['Type'] == 'bool': val = str(val).lower() == 'true'
-                            p[row['Name']] = {'value': val}
-                        except: pass
-            return p
-            
-        params = local_load_params(live_params_path)
-        print("NOTE: Temporarily overriding 'Max Volume Multiplier' to 100.0 for comparison to bypass history mismatch.")
-        params['Max Volume Multiplier'] = {'value': 100.0}
+        from bollinger_strategy.parameters import load_params
+        params = load_params(live_params_path)
         
-        # Override TP Method to align with OBSERVED Live Behavior (Fixed Entry TP used effectively)
-        # Live System exited at 6994.50 (Entry Band 6994.42) vs Dynamic Band 6994.59.
-        # This implies Fixed Entry Logic was dominant.
-        print("NOTE: Overriding 'Fixed BB at Entry TP' to True to match Live Execution behavior.")
-        params['Fixed BB at Entry TP'] = {'value': True}
-        params['Opposite Bollinger Band TP'] = {'value': False}
+        # Old Overrides Removed to allow CSV Config to rule
+        pass
+        
+        # Check if we are running "Cold Start" (No Warmup)
+        # If so, we must override Lengths to allow calculation on short data
+        if warmup_df.empty:
+             print("NOTE: Running Cold Start (No Warmup). Overriding Lengths to minimize warmup period.")
+             params['Volume MA Length'] = {'value': 5}
+             params['ATR Length for Filter'] = {'value': 10}
+             params['ATR Length for Trailing Stop'] = {'value': 10}
         
         backtest_result = run_backtest_v4(combined_path, params, suppress_log=True)
         
@@ -254,7 +293,10 @@ def compare_live_vs_backtest():
             'exit_price': 'bt_exit_price',
             'pnl_currency': 'bt_pnl',
             'direction': 'bt_dir_val',
-            'reason': 'bt_reason'
+            'reason': 'bt_reason',
+            'tp': 'bt_tp',
+            'sl': 'bt_sl',
+            'stop_history': 'bt_stop_history'
         })
         bt_trades['bt_direction'] = bt_trades['bt_dir_val'].map({1: 'LONG', -1: 'SHORT'})
         print(f"Backtest generated {len(bt_trades)} trades.")
@@ -354,6 +396,23 @@ def compare_live_vs_backtest():
                 bt_time = closest_bt_trade['bt_entry_time']
                 bt_dir = closest_bt_trade['bt_direction']
                 bt_pnl = closest_bt_trade['bt_pnl']
+                bt_tp = closest_bt_trade.get('bt_tp')
+                bt_stop_hist = closest_bt_trade.get('bt_stop_history')
+                
+                # Serialize history to string for CSV
+                if isinstance(bt_stop_hist, list):
+                    # Convert Timestamps to strings
+                    clean_hist = []
+                    for item in bt_stop_hist:
+                        try:
+                            # Assume item is [timestamp, price]
+                            t_str = item[0].strftime('%Y-%m-%d %H:%M:%S') if hasattr(item[0], 'strftime') else str(item[0])
+                            clean_hist.append([t_str, float(item[1])])
+                        except:
+                            clean_hist.append([str(x) for x in item])
+                    bt_stop_hist_str = json.dumps(clean_hist)
+                else:
+                    bt_stop_hist_str = ""
                 
                 time_diff_seconds = (live_time - bt_time).total_seconds()
                 status = "MATCHED"
@@ -380,7 +439,13 @@ def compare_live_vs_backtest():
                     'PnL Diff': live_pnl - bt_pnl,
                     'BT Reason': closest_bt_trade.get('bt_reason', 'N/A'),
                     'Live Dur': live_dur,
-                    'BT Dur': bt_dur
+                    'BT Dur': bt_dur,
+                    'Live Exit Time': live_trade['live_exit_time'],
+                    'Live Exit Price': live_trade['live_exit_price'],
+                    'BT Exit Time': closest_bt_trade['bt_exit_time'],
+                    'BT Exit Price': closest_bt_trade['bt_exit_price'],
+                    'BT TP': bt_tp,
+                    'BT Stop Hist': bt_stop_hist_str
                 })
             else:
                 live_dur = live_trade['live_exit_time'] - live_trade['live_entry_time']
@@ -398,7 +463,11 @@ def compare_live_vs_backtest():
                     'PnL Diff': None,
                     'BT Reason': None,
                     'Live Dur': live_dur,
-                    'BT Dur': None
+                    'BT Dur': None,
+                    'Live Exit Time': live_trade['live_exit_time'],
+                    'Live Exit Price': live_trade['live_exit_price'],
+                    'BT Exit Time': None,
+                    'BT Exit Price': None
                 })
         
         
@@ -435,7 +504,13 @@ def compare_live_vs_backtest():
                     'BT Reason': bt_trade.get('bt_reason', 'N/A'),
                     'Live Dur': None,
                     'BT Dur': bt_dur,
-                    'Overlap Note': overlap_note
+                    'Overlap Note': overlap_note,
+                    'Live Exit Time': None,
+                    'Live Exit Price': None,
+                    'BT Exit Time': bt_trade['bt_exit_time'],
+                    'BT Exit Price': bt_trade['bt_exit_price'],
+                    'BT TP': bt_trade.get('bt_tp'),
+                    'BT Stop Hist': json.dumps([[x[0].strftime('%Y-%m-%d %H:%M:%S') if hasattr(x[0], 'strftime') else str(x[0]), float(x[1])] for x in bt_trade.get('bt_stop_history', [])]) if isinstance(bt_trade.get('bt_stop_history'), list) else ""
                 })
 
         matches_df = pd.DataFrame(matches)
@@ -473,9 +548,12 @@ def compare_live_vs_backtest():
                     matches_df.at[i, 'BT Reason'] = f"In Trade ({occupying_trade['bt_direction']})"
 
         # Reorder columns
-        cols = ['Live Time', 'BT Time', 'Diff (s)', 'Status', 
+        cols = ['SortTime', 'Live Time', 'BT Time', 'Diff (s)', 'Status', 
                 'Live Dir', 'BT Dir', 
                 'Live Price', 'BT Price', 
+                'Live Exit Time', 'BT Exit Time',
+                'Live Exit Price', 'BT Exit Price',
+                'BT TP', 'BT Stop Hist',
                 'Live PnL', 'BT PnL', 'PnL Diff',
                 'Live Dur', 'BT Dur',
                 'BT Reason']
@@ -517,5 +595,43 @@ def compare_live_vs_backtest():
         bt_trades = bt_trades.sort_values('bt_entry_time') # Changed from 'entry_time' to 'bt_entry_time' to match new column name
         print(bt_trades[['bt_entry_time', 'bt_direction', 'bt_entry_price', 'bt_pnl', 'bt_reason']].to_string()) # Added reason
 
+    # Generate Web Dashboard
+    try:
+        from plot_comparison import generate_comparison_charts
+        print("\nGenerating Comparison Dashboard...")
+        generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", output_dir="web/comparison_charts")
+    except ImportError:
+        print("plot_comparison.py not found. Skipping chart generation.")
+    except Exception as e:
+        print(f"Error generating charts: {e}")
+
 if __name__ == "__main__":
-    compare_live_vs_backtest()
+    parser = argparse.ArgumentParser(
+        description="""
+        Live vs Backtest Comparison Tool for Bollinger Strategy
+        =======================================================
+        
+        Function:
+        ---------
+        Compares real-time trading executions against a theoretical backtest 
+        simulated on the same historical data. It aligns trades by time, 
+        calculates slippage, latency, and PnL divergence, and generates 
+        visual dashboards.
+
+        Files Accessed:
+        ---------------
+        - Input (Live Trades): c:/Trading/paper_logs/live_trades.csv
+        - Input (Live Data):   c:/Trading/paper_logs/live_data.csv
+        - Input (Params):      c:/Trading/Bollinger/parameters/live_params.csv
+        - Output (Metrics):    comparison_metrics_sequential.csv
+        - Output (Dashboard):  web/comparison_charts/index.html
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--start', type=str, help='Start Date (YYYY-MM-DD) for analysis filter.')
+    parser.add_argument('--end', type=str, help='End Date (YYYY-MM-DD) for analysis filter.')
+    
+    args = parser.parse_args()
+    
+    compare_live_vs_backtest(args.start, args.end)
