@@ -49,6 +49,12 @@ Enable Trailing Stop,0,0,1,int,"Use ATR trailing stop (0=false, 1=true) - OPTIMI
 ATR Length for Trailing Stop,56,10,100,int,ATR period for trailing
 ATR Multiplier for Trailing Stop,0.5114,0.5,4.5,float,Trailing stop ATR multiplier - reduced max to prevent overfitting
 Trailing Delay (bars),18,0,20,int,"Bars before trailing stop begins tightening (0 = immediate, max 7 to avoid delayed trailing)"
+=== RSI & VWAP FILTERS (V5) ===,,,,,
+Enable RSI Filter,0,0,1,int,Enable RSI Divergence/Extreme Filter
+RSI Period,14,5,30,int,RSI Lookback Period
+RSI Overbought,70,60,85,int,Threshold for Overbought (Short Entry Blocked if < this)
+RSI Oversold,30,15,40,int,Threshold for Oversold (Long Entry Blocked if > this)
+Enable VWAP Filter,0,0,1,int,Enable VWAP Trend Alignment Filter
 === GA CRITERIA ===,,,,,
 POP_SIZE,150,100,150,int,Population size - reduced to prevent overfitting
 NUM_GEN,100,50,75,int,Number of generations - reduced to prevent overfitting

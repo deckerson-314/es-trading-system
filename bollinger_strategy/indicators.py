@@ -110,3 +110,63 @@ def calculate_adx(df, length):
     adx = dx.ewm(alpha=1/length, adjust=False).mean()
     
     return adx
+
+
+def calculate_rsi(df, period=14):
+    """
+    Calculate Relative Strength Index (RSI).
+    Uses Wilder's smoothing.
+    
+    Args:
+        df: DataFrame with 'close' column
+        period: RSI period (standard 14)
+        
+    Returns:
+        Series: RSI values (0-100)
+    """
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    
+    # Wilder's Smoothing
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    
+    # Avoid division by zero
+    rs = ma_up / ma_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)  # Neutral filling
+
+
+def calculate_vwap(df):
+    """
+    Calculate Volume Weighted Average Price (VWAP).
+    Resets at the start of each day (based on index date).
+    
+    Args:
+        df: DataFrame with 'close', 'high', 'low', 'volume' columns and DatetimeIndex.
+        
+    Returns:
+        Series: VWAP values
+    """
+    df = df.copy()
+    
+    # Typical Price
+    df['tp'] = (df['high'] + df['low'] + df['close']) / 3
+    df['vol_price'] = df['tp'] * df['volume']
+    
+    # Group by Date for Daily Reset
+    # Note: efficient vectorized groupby cumsum
+    grouper = df.index.date
+    
+    # Calculate cumulative sums per day
+    daily_cum_vol = df.groupby(grouper)['volume'].cumsum()
+    daily_cum_vol_price = df.groupby(grouper)['vol_price'].cumsum()
+    
+    # Calculate VWAP
+    vwap = daily_cum_vol_price / daily_cum_vol
+    
+    # Fill NaNs (start of day or zero volume) with Typical Price
+    vwap = vwap.fillna(df['tp'])
+    
+    return vwap

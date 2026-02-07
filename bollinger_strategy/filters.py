@@ -299,3 +299,74 @@ def apply_maintenance_filter(df, enable_maintenance_filter,
     
     return df
 
+    return df
+
+
+def apply_rsi_filter(df, enable_rsi_filter, rsi_period=14, rsi_overbought=70, rsi_oversold=30):
+    """
+    Apply RSI Filter.
+    
+    Logic:
+    - If Enabled, signals are only allowed if RSI confirms extreme condition (Mean Reversion).
+    - Longs allowed ONLY if RSI < Oversold (e.g. 30)
+    - Shorts allowed ONLY if RSI > Overbought (e.g. 70)
+    
+    Args:
+        df: DataFrame with 'rsi' column
+        enable_rsi_filter: bool
+        rsi_period: int (used for logging/checking, calculation assumed done)
+        rsi_overbought: threshold for Short entry
+        rsi_oversold: threshold for Long entry
+        
+    Returns:
+        DataFrame with 'rsi_filter_long' and 'rsi_filter_short' columns
+    """
+    if not enable_rsi_filter:
+        df['rsi_filter_long'] = True
+        df['rsi_filter_short'] = True
+        return df
+        
+    if 'rsi' not in df.columns:
+        # Fallback if RSI not calculated (should not happen if pipeline correct)
+        df['rsi_filter_long'] = True
+        df['rsi_filter_short'] = True
+        return df
+        
+    # Mean Reversion Logic: Only fade if momentum is actually extreme
+    df['rsi_filter_long'] = df['rsi'] < rsi_oversold
+    df['rsi_filter_short'] = df['rsi'] > rsi_overbought
+    
+    return df
+
+
+def apply_vwap_filter(df, enable_vwap_filter):
+    """
+    Apply VWAP Filter.
+    
+    Logic:
+    - If Enabled, enforces entries to be "reverting towards VWAP".
+    - Longs allowed ONLY if Price < VWAP (Buying below average)
+    - Shorts allowed ONLY if Price > VWAP (Selling above average)
+    
+    Args:
+        df: DataFrame with 'close' and 'vwap' columns
+        enable_vwap_filter: bool
+        
+    Returns:
+        DataFrame with 'vwap_filter_long' and 'vwap_filter_short' columns
+    """
+    if not enable_vwap_filter:
+        df['vwap_filter_long'] = True
+        df['vwap_filter_short'] = True
+        return df
+        
+    if 'vwap' not in df.columns:
+        df['vwap_filter_long'] = True
+        df['vwap_filter_short'] = True
+        return df
+        
+    # Reversion Logic
+    df['vwap_filter_long'] = df['close'] < df['vwap']
+    df['vwap_filter_short'] = df['close'] > df['vwap']
+    
+    return df

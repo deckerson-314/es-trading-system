@@ -1,0 +1,26 @@
+Name,Value,Min,Max,Type,Description
+Enable Long Trades,true,false,true,bool,Allow long entries
+Enable Short Trades,true,false,true,bool,Allow short entries
+Bollinger Band Length,30,1,30,int,Lookback
+Bollinger Band StdDev,2,0.1,4,float,StdDev
+Enable Trend Filter,0,0,1,int,Trend Filter OFF
+Trend EMA Length,200,10,400,int,EMA Length
+Enable ADX Filter,0,0,1,int,ADX Filter OFF
+ADX Period,14,5,35,int,ADX Period
+Max ADX Threshold,25,10,45,int,Threshold
+Enable RTH Filter,0,0,1,int,RTH Filter OFF
+Enable RSI Filter,0,0,1,int,RSI Filter OFF
+Enable VWAP Filter,0,0,1,int,VWAP Filter OFF
+Timeframe (minutes),15,1,15,int,Timeframe
+Max Open Trades,1,1,1,int,Max Open
+Initial Stop Loss (%),1,0.1,2,float,SL
+Enable Trailing Stop,1,0,1,int,TS
+ATR Length for Trailing Stop,26,3,100,int,ATR TS
+ATR Multiplier for Trailing Stop,2,0.1,4.5,float,ATR TS Mult
+Fixed BB at Entry TP,true,true,true,bool,TP
+Long Entry on Wick Touch,0,0,1,int,Long Wick
+Long Entry on Body in Zone,1,0,1,int,Long Body
+Short Entry on Wick Touch,0,0,1,int,Short Wick
+Short Entry on Body in Zone,1,0,1,int,Short Body
+Long Trigger (% From Lower Band),0,0,2,float,Long Trig
+Short Trigger (% From Upper Band),0,0,2,float,Short Trig

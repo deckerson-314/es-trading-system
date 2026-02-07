@@ -19,7 +19,8 @@ def group_params_for_display(params_dict_local):
         'Entry Criteria': ['Enable Long Trades', 'Enable Short Trades', 'Bollinger Band Length', 
                           'Bollinger Band StdDev', 'Long Entry on Wick Touch', 'Long Entry on Body in Zone',
                           'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
-                          'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)'],
+                          'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
+                          'RSI Period', 'RSI Overbought', 'RSI Oversold'],
         'Exit Criteria': ['Profit Target (Multiplier)', 'TP Method', 'Stop Loss (Multiplier)', 
                          'Use Trailing Stop', 'Trailing Stop Activation (Multiplier)', 'Trailing Stop Distance (Multiplier)',
                          'Use Time-Based Exit', 'Max Trade Duration (Bars)', 'Exit on Band Touch', 'Band Touch Exit StdDev'],
@@ -28,7 +29,9 @@ def group_params_for_display(params_dict_local):
         'Filters': ['Use RTH Only', 'RTH Start Hour', 'RTH End Hour', 
                    'Use Volume Filter', 'Min Volume (Percentile)', 'Volume MAPeriod',
                    'Use ATR Filter', 'Min Volatility (ATR)', 'ATR Period',
-                   'Use Trend Filter', 'Trend EMA Period', 'Trend Filter Type'],
+                   'Use ATR Filter', 'Min Volatility (ATR)', 'ATR Period',
+                   'Use Trend Filter', 'Trend EMA Period', 'Trend Filter Type',
+                   'Use VWAP Filter', 'Use RSI Filter'],
         'GA Criteria': ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
                        'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                        'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
@@ -51,7 +54,8 @@ def calculate_stats(trades_df, equity_series=None):
     """Calculate standard performance metrics."""
     if trades_df.empty:
         return {'Total PnL': 0, 'Win Rate': 0, 'Profit Factor': 0, 'Sharpe': 0, 
-                'Sortino': 0, 'Max Drawdown': 0, 'Trades': 0, 'Avg Trades/Day': 0}
+                'Sortino': 0, 'Max Drawdown': 0, 'Trades': 0, 'Avg Trades/Day': 0,
+                'Avg Duration (min)': 0, 'Max Duration (min)': 0}
         
     pnl = trades_df['pnl_currency'].sum()
     wr = (trades_df['pnl_points'] > 0).mean() * 100
@@ -138,11 +142,11 @@ def generate_trade_plot(trade, df, output_dir, version, sol_name=None):
         
         # Create subplots
         fig_trade = make_subplots(
-            rows=2, cols=1,
+            rows=3, cols=1,
             shared_xaxes=True,
             vertical_spacing=0.05,
-            row_heights=[0.7, 0.3],
-            subplot_titles=('Price & Bollinger Bands', 'Volume')
+            row_heights=[0.6, 0.2, 0.2],
+            subplot_titles=('Price & Bollinger Bands', 'RSI', 'Volume')
         )
         
         # Price
@@ -155,6 +159,10 @@ def generate_trade_plot(trade, df, output_dir, version, sol_name=None):
         if 'upper' in segment.columns:
             fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['upper'], line=dict(color='blue', dash='dash', width=1), name='Upper BB'), row=1, col=1)
             fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['lower'], line=dict(color='blue', dash='dash', width=1), name='Lower BB'), row=1, col=1)
+        
+        # VWAP
+        if 'vwap' in segment.columns:
+            fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['vwap'], line=dict(color='orange', width=1.5), name='VWAP'), row=1, col=1)
             
         # Markers
         entry_color = 'green' if trade.direction == 1 else 'red'
@@ -195,11 +203,18 @@ def generate_trade_plot(trade, df, output_dir, version, sol_name=None):
                 line=dict(color='purple', dash='dot', width=2),
             ), row=1, col=1)
         
+        # RSI
+        if 'rsi' in segment.columns:
+            fig_trade.add_trace(go.Scatter(x=segment.index, y=segment['rsi'], line=dict(color='purple', width=1.5), name='RSI'), row=2, col=1)
+            # Add Overbought/Oversold lines
+            fig_trade.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
+            fig_trade.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
+        
         # Volume
         colors = ['green' if c >= o else 'red' for c, o in zip(segment['close'], segment['open'])]
         fig_trade.add_trace(go.Bar(
             x=segment.index, y=segment['volume'], name='Volume', marker_color=colors
-        ), row=2, col=1)
+        ), row=3, col=1)
         
         # Layout
         res_str = "WIN" if trade.pnl_currency > 0 else "LOSS"
@@ -336,6 +351,12 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
         html_content += f"<tr><td>{m}</td>"
         values = [s['stats'][m] for s in solutions_data]
         if not values: continue
+        
+        # DEBUG KEYS
+        # print(f"DEBUG METRIC: {m}")
+        # for s in solutions_data:
+        #    if m not in s['stats']:
+        #        print(f"MISSING {m} in stats: {s['stats'].keys()}")
         
         best_val = min(values) if m == 'Max Drawdown' else max(values)
         
