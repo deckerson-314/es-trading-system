@@ -4,8 +4,11 @@ import os
 from datetime import datetime
 import numpy as np
 
-# Add project root to path
-sys.path.append(os.getcwd())
+# Add project root to path (robustly)
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 from BB_Strategy_v5 import run_backtest_v5
 
 import pandas as pd
@@ -17,8 +20,11 @@ import argparse
 from datetime import datetime, timedelta
 import numpy as np
 
-# Add project root to path
-sys.path.append(os.getcwd())
+# Add project root to path (robustly)
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 from BB_Strategy_v5 import run_backtest_v5
 
 def parse_live_trades_csv(csv_path):

@@ -15,7 +15,9 @@ from pathlib import Path
 
 # Configuration
 PORT = 8000
-WEB_DIR = Path(__file__).parent / 'web'
+# Startup from /tools/dashboard/server.py -> Root is up 2 levels
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+WEB_DIR = PROJECT_ROOT / 'web'
 
 class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Custom handler to serve from web directory and add CORS headers"""

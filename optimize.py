@@ -102,8 +102,11 @@ import plotly.offline as pyo
 import plotly.offline as pyo
 import webbrowser
 from deap import base, creator, tools, algorithms
-from bollinger_strategy.strategy_v5 import BollingerBandStrategyV5 as BollingerBandStrategy
-from bollinger_strategy import load_params
+from strategies.factory import StrategyFactory
+# from bollinger_strategy.strategy_v5 import BollingerBandStrategyV5 as BollingerBandStrategy # REMOVED
+
+from strategies.bollinger.parameters import load_params # Updated Import
+# from bollinger_strategy import load_params # REMOVED
 
 warnings.filterwarnings("ignore")
 
@@ -128,12 +131,13 @@ if hasattr(signal, 'SIGTERM'):
 # CSV INPUT / OUTPUT
 # ----------------------------------------------------------------------
 # Default paths (can be overridden by CLI args)
-DEFAULT_PARAM_CSV = os.path.join('Bollinger', 'parameters', 'backtest_params.csv')
+DEFAULT_PARAM_CSV = os.path.join('strategies', 'bollinger', 'parameters', 'backtest_params.csv')
 
 # Parse Command Line Arguments
 parser = argparse.ArgumentParser(description='Genetic Optimization for Bollinger Band Strategy')
 parser.add_argument('--params', type=str, default=DEFAULT_PARAM_CSV, help='Path to parameter CSV file')
 parser.add_argument('--cores', type=int, default=12, help='Number of processor cores to use (default: 12)')
+parser.add_argument('--strategy', type=str, default='bollinger', help='Strategy to optimize (default: bollinger)')
 parser.add_argument('--dashboard-from', type=str, help='Path to an old checkpoint file to generate dashboard from (skips optimization)', default=None)
 parser.add_argument('--visualize-json', type=str, help='Generate dashboard for a specific solution from a JSON parameter file', default=None)
 parser.add_argument('--fresh', '-f', action='store_true', help='Force start fresh (ignore checkpoints)')
@@ -192,7 +196,13 @@ if args.dashboard_from:
     except:
         pass
 else:
-    CHECKPOINT_FILE = os.path.join(DIAG_DIR, 'ga_checkpoint_v4.pkl')
+    # Dynamic Checkpoint Path based on strategy (defaulting to bollinger for now)
+    # Ideally should use args.strategy but args not available here yet (defined below)
+    # So we used a fixed path relative to strategies/bollinger for now
+    # We will refine this in main() if needed
+    CHECKPOINT_DIR = os.path.join('strategies', 'bollinger', 'checkpoints')
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, 'ga_checkpoint_v4.pkl')
 START_TIME_FILE = os.path.join(DIAG_DIR, 'ga_start_time.txt')
 HTML_DIR = os.path.join(DIAG_DIR, 'html')
 HTML_DASHBOARD = os.path.join(HTML_DIR, 'ga_dashboard_v4.html')
@@ -248,8 +258,18 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     if len(df_in) == 0:
         return default_result.copy()
     
-    # Create strategy instance (V4)
-    strategy = BollingerBandStrategy(param_dict_local)
+    # Create strategy instance (V4) -> Logic moved to Factory
+    try:
+        # Use factory to get strategy. defaulting to 'bollinger' if not specified in params (or passed globally)
+        # For now, we assume 'bollinger' as that's what this script was built for, 
+        # but ideally we pass strategy_name to run_backtest
+        strategy_name = param_dict_local.get('strategy_name', 'bollinger')
+        strategy = StrategyFactory.get_strategy(strategy_name, param_dict_local)
+    except Exception as e:
+        if not suppress_output: print(f"Factory Error: {e}")
+        return default_result.copy()
+    
+    # strategy = BollingerBandStrategy(param_dict_local) # REMOVED
     strategy.update_optimizable_params(params)
     
     try:
@@ -287,7 +307,9 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
         if pending_entry:
             dir_ = pending_entry['direction']
             # Execute at OPEN
-            positions.append(strategy.setup_position(row.open, dir_, row, df))
+            pos = strategy.setup_position(row.open, dir_, row, df)
+            if 'stop' not in pos: pos['stop'] = 0.0 # Safety init
+            positions.append(pos)
             pending_entry = None
 
         # 2. Check exits first
@@ -312,9 +334,9 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
         # But even if we could, we would just set pending_entry again for the NEXT bar.
         if len(positions) < strategy.max_open_trades and pending_entry is None:
             if row.entry_long_signal:
-                pending_entry = {'direction': 1}
+                pending_entry = {'direction': 1, 'entry_price': row.close, 'stop': 0.0} # Init fields
             elif row.entry_short_signal:
-                pending_entry = {'direction': -1}
+                pending_entry = {'direction': -1, 'entry_price': row.close, 'stop': 0.0}
     
     # Final cleanup (close open positions at end)
     for pos in positions:
@@ -1723,8 +1745,12 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
             for pname in valid_list:
                 # Get Input Range
                 p_data = param_dict[pname]
-                p_min = p_data.get('min', 'N/A')
-                p_max = p_data.get('max', 'N/A')
+                if not isinstance(p_data, dict):
+                    p_min = 'N/A'
+                    p_max = 'N/A'
+                else:
+                    p_min = p_data.get('min', 'N/A')
+                    p_max = p_data.get('max', 'N/A')
                 input_range = f"[{p_min} - {p_max}]" if (p_min != 'N/A' and p_max != 'N/A') else "Fixed"
                 
                 # Check if optimized
@@ -2307,6 +2333,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             continue
         if pname in ga_criteria_params:
             continue
+        
+        # FIX: Ensure pdata is a dictionary
+        if not isinstance(pdata, dict):
+            continue
+            
         ptype = pdata.get('type', '')
         pmin = pdata.get('min')
         pmax = pdata.get('max')
@@ -2331,6 +2362,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             for pname in sorted(params_list):
                 if pname in param_dict:
                     pdata = param_dict[pname]
+                    
+                    # FIX: Ensure pdata is a dictionary
+                    if not isinstance(pdata, dict):
+                        continue
+                        
                     ptype = pdata.get('type', '')
                     pmin = pdata.get('min')
                     pmax = pdata.get('max')
@@ -2541,6 +2577,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     pareto3d_div, pareto3d_script = extract_chart_html(pareto3d_html)
     pareto2d_div, pareto2d_script = extract_chart_html(pareto2d_html)
     paretosize_div, paretosize_script = extract_chart_html(paretosize_html)
+    print("DEBUG: extract_chart_html END")
     
     # Progress information with time tracking
     progress_html = ""
@@ -2603,14 +2640,20 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         weight_names = ['Sortino Ratio', 'Max Drawdown', 'Profit Factor', 'Avg Trades/Day', 'Total Profit', 'Avg Profit/Trade']
         directions = ['Maximize', 'Minimize', 'Maximize', 'Maximize', 'Maximize', 'Maximize']
         
-        # Get normalization ranges from param_dict
+        # Get normalization ranges from param_dict with safety check
+        def get_p_val(key, default):
+            item = param_dict.get(key)
+            if isinstance(item, dict):
+                return item.get('value', default)
+            return default
+
         norm_ranges = {
-            'Sortino Ratio': param_dict.get('NORM_SORTINO_MAX', {}).get('value', 10.0),
-            'Max Drawdown': param_dict.get('NORM_DD_MAX', {}).get('value', 100000.0),
-            'Profit Factor': param_dict.get('NORM_PF_MAX', {}).get('value', 5.0),
-            'Avg Trades/Day': param_dict.get('NORM_TRADES_MAX', {}).get('value', 3.0),
-            'Total Profit': param_dict.get('NORM_PNL_MAX', {}).get('value', 200000.0),
-            'Avg Profit/Trade': param_dict.get('NORM_PROFIT_TRADE_MAX', {}).get('value', 250.0)
+            'Sortino Ratio': get_p_val('NORM_SORTINO_MAX', 10.0),
+            'Max Drawdown': get_p_val('NORM_DD_MAX', 100000.0),
+            'Profit Factor': get_p_val('NORM_PF_MAX', 5.0),
+            'Avg Trades/Day': get_p_val('NORM_TRADES_MAX', 3.0),
+            'Total Profit': get_p_val('NORM_PNL_MAX', 200000.0),
+            'Avg Profit/Trade': get_p_val('NORM_PROFIT_TRADE_MAX', 250.0)
         }
         
         notes = [
@@ -2955,6 +2998,10 @@ def main():
     
     # Load Parameters (only in main process, not in workers)
     param_dict, param_df = load_params(PARAM_CSV, return_dataframe=True)
+
+    # Inject strategy name from CLI args
+    param_dict['strategy_name'] = args.strategy
+    print(f"Goal: Optimize Strategy '{args.strategy}'")
     
     # Print the exact parameter file that will be used (grouped)
     print("\n=== PARAMETER FILE USED (grouped by category) ===")
@@ -3034,6 +3081,8 @@ def main():
     global PARAM_RANGES, param_keys
     PARAM_RANGES = {}
     for n, d in param_dict.items():
+        if not isinstance(d, dict):
+            continue
         if n.startswith('===') or n.startswith('__'):
             continue
         if n in ga_criteria_params:

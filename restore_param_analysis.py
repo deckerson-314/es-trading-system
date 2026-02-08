@@ -76,8 +76,15 @@ def generate_interactive_analysis(hof, param_keys, param_dict, current_gen):
     # ---------------------------------------------------------
     # Get Normalization Constants from param_dict
     try:
-        norm_pnl_max = float(param_dict['NORM_PNL_MAX']['value']) if 'NORM_PNL_MAX' in param_dict else 200000.0
-        norm_ppt_max = float(param_dict['NORM_PROFIT_TRADE_MAX']['value']) if 'NORM_PROFIT_TRADE_MAX' in param_dict else 250.0
+        # Safe extraction helper
+        def get_val(key, default):
+            item = param_dict.get(key)
+            if isinstance(item, dict):
+                return float(item.get('value', default))
+            return default
+
+        norm_pnl_max = get_val('NORM_PNL_MAX', 200000.0)
+        norm_ppt_max = get_val('NORM_PROFIT_TRADE_MAX', 250.0)
     except:
         norm_pnl_max = 200000.0
         norm_ppt_max = 250.0

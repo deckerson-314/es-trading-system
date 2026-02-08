@@ -240,7 +240,8 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
     Generate Unified HTML Dashboard.
     """
     if output_dir is None:
-        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # strategies/bollinger/reporting.py -> strategies/bollinger -> strategies -> root
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         output_dir = os.path.join(BASE_DIR, 'web')
     
     os.makedirs(output_dir, exist_ok=True)
