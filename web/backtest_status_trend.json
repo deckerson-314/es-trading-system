@@ -1,0 +1,1 @@
+window.updateStatus('paper', {"mode": "BACKTEST", "port": 0, "connected": false, "net_liquidation": -1096628.99928571, "pnl": -1196628.99928571, "position": 0.0, "last_update": "2026-03-10 14:18:11"});

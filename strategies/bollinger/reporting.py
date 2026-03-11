@@ -235,7 +235,7 @@ def generate_trade_plot(trade, df, output_dir, version, sol_name=None):
         print(f"Error generating plot for trade: {e}")
         return None
 
-def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_browser=True):
+def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_browser=True, filename=None):
     """
     Generate Unified HTML Dashboard.
     """
@@ -259,6 +259,7 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
     <html>
     <head>
         <title>BB Strategy V{version} Dashboard</title>
+        <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📊</text></svg>">
         <style>
             body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background: #f4f4f9; color: #333; }}
             .container {{ max-width: 1400px; margin: 20px auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }}
@@ -799,7 +800,8 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
     html_content += "</div></body></html>"
     
     # Save
-    filename = f'comprehensive_dashboard_v{version}.html'
+    if filename is None:
+        filename = f'comprehensive_dashboard_v{version}.html'
     path = os.path.join(output_dir, filename)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(html_content)

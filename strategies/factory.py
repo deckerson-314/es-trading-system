@@ -30,5 +30,13 @@ class StrategyFactory:
             except ImportError as e:
                 logging.error(f"Factory: Failed to import BollingerStrategy: {e}")
                 raise
+        elif name == "trend":
+            try:
+                from strategies.trend.strategy import TrendStrategy
+                logging.info(f"Factory: Loading TrendStrategy")
+                return TrendStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import TrendStrategy: {e}")
+                raise
         else:
-            raise ValueError(f"Unknown strategy: '{strategy_name}'. Available: ['bollinger']")
+            raise ValueError(f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'trend']")

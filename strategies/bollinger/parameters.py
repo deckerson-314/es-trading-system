@@ -25,6 +25,10 @@ def load_params(csv_path, return_dataframe=False):
     d = {}
     
     for _, r in df.iterrows():
+        # Skip if name is not a string (e.g. NaN)
+        if pd.isna(r['Name']) or not isinstance(r['Name'], str):
+            continue
+            
         name = r['Name'].strip()
         
         # Skip section headers (lines starting with ===)

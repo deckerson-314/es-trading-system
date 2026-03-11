@@ -1,138 +1,89 @@
-# ==============================================================================
-#  IBKR Futures Data Downloader
-# ==============================================================================
-#
-#  Purpose:
-#  This script connects to an Interactive Brokers TWS or Gateway instance via
-#  an ngrok tunnel and downloads 90 days of 1-minute historical data for a
-#  specified futures contract (default is ES). It downloads the data in
-#  chunks to avoid API timeouts.
-#
-# ==============================================================================
-#  REVISION HISTORY
-# ==============================================================================
-#  Last Updated: 2025-09-22 16:02 EDT
-#  --
-#  - 2025-09-22 16:02 EDT: **CRITICAL FIX:** Re-implemented the chunking logic to
-#    reliably download large datasets (like 90 days of 1-min data) by breaking
-#    the request into smaller, 10-day increments to avoid API timeouts.
-#  - 2025-09-22 15:46 EDT: Modified to download ES futures data.
-#  - 2025-09-22 15:05 EDT: Reverted to manual ngrok connection for stability.
-# ==============================================================================
+"""
+tools/data/downloader.py
+========================
+Utility for downloading recent high-fidelity minute data from Interactive Brokers.
+Used primarily to fetch recent market data to audit live trade executions against a backtest.
+"""
 
+from ib_insync import IB, Future, util
 import pandas as pd
 import datetime
-from ib_insync import *
 import os
+import argparse
 
-def download_futures_data_chunked(host, port, symbol='ES', exchange='CME', currency='USD', total_days=90, chunk_days=10, bar_size='1 min'):
+def download_recent_data(symbol='ES', exchange='CME', duration_str='5 D', bar_size='1 min', output_path='recent_warmup_data.csv', port=None):
     """
-    Connects to IBKR and downloads historical data for a futures contract in chunks.
+    Connects to IBKR and downloads recent historical data.
     """
     ib = IB()
-    all_bars_df = None
+    ports = [port] if port else [7497, 7496, 4002, 4001]
+    connected = False
+    
     try:
-        print(f"Attempting to connect to TWS/Gateway via manual ngrok tunnel at {host}:{port}...")
-        ib.connect(host, port, clientId=1, timeout=20)
-        print("Connection successful.")
-
-        generic_contract = Future(symbol=symbol, exchange=exchange, currency=currency)
-        contracts = ib.reqContractDetails(generic_contract)
-        if not contracts:
-            print(f"Error: Could not find any contracts for symbol {symbol} on {exchange}.")
-            return
-
-        front_month_contract = sorted(contracts, key=lambda c: c.contract.lastTradeDateOrContractMonth)[0].contract
-        print(f"Found front-month contract: {front_month_contract.localSymbol}")
-
-        print(f"Starting download of {total_days} days of {bar_size} data for {symbol} in {chunk_days}-day chunks...")
-        
-        all_bars_list = []
-        end_date_time = '' # Start with the current time
-
-        for i in range(0, total_days, chunk_days):
-            days_to_get = min(chunk_days, total_days - i)
-            duration_str = f'{days_to_get} D'
-            
-            print(f"  - Requesting chunk {i//chunk_days + 1}: {duration_str} ending at {end_date_time or 'now'}...")
-            
-            bars = ib.reqHistoricalData(
-                front_month_contract,
-                endDateTime=end_date_time,
-                durationStr=duration_str,
-                barSizeSetting=bar_size,
-                whatToShow='TRADES',
-                useRTH=False,
-                formatDate=1
-            )
-
-            if not bars:
-                print("  - No more data returned for this period. Stopping download.")
+        for p in ports:
+            try:
+                print(f"Attempting connection on port {p} (Client ID 101)...")
+                ib.connect('127.0.0.1', p, clientId=101, timeout=10)
+                print(f"Connected on port {p}.")
+                connected = True
                 break
+            except Exception:
+                continue
+                
+        if not connected:
+            print("Could not connect to any standard IBKR port.")
+            return False
 
-            print(f"  - Received {len(bars)} bars.")
-            all_bars_list.extend(bars)
+        contract = Future(symbol=symbol, exchange=exchange, currency='USD')
+        details = ib.reqContractDetails(contract)
+        if not details:
+            print(f"No contract found for {symbol}.")
+            return False
+
+        # Get front month contract
+        front_contract = sorted(details, key=lambda c: c.contract.lastTradeDateOrContractMonth)[0].contract
+        print(f"Downloading data for: {front_contract.localSymbol}")
+        
+        bars = ib.reqHistoricalData(
+            front_contract,
+            endDateTime='',
+            durationStr=duration_str,
+            barSizeSetting=bar_size,
+            whatToShow='TRADES',
+            useRTH=False,
+            formatDate=1
+        )
+        
+        if bars:
+            df = util.df(bars)
+            df.rename(columns={'date': 'datetime'}, inplace=True)
+            df.set_index('datetime', inplace=True)
             
-            # The new end time for the next chunk is the start time of the current chunk
-            end_date_time = bars[0].date
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             
-            ib.sleep(2) # Pause between requests to be kind to the API
-
-        if not all_bars_list:
-            print("No data was downloaded in total.")
-            return
-
-        print("\nCombining all data chunks...")
-        all_bars_df = util.df(all_bars_list)
-        
-        # Clean up the final DataFrame
-        all_bars_df.drop_duplicates(inplace=True)
-        all_bars_df.sort_values(by='date', inplace=True)
-        
-        print(f"Total unique bars received: {len(all_bars_df)}")
-        
-        all_bars_df.rename(columns={'date': 'datetime', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-        all_bars_df.set_index('datetime', inplace=True)
-
-        # base_dir = "/content/drive/MyDrive/TradingStrategyOptimization"
-        # data_dir = os.path.join(base_dir, "data")
-        data_dir = r"c:\Trading"
-        if not os.path.exists(data_dir):
-            os.makedirs(data_dir)
+            df.to_csv(output_path)
+            print(f"Saved {len(df)} bars to {output_path}")
+            return True
+        else:
+            print("No data received.")
+            return False
             
-        timestamp = datetime.datetime.now().strftime("%Y%m%d")
-        filename = f"{symbol}_1min_Dec29_31_{timestamp}.csv"
-        filepath = os.path.join(data_dir, filename)
-        
-        all_bars_df.to_csv(filepath)
-        print(f"Data successfully saved to {filepath}")
-
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"Error downloading data: {e}")
+        return False
     finally:
         if ib.isConnected():
-            print("Disconnecting from TWS/Gateway.")
             ib.disconnect()
 
-def download_overlap_check(host, port, symbol='ES', exchange='CME', currency='USD'):
-    pass # Skipped for now
-
-if __name__ == '__main__':
-    util.patchAsyncio()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Download recent IBKR data")
+    parser.add_argument('--symbol', type=str, default='ES')
+    parser.add_argument('--days', type=int, default=5)
+    parser.add_argument('--output', type=str, default='recent_warmup_data.csv')
+    parser.add_argument('--port', type=int, default=None, help="Force specific IBKR port")
     
-    # args = sys.argv # Could use args but hardcoding is faster for this task
-    host = "127.0.0.1"
-    port = 7496 # TWS Default
+    args = parser.parse_args()
+    duration = f"{args.days} D"
     
-    # We need data ending NOW (Dec 31) back to Dec 29.
-    # Duration: 3 days.
-    # End Date: Now (or hardcoded to Dec 31 end of day if looking back)
-    # Actually, reqHistoricalData with EndDateTime='' gets until now.
-    # If we want 3 days back from now, that covers Dec 29-31.
-    
-    total_days = 4 # 29, 30, 31 + little buffer
-    chunk_days = 2
-    
-    print(f"Downloading last {total_days} days of ES data...")
-    download_futures_data_chunked(host, port, total_days=total_days, chunk_days=chunk_days)
-
+    download_recent_data(symbol=args.symbol, duration_str=duration, output_path=args.output, port=args.port)

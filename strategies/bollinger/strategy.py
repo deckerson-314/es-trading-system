@@ -130,6 +130,21 @@ class BollingerStrategy(Strategy):
         except:
             return time(9, 30)
 
+    @property
+    def min_bars_required(self) -> int:
+        """Calculate minimum bars required for all indicators to warm up."""
+        lookbacks = [
+            self.bb_length, 
+            self.atr_length_ts, 
+            self.atr_length_tp if self.fixed_atr_tp else 0,
+            self.atr_length_filter,
+            self.trend_ema_length if self.enable_trend_filter else 0,
+            self.adx_period if self.enable_adx_filter else 0,
+            self.rsi_period if self.enable_rsi_filter else 0,
+            self.volume_ma_length
+        ]
+        return max(lookbacks) + 10
+
     def get_param_structure(self) -> dict:
         """Return parameter groups for display/logging."""
         return {

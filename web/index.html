@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bollinger Strategy Platform</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏠</text></svg>">
     <style>
         :root {
             --primary: #2563eb;
@@ -163,7 +164,7 @@
     <div class="container">
         <header>
             <h1>Bollinger Strategy Control Center</h1>
-            <p class="subtitle">Algorithmic Trading & Analytics Platform v2.2.0</p>
+            <p class="subtitle">Algorithmic Trading & Analytics Platform v3.0.0</p>
         </header>
 
         <h2 style="color: var(--secondary); border-bottom: 1px solid #e2e8f0; padding-bottom: 0.5rem;">Live Dashboards
@@ -233,23 +234,53 @@
                 </div>
             </a>
 
-            <!-- Backtest Results -->
-            <a href="comprehensive_dashboard_v4.0.html" class="card">
+            <!-- Backtest: Bollinger -->
+            <a href="backtest_dashboard_bollinger.html" class="card">
                 <div class="card-icon">📈</div>
-                <div class="card-title">Backtest Results</div>
+                <div class="card-title">Backtest: Bollinger</div>
+                <div class="card-desc">
+                    Latest Bollinger Strategy<br>
+                    Backtest Results
+                </div>
+            </a>
+
+            <!-- Backtest: Trend -->
+            <a href="backtest_dashboard_trend.html" class="card">
+                <div class="card-icon">📉</div>
+                <div class="card-title">Backtest: Trend</div>
+                <div class="card-desc">
+                    Latest Trend Strategy<br>
+                    Backtest Results
+                </div>
+            </a>
+
+            <!-- Comprehensive Dashboard (latest version) -->
+            <a href="comprehensive_dashboard_v5.0.html" class="card">
+                <div class="card-icon">📊</div>
+                <div class="card-title">Comprehensive Dashboard</div>
                 <div class="card-desc">
                     Detailed Historical Simulation<br>
-                    (Performance Metrics)
+                    (Full Performance Metrics)
                 </div>
             </a>
 
             <!-- Comparison Charts -->
-            <a href="../comparison_charts/index.html" class="card" target="_blank">
-                <div class="card-icon">📊</div>
+            <a href="comparison_charts/index.html" class="card" target="_blank">
+                <div class="card-icon">🔍</div>
                 <div class="card-title">Comparison Charts</div>
                 <div class="card-desc">
                     Interactive Overlays<br>
                     (Live vs Backtest)
+                </div>
+            </a>
+
+            <!-- Multi-Solution Comparison -->
+            <a href="backtest_dashboard_v4.0.html" class="card" target="_blank">
+                <div class="card-icon">🔬</div>
+                <div class="card-title">Multi-Solution Comparison</div>
+                <div class="card-desc">
+                    Compare Multiple Strategies<br>
+                    (GA Solutions)
                 </div>
             </a>
 
@@ -264,7 +295,7 @@
         </div>
 
         <div class="footer">
-            <p>System Revision: 2.2.0-stable | US/Eastern Time Zone</p>
+            <p>System Revision: 3.0.0-stable | US/Eastern Time Zone</p>
         </div>
     </div>
 

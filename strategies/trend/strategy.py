@@ -1,0 +1,353 @@
+"""
+Trend Following Strategy (Dual Thrust / Donchian)
+================================================
+Inherits from the base Strategy class.
+"""
+
+import pandas as pd
+import numpy as np
+import math
+from datetime import time
+from strategies.base import Strategy
+from .parameters import get_param_value
+from strategies.bollinger.filters import apply_rth_filter, apply_maintenance_filter
+
+class TrendStrategy(Strategy):
+    """
+    Trend Following Strategy using Donchian Channels / Dual Thrust logic.
+    """
+    
+    def __init__(self, params_dict):
+        self.params_dict = params_dict
+        self._extract_params()
+        
+    def _extract_params(self):
+        """Extract and validate all parameters."""
+        # Fixed / Config
+        self.max_open_trades = int(get_param_value(self.params_dict, 'Max Open Trades', 1))
+        self.enable_long = get_param_value(self.params_dict, 'Enable Long Trades', True)
+        self.enable_short = get_param_value(self.params_dict, 'Enable Short Trades', True)
+        self.initial_sl_pct = float(get_param_value(self.params_dict, 'Initial Stop Loss (%)', 1.0))
+        self.timeframe = int(get_param_value(self.params_dict, 'Timeframe (minutes)', 15))
+        
+        # Trailing Stop
+        self.enable_trailing = get_param_value(self.params_dict, 'Enable Trailing Stop', True)
+        self.atr_length_ts = int(get_param_value(self.params_dict, 'ATR Length for Trailing Stop', 14))
+        self.atr_mult_ts = float(get_param_value(self.params_dict, 'ATR Multiplier for Trailing Stop', 3.0))
+        self.trailing_delay = int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5))
+        
+        # Take Profit
+        self.tp_mult_atr = float(get_param_value(self.params_dict, 'Take Profit ATR Multiplier', 0.0)) # 0 = disabled
+        
+        # Entry Logic (Donchian / Dual Thrust)
+        self.lookback_buy = int(get_param_value(self.params_dict, 'Buy Lookback', 20))
+        self.lookback_sell = int(get_param_value(self.params_dict, 'Sell Lookback', 20))
+        
+        # Filter Logic
+        self.enable_adx_filter = get_param_value(self.params_dict, 'Enable ADX Filter', False)
+        self.adx_period = int(get_param_value(self.params_dict, 'ADX Period', 14))
+        self.min_adx = float(get_param_value(self.params_dict, 'Min ADX Threshold', 20.0))
+        
+        self.atr_filter_period = int(get_param_value(self.params_dict, 'ATR Filter Period', 14))
+
+        self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR (Points)', 0.5))
+
+        # Regime Filter (SMA)
+        self.enable_sma_filter = get_param_value(self.params_dict, 'Enable SMA Filter', False)
+        self.sma_period = int(get_param_value(self.params_dict, 'SMA Period', 200))
+
+        # Volume Filter
+        self.enable_vol_filter = get_param_value(self.params_dict, 'Enable Volume Filter', False)
+        self.vol_ma_length = int(get_param_value(self.params_dict, 'Volume MA Length', 20))
+        self.min_vol_mult = float(get_param_value(self.params_dict, 'Min Volume Multiplier', 1.5))
+
+        # Time Filters (RTH & Maintenance)
+        rth_filter_val = get_param_value(self.params_dict, 'Enable RTH Filter', True)
+        if isinstance(rth_filter_val, (int, float)): self.enable_rth_filter = bool(int(rth_filter_val))
+        elif isinstance(rth_filter_val, bool): self.enable_rth_filter = rth_filter_val
+        else: self.enable_rth_filter = bool(int(float(str(rth_filter_val))))
+        
+        self.rth_start_str = get_param_value(self.params_dict, 'RTH Start (HH:MM)', '09:30')
+        self.rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
+        self.rth_exit_buffer_minutes = int(get_param_value(self.params_dict, 'RTH Exit Buffer (minutes)', 0))
+        
+        self.enable_maintenance_filter = get_param_value(self.params_dict, 'Enable Maintenance Filter', False)
+        self.daily_maintenance_start_str = get_param_value(self.params_dict, 'Daily Maintenance Start (HH:MM)', '16:00')
+        self.daily_maintenance_end_str = get_param_value(self.params_dict, 'Daily Maintenance End (HH:MM)', '16:30')
+        self.weekend_maintenance_start_day = int(get_param_value(self.params_dict, 'Weekend Maintenance Start Day', 4))
+        self.weekend_maintenance_start_time_str = get_param_value(self.params_dict, 'Weekend Maintenance Start Time (HH:MM)', '16:00')
+        self.weekend_maintenance_end_day = int(get_param_value(self.params_dict, 'Weekend Maintenance End Day', 6))
+        self.weekend_maintenance_end_time_str = get_param_value(self.params_dict, 'Weekend Maintenance End Time (HH:MM)', '17:00')
+        self.maintenance_buffer_minutes = int(get_param_value(self.params_dict, 'Maintenance Buffer Minutes', 5))
+
+        self.rth_start = self._parse_time(self.rth_start_str)
+        self.rth_end = self._parse_time(self.rth_end_str)
+        
+    def _parse_time(self, time_str):
+        try:
+            return pd.to_datetime(time_str, format='%H:%M').time()
+        except:
+            return time(9, 30)
+        
+    @property
+    def min_bars_required(self) -> int:
+        """Calculate minimum bars required for all indicators to warm up."""
+        lookbacks = [
+            self.lookback_buy,
+            self.lookback_sell,
+            self.atr_length_ts,
+            self.adx_period if self.enable_adx_filter else 0,
+            self.atr_filter_period,
+            self.sma_period if self.enable_sma_filter else 0,
+            self.vol_ma_length if getattr(self, 'enable_vol_filter', False) else 0
+        ]
+        return max(lookbacks) + 10
+
+    def get_param_structure(self) -> dict:
+        return {
+            'Entry Criteria': {
+                'Enable Long': self.enable_long,
+                'Enable Short': self.enable_short,
+                'Buy Lookback': self.lookback_buy,
+                'Sell Lookback': self.lookback_sell,
+                'Enable ADX Filter': self.enable_adx_filter,
+                'Min ADX': self.min_adx,
+                'Min ATR': self.min_atr_points,
+                'Enable RTH': self.enable_rth_filter,
+                'RTH Start': self.rth_start_str,
+                'RTH End': self.rth_end_str
+            },
+            'Exit Criteria': {
+                'Initial SL (%)': self.initial_sl_pct,
+                'Trailing Stop': self.enable_trailing,
+                'Trail ATR Mult': self.atr_mult_ts,
+                'TP ATR Mult': self.tp_mult_atr
+            }
+        }
+        
+    def update_optimizable_params(self, params):
+        """Update params from GA individual."""
+        if 'Buy Lookback' in params: self.lookback_buy = int(params['Buy Lookback'])
+        if 'Sell Lookback' in params: self.lookback_sell = int(params['Sell Lookback'])
+        if 'ATR Multiplier for Trailing Stop' in params: self.atr_mult_ts = float(params['ATR Multiplier for Trailing Stop'])
+        if 'Initial Stop Loss (%)' in params: self.initial_sl_pct = float(params['Initial Stop Loss (%)'])
+        if 'Min ADX Threshold' in params: self.min_adx = float(params['Min ADX Threshold'])
+        if 'ADX Period' in params: self.adx_period = int(params['ADX Period'])
+        # Min ATR (Points)
+        if 'Min ATR (Points)' in params: self.min_atr_points = float(params['Min ATR (Points)'])
+        # ATR Filter Period
+        if 'ATR Filter Period' in params: self.atr_filter_period = int(params['ATR Filter Period'])
+        # Trailing Delay
+        if 'Trailing Delay (bars)' in params: self.trailing_delay = int(params['Trailing Delay (bars)'])
+        # Take Profit
+        if 'Take Profit ATR Multiplier' in params: self.tp_mult_atr = float(params['Take Profit ATR Multiplier'])
+        # ATR Length for TS
+        if 'ATR Length for Trailing Stop' in params: self.atr_length_ts = int(params['ATR Length for Trailing Stop'])
+        
+        # New Filters
+        if 'SMA Period' in params: self.sma_period = int(params['SMA Period'])
+        if 'Volume MA Length' in params: self.vol_ma_length = int(params['Volume MA Length'])
+        if 'Min Volume Multiplier' in params: self.min_vol_mult = float(params['Min Volume Multiplier'])
+        
+        # Boolean Filters (Optimized as 0/1 int)
+        if 'Enable SMA Filter' in params: self.enable_sma_filter = int(params['Enable SMA Filter'])
+        if 'Enable Volume Filter' in params: self.enable_vol_filter = int(params['Enable Volume Filter'])
+
+    def calculate_indicators(self, df):
+        """Calculate Donchian Channels, ATR, ADX."""
+        df = df.copy()
+        
+        # 1. Donchian Channels (High of last N, Low of last N)
+        # Shift NOT needed for backtest usually if we use "Close > High[1:]", but typically logic is:
+        # Breakout of the High of the PREVIOUS N bars.
+        # So we calculate rolling max of N, then SHIFT by 1 to represent "Yesterday's" high.
+        
+        df['donchian_high'] = df['high'].rolling(self.lookback_buy).max().shift(1)
+        df['donchian_low'] = df['low'].rolling(self.lookback_sell).min().shift(1)
+        
+        # 2. ATR (for stops and filters)
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        
+        df['atr'] = tr.rolling(self.atr_length_ts).mean()
+        df['atr_filter'] = tr.rolling(self.atr_filter_period).mean()
+        
+        # 3. ADX (Wilder's implementation approximation)
+        if self.enable_adx_filter:
+            up = df['high'] - df['high'].shift(1)
+            down = df['low'].shift(1) - df['low']
+            pos_dm = np.where((up > down) & (up > 0), up, 0.0)
+            neg_dm = np.where((down > up) & (down > 0), down, 0.0)
+            
+            tr_s = tr.rolling(self.adx_period).sum()
+            pos_dm_s = pd.Series(pos_dm).rolling(self.adx_period).sum()
+            neg_dm_s = pd.Series(neg_dm).rolling(self.adx_period).sum()
+            
+            # Avoid div by zero
+            pos_di = 100 * (pos_dm_s / tr_s.replace(0, 1))
+            neg_di = 100 * (neg_dm_s / tr_s.replace(0, 1))
+            dx = 100 * np.abs(pos_di - neg_di) / (pos_di + neg_di).replace(0, 1)
+            df['adx'] = dx.rolling(self.adx_period).mean()
+            
+        # 4. Regime Filter (SMA)
+        if self.enable_sma_filter:
+            df['sma_regime'] = df['close'].rolling(self.sma_period).mean()
+            
+        # 5. Volume Filter
+        if self.enable_vol_filter:
+            df['vol_ma'] = df['volume'].rolling(self.vol_ma_length).mean()
+            
+        df.dropna(inplace=True)
+        return df
+
+    def apply_filters(self, df):
+        """
+        Apply time filters to dataframe.
+        """
+        df = apply_rth_filter(df, self.enable_rth_filter, self.rth_start, self.rth_end, self.rth_exit_buffer_minutes)
+        df = apply_maintenance_filter(
+            df, self.enable_maintenance_filter,
+            self.daily_maintenance_start_str, self.daily_maintenance_end_str,
+            self.weekend_maintenance_start_day, self.weekend_maintenance_start_time_str,
+            self.weekend_maintenance_end_day, self.weekend_maintenance_end_time_str,
+            self.maintenance_buffer_minutes
+        )
+        return df
+
+    def calculate_entry_signals(self, df):
+        """
+        Long if High > Donchian High.
+        Short if Low < Donchian Low.
+        """
+        # Vectorized implementation
+        # Note: Signal generation usually implies "Close crossed" or "High touched"
+        # Strategy: Enter if Price breaks the level.
+        
+        # Filter masks
+        mask_adx = np.ones(len(df), dtype=bool)
+        if self.enable_adx_filter:
+            mask_adx = (df['adx'] > self.min_adx).values
+            
+        mask_atr = (df['atr_filter'] > self.min_atr_points).values
+        
+        # New Filter Masks
+        mask_sma_long = np.ones(len(df), dtype=bool)
+        mask_sma_short = np.ones(len(df), dtype=bool)
+        
+        if self.enable_sma_filter:
+            # Long only if Close > SMA
+            mask_sma_long = (df['close'] > df['sma_regime']).values
+            # Short only if Close < SMA
+            mask_sma_short = (df['close'] < df['sma_regime']).values
+            
+        mask_vol = np.ones(len(df), dtype=bool)
+        if self.enable_vol_filter:
+            # Entry Volume > Avg Vol * Mult
+            mask_vol = (df['volume'] > (df['vol_ma'] * self.min_vol_mult)).values
+        
+        # Breakout signals
+        # We use 'close' for confirmation or 'high'/'low' for touch?
+        # Trend systems usually stop-entry at the breakout level. 
+        # For this vectorized backtest, we assume fill if High > DonchianHigh
+        
+        # Time filter masks
+        mask_rth = df['in_rth'].values if 'in_rth' in df.columns else np.ones(len(df), dtype=bool)
+        mask_maint = (~df['in_maintenance'].values) if 'in_maintenance' in df.columns else np.ones(len(df), dtype=bool)
+
+        long_sig = (df['high'] > df['donchian_high']) & mask_adx & mask_atr & mask_sma_long & mask_vol & mask_rth & mask_maint
+        short_sig = (df['low'] < df['donchian_low']) & mask_adx & mask_atr & mask_sma_short & mask_vol & mask_rth & mask_maint
+        
+        if not self.enable_long: long_sig[:] = False
+        if not self.enable_short: short_sig[:] = False
+        
+        return long_sig, short_sig
+
+    def setup_position(self, entry_price, direction, row, df=None):
+        """Create position with initial stop logic."""
+        
+        # For trend strategy, entry price is often the breakout level (stop order)
+        # In this simplified backtest, we often use 'close' or 'breakout level'
+        # To be robust, if High > Donchian, we theoretically entered at Donchian Level + Tick
+        # But for now, using the passed entry_price which comes from Backtester (customizable)
+        
+        stop_price = 0.0
+        if self.initial_sl_pct > 0:
+            if direction == 1:
+                stop_price = entry_price * (1 - self.initial_sl_pct / 100.0)
+            else:
+                stop_price = entry_price * (1 + self.initial_sl_pct / 100.0)
+        
+        tp_price = 0.0
+        if self.tp_mult_atr > 0:
+            atr = row.atr if hasattr(row, 'atr') else row['atr']
+            if direction == 1:
+                tp_price = entry_price + (atr * self.tp_mult_atr)
+            else:
+                tp_price = entry_price - (atr * self.tp_mult_atr)
+
+        return {
+            'entry_time': row.Index if not isinstance(row, pd.Series) else row.name,
+            'entry_price': entry_price,
+            'direction': direction,
+            'stop': stop_price,
+            'tp': tp_price,
+            'bars_held': 0,
+            'highest_high': entry_price if direction == 1 else -1,
+            'lowest_low': entry_price if direction == -1 else 999999
+        }
+
+    def check_exit(self, position, row, df):
+        """
+        Check stops (Initial, Trailing) and TP.
+        Also check for 'Reverse' signal (Donchian lower band for Longs).
+        """
+        idx = row.Index if not isinstance(row, pd.Series) else row.name
+        high = row.high if not isinstance(row, pd.Series) else row['high']
+        low = row.low if not isinstance(row, pd.Series) else row['low']
+        close = row.close if not isinstance(row, pd.Series) else row['close']
+        donchian_low = row.donchian_low if hasattr(row, 'donchian_low') else row['donchian_low']
+        donchian_high = row.donchian_high if hasattr(row, 'donchian_high') else row['donchian_high']
+        
+        dir_ = position['direction']
+        
+        # 1. Stop Loss
+        if dir_ == 1 and low <= position['stop']: return True, 'Stop Loss', position['stop']
+        if dir_ == -1 and high >= position['stop']: return True, 'Stop Loss', position['stop']
+        
+        # 2. Take Profit
+        if position['tp'] > 0:
+            if dir_ == 1 and high >= position['tp']: return True, 'Take Profit', position['tp']
+            if dir_ == -1 and low <= position['tp']: return True, 'Take Profit', position['tp']
+            
+        # 3. Channel Exit (Reversal)
+        # If Long, and Price drops below Donchian Low (Support broken) -> Exit
+        if dir_ == 1 and low < donchian_low:
+             return True, 'Channel Exit', donchian_low
+        if dir_ == -1 and high > donchian_high:
+             return True, 'Channel Exit', donchian_high
+             
+        return False, None, None
+
+    def update_trailing_stop(self, position, row, df):
+        """Update trailing stop based on ATR."""
+        if not self.enable_trailing: return
+        
+        high = row.high if not isinstance(row, pd.Series) else row['high']
+        low = row.low if not isinstance(row, pd.Series) else row['low']
+        atr = row.atr if not isinstance(row, pd.Series) else row['atr']
+        
+        position['bars_held'] += 1
+        if position['bars_held'] < self.trailing_delay: return
+        
+        if position['direction'] == 1:
+            # Ratchet logic
+            new_stop = high - (atr * self.atr_mult_ts) # Standard Chandelier Exit uses High
+            # Or use close? High is safer for profit locking.
+            if new_stop > position['stop']:
+                position['stop'] = new_stop
+        else:
+             new_stop = low + (atr * self.atr_mult_ts)
+             if new_stop < position['stop']:
+                 position['stop'] = new_stop

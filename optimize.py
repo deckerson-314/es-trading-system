@@ -141,16 +141,29 @@ parser.add_argument('--strategy', type=str, default='bollinger', help='Strategy 
 parser.add_argument('--dashboard-from', type=str, help='Path to an old checkpoint file to generate dashboard from (skips optimization)', default=None)
 parser.add_argument('--visualize-json', type=str, help='Generate dashboard for a specific solution from a JSON parameter file', default=None)
 parser.add_argument('--fresh', '-f', action='store_true', help='Force start fresh (ignore checkpoints)')
+parser.add_argument('--pop', type=int, help='Override Population Size', default=None)
+parser.add_argument('--gen', type=int, help='Override Number of Generations', default=None)
 args = parser.parse_args()
 
 import glob
 
-PARAM_CSV = args.params
+# Defines strategy-specific defaults
+strategy_name_cap = args.strategy.capitalize()
+
+if args.params == DEFAULT_PARAM_CSV:
+    if args.strategy == 'trend':
+        PARAM_CSV = os.path.join('strategies', 'trend', 'parameters', 'trend_strategy_params.csv')
+    else:
+        PARAM_CSV = args.params
+else:
+    PARAM_CSV = args.params
+    
+print(f"Using Strategy: {args.strategy}")
 print(f"Using Parameter File: {PARAM_CSV}")
 
 # Generate Unique Output Filename (Date + Sequence Number)
 today_str = datetime.now().strftime('%Y-%m-%d')
-output_dir = os.path.join('Bollinger', 'parameters')
+output_dir = os.path.join(strategy_name_cap, 'parameters')
 os.makedirs(output_dir, exist_ok=True)
 
 # Find next sequence number
@@ -176,9 +189,9 @@ OUTPUT_CSV = os.path.join(output_dir, f'genetic_results_{suffix}.csv')
 print(f"Generated Output Filename: {OUTPUT_CSV}")
 
 # Also version the trade logs to keep them associated
-TRADES_OOS_CSV = os.path.join('Bollinger', 'output', f'genetic_trades_oos_{suffix}.csv')
-TRADES_IS_CSV = os.path.join('Bollinger', 'output', f'genetic_trades_is_{suffix}.csv')
-DIAG_DIR = 'ga_diagnostics_v4'
+TRADES_OOS_CSV = os.path.join(strategy_name_cap, 'output', f'genetic_trades_oos_{suffix}.csv')
+TRADES_IS_CSV = os.path.join(strategy_name_cap, 'output', f'genetic_trades_is_{suffix}.csv')
+DIAG_DIR = os.path.join(strategy_name_cap, 'diagnostics')
 # If generating dashboard from old checkpoint, override paths
 if args.dashboard_from:
     CHECKPOINT_FILE = args.dashboard_from
@@ -200,7 +213,8 @@ else:
     # Ideally should use args.strategy but args not available here yet (defined below)
     # So we used a fixed path relative to strategies/bollinger for now
     # We will refine this in main() if needed
-    CHECKPOINT_DIR = os.path.join('strategies', 'bollinger', 'checkpoints')
+    # Dynamic Checkpoint Path based on strategy
+    CHECKPOINT_DIR = os.path.join('strategies', strategy_name_cap.lower(), 'checkpoints')
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, 'ga_checkpoint_v4.pkl')
 START_TIME_FILE = os.path.join(DIAG_DIR, 'ga_start_time.txt')
@@ -581,16 +595,9 @@ def evaluate_multi_objective(ind_and_df):
     avg_trades_day = metrics['avg_trades_day']
     
     # ====================================================================
+    # COMPLIANCE: Hard Constraints have been removed in favor of Graduated Penalties below
+    # to avoid evolutionary dead-ends for the Genetic Algorithm.
     # ====================================================================
-    # HARD CONSTRAINT: Minimum trades per day (< 1.0 = eliminated)
-    # Solutions with < 1 trade/day are completely useless and must be eliminated
-    # This is the ONLY hard constraint - all others use graduated penalties
-    # ====================================================================
-    min_trades = param_dict.get('MIN_TRADES_DAY', {'value': 1.0})['value']
-    if avg_trades_day < min_trades:
-        # Hard constraint: eliminate solutions with < 1 trade/day
-        # Return negative infinity or very large negative to ensure elimination
-        return (-100.0, 100000.0, -100.0, -100.0, -100.0, -100.0)
     
     # ====================================================================
     # GRADUATED PENALTIES - Allow exploration while discouraging bad solutions
@@ -748,23 +755,12 @@ def evaluate_multi_objective(ind_and_df):
     pf *= penalty_factor
     
     # ====================================================================
-    # NORMALIZATION - Normalize objectives to 0-1 range before weighting
-    # Based on research: Prevents one objective from dominating
-    # Using reasonable fixed ranges (since we don't have population stats)
+    # NORMALIZATION & FINAL CALCULATION
+    # Normalize objectives to 0-1 range before weighting.
+    # Prevents one objective from dominating.
     # ====================================================================
     
     # Normalization ranges - loaded from CSV for configurability
-    SORTINO_MAX = param_dict.get('NORM_SORTINO_MAX', {'value': 10.0})['value']
-    DD_MAX = param_dict.get('NORM_DD_MAX', {'value': 100000.0})['value']
-    PF_MAX = param_dict.get('NORM_PF_MAX', {'value': 5.0})['value']
-    TRADES_MAX = param_dict.get('NORM_TRADES_MAX', {'value': 3.0})['value']
-    PNL_MAX = param_dict.get('NORM_PNL_MAX', {'value': 200000.0})['value']
-    
-    # ====================================================================
-    # NORMALIZATION & FINAL CALCULATION
-    # ====================================================================
-    
-    # Normalization ranges
     SORTINO_MAX = param_dict.get('NORM_SORTINO_MAX', {'value': 10.0})['value']
     DD_MAX = param_dict.get('NORM_DD_MAX', {'value': 100000.0})['value']
     PF_MAX = param_dict.get('NORM_PF_MAX', {'value': 5.0})['value']
@@ -787,7 +783,7 @@ def evaluate_multi_objective(ind_and_df):
     normalized_sortino -= low_trade_penalty
     normalized_pf -= low_trade_penalty
     normalized_pnl -= low_trade_penalty
-    normalized_ppt -= low_trade_penalty
+    # Note: normalized_ppt penalty applied after its definition below (line ~830)
     
     # For Drawdown (Minimized, where 1.0 is Best/NoDD and 0.0 is Worst/MaxDD)
     # Wait, normalized_dd is 1.0 - (DD/Max). So 1.0 is Good.
@@ -843,6 +839,7 @@ def evaluate_multi_objective(ind_and_df):
     
     # Apply penalty to this too (bad strategies shouldn't get credit for high ppt if they fail basic checks)
     normalized_ppt *= penalty_factor
+    normalized_ppt -= low_trade_penalty  # Deferred from normalization block above
     normalized_ppt = max(0.0001, normalized_ppt)
     normalized_ppt = float(normalized_ppt)
 
@@ -1743,14 +1740,17 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
             """
             
             for pname in valid_list:
-                # Get Input Range
+                # Get Input Range & Value safely
                 p_data = param_dict[pname]
-                if not isinstance(p_data, dict):
-                    p_min = 'N/A'
-                    p_max = 'N/A'
-                else:
+                if isinstance(p_data, dict):
                     p_min = p_data.get('min', 'N/A')
                     p_max = p_data.get('max', 'N/A')
+                    val = p_data.get('value', 'N/A')
+                else:
+                    p_min = 'N/A'
+                    p_max = 'N/A'
+                    val = str(p_data)
+                    
                 input_range = f"[{p_min} - {p_max}]" if (p_min != 'N/A' and p_max != 'N/A') else "Fixed"
                 
                 # Check if optimized
@@ -1770,7 +1770,6 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
                         symbol = '<span style="color:gray;" title="Stable">○</span>'
                 else:
                     # Fixed Parameter
-                    val = p_data.get('value', 'N/A')
                     mean_val = str(val)
                     std_val = "-"
                     gen_range = "-"
@@ -3030,7 +3029,7 @@ def main():
         }
         
         # Filter out section headers
-        param_df_filtered = param_df_local[~param_df_local['Name'].str.startswith('===')]
+        param_df_filtered = param_df_local[~param_df_local['Name'].str.startswith('===').fillna(False)]
         
         for group_name, param_list in groups.items():
             group_df = param_df_filtered[param_df_filtered['Name'].isin(param_list)]
@@ -3052,7 +3051,14 @@ def main():
     
     # Set GA configuration from parameters
     POP_SIZE = param_dict.get('POP_SIZE', {'value': 20})['value']
+    if args.pop:
+        POP_SIZE = args.pop
+        print(f"Override: POP_SIZE set to {POP_SIZE}")
+
     NUM_GEN = param_dict.get('NUM_GEN', {'value': 10})['value']
+    if args.gen:
+        NUM_GEN = args.gen
+        print(f"Override: NUM_GEN set to {NUM_GEN}")
     CX_PB = param_dict.get('CX_PB', {'value': 0.7})['value']
     MUT_PB = param_dict.get('MUT_PB', {'value': 0.2})['value']
     MUT_MU = param_dict.get('MUT_MU', {'value': 0.0})['value']

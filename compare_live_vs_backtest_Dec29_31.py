@@ -6,12 +6,16 @@ from datetime import datetime, timedelta
 import numpy as np
 
 # Add project root to path
-sys.path.append(os.getcwd())
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 try:
-    from BB_Strategy_v4 import run_backtest_v4
+    from backtest import run_backtest as run_backtest_v4
 except ImportError:
-    print("Could not import BB_Strategy_v4. Ensure you are in the project root.")
-    sys.exit(1)
+    try:
+        from BB_Strategy_v4 import run_backtest_v4
+    except ImportError:
+        print("Error: Could not import backtest module. Ensure backtest.py or BB_Strategy_v4.py is available.")
+        sys.exit(1)
 
 def parse_live_trades_csv(csv_path):
     """

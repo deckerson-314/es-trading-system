@@ -17,6 +17,12 @@ class Strategy(ABC):
         """
         pass
 
+    @property
+    @abstractmethod
+    def min_bars_required(self) -> int:
+        """Return the minimum number of bars required to calculate all indicators for this strategy."""
+        pass
+
     @abstractmethod
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """

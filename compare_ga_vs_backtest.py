@@ -5,7 +5,17 @@ Compare how GA processes data vs BB_Strategy_v3 to find discrepancies.
 
 import pandas as pd
 import sys
-from bollinger_strategy import load_params, BollingerBandStrategy
+import os
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from strategies.bollinger.parameters import load_params
+    from strategies.bollinger.strategy import BollingerBandStrategy
+except ImportError:
+    # Fallback for old-style imports
+    from bollinger_strategy import load_params, BollingerBandStrategy
 
 # GA settings
 DATA_SIZE = 5095390

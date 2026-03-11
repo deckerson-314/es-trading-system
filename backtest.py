@@ -22,13 +22,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from strategies.factory import StrategyFactory
 from strategies.bollinger.parameters import load_params 
 # Eventually we want a generic reporting module in core/ or tools/
-# For now, we still rely on the bollinger_strategy package for reporting helpers if needed,
-# or we move generate_dashboard to tools/dashboard/reporting.py (Planned in Phase 5)
 try:
-    from strategies.bollinger.reporting import generate_dashboard
+    from tools.dashboard.updates import DashboardState, update_dashboard
 except ImportError:
-    print("Warning: Could not import generate_dashboard from strategies.bollinger.reporting")
-    generate_dashboard = None
+    pass
 
 warnings.filterwarnings("ignore")
 
@@ -94,7 +91,7 @@ def load_ga_params(ga_file, solution_idx):
         print(f"Error parsing GA params: {e}")
         raise
 
-def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, start_date=None, end_date=None):
+def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, start_date=None, end_date=None, dashboard_path=None):
     """
     Run backtest using StrategyFactory.
     """
@@ -232,14 +229,67 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
             if not suppress_log:
                 log(f"Total PnL: ${total_pnl:,.2f} | WR: {win_rate:.1f}% | PF: {pf:.2f}", log_file)
         
-        # Generate Dashboard if single run
-        if not suppress_log and generate_dashboard:
+        # Generate Dashboard
+        if not suppress_log:
              try:
-                 generate_dashboard([{'name': 'Backtest', 'params': params_dict, 
-                                     'trades_df': result_package['trades_df'], 
-                                     'equity_curve': result_package['equity_curve'],
-                                     'df': df}])
-             except: pass
+                 web_dir = os.path.join(BASE_DIR, 'web')
+                 os.makedirs(web_dir, exist_ok=True)
+                 dash_filename = os.path.basename(dashboard_path) if dashboard_path else f"backtest_dashboard_{strategy_name}.html"
+                 
+                 # Dynamic import for reporting module
+                 has_reporting_module = False
+                 try:
+                     import importlib
+                     reporting_module = importlib.import_module(f"strategies.{strategy_name}.reporting")
+                     generate_dashboard = reporting_module.generate_dashboard
+                     calculate_stats = reporting_module.calculate_stats
+                     has_reporting_module = True
+                 except ImportError:
+                     pass
+
+                 if has_reporting_module:
+                     solutions_data = [{
+                         'name': strategy_name.capitalize(),
+                         'stats': calculate_stats(result_package['trades_df'], result_package.get('equity_curve')),
+                         'params': params_dict,
+                         'trades_df': result_package['trades_df'],
+                         'equity_curve': result_package.get('equity_curve', pd.Series(dtype=float)),
+                         'df': result_package.get('df')
+                     }]
+                     generate_dashboard(solutions_data, output_dir=web_dir, version='5.0', 
+                                       filename=dash_filename, open_browser=False)
+                     dash_path = os.path.join(web_dir, dash_filename)
+                     print(f"Backtest dashboard saved to {dash_path}")
+                 else:
+                     # Fallback: use live-style dashboard if reporting module unavailable
+                     state = DashboardState(
+                         mode="BACKTEST", port=0, contract_symbol=strategy_name,
+                         is_connected=False, params=params_dict,
+                         account_info={
+                             'NetLiquidation': 100000 + result_package['total_pnl'],
+                             'RealizedPNL': result_package['total_pnl'],
+                             'UnrealizedPNL': 0.0
+                         }
+                     )
+                     if not result_package['trades_df'].empty:
+                         for _, t in result_package['trades_df'].iterrows():
+                             exit_time_str = t['exit_time'].strftime('%Y-%m-%d %H:%M') if hasattr(t['exit_time'], 'strftime') else str(t['exit_time'])
+                             state.completed_trades.append({
+                                 'time': exit_time_str, 'side': 'LONG' if t['direction'] == 1 else 'SHORT',
+                                 'size': 1, 'price': t['exit_price'],
+                                 'commission': transaction_cost, 'realizedPNL': t['pnl_currency']
+                             })
+                     if 'df' in result_package and result_package['df'] is not None and not result_package['df'].empty:
+                         state.current_price = result_package['df'].iloc[-1]['close']
+                     state.live_tracker.append({'timestamp': datetime.now().strftime('%H:%M:%S'), 'type': 'INFO', 'message': 'Backtest Completed'})
+                     dash_path = dashboard_path if dashboard_path else os.path.join(web_dir, dash_filename)
+                     status_path = os.path.join(web_dir, f"backtest_status_{strategy_name}.json")
+                     update_dashboard(state, dash_path, status_path)
+                     print(f"Dashboard saved to {dash_path} (fallback mode)")
+             except Exception as e:
+                 print(f"Failed to generate dashboard: {e}")
+                 import traceback
+                 traceback.print_exc()
              
     return result_package
 
@@ -252,6 +302,7 @@ def main():
     parser.add_argument('--solutions', type=str, help='Comparison mode: Solution IDs (e.g. 0,1,2)')
     parser.add_argument('--start', type=str)
     parser.add_argument('--end', type=str)
+    parser.add_argument('--dashboard', type=str, help='Path for output dashboard HTML')
     
     args = parser.parse_args()
     
@@ -283,6 +334,9 @@ def main():
                 print("Error: --solutions must be a comma-separated list of integers (e.g. 0,1,2)")
                 sys.exit(1)
                 
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            summary_results = []
+            equity_curves = {}
             solutions_data = []
             
             print(f"Comparing solutions {sol_list} from {ga_file}...")
@@ -291,7 +345,7 @@ def main():
                 try:
                     p, name = load_ga_params(ga_file, idx)
                     # DEBUG: Print a few key params to verify loading
-                    print(f"Running Sol {idx} with {len(p)} params. BB Len: {p.get('Bollinger Band Length', {}).get('value','N/A')}")
+                    print(f"  > Processing Sol {idx} with {len(p)} params... ", end='', flush=True)
                     
                     res = run_backtest(args.strategy, args.data, p, suppress_log=True, start_date=args.start, end_date=args.end)
                     solutions_data.append({
@@ -301,16 +355,63 @@ def main():
                         'equity_curve': res['equity_curve'],
                         'df': res['df']
                     })
-                    print(f"Sol {idx}: ${res['total_pnl']:,.0f} ({len(res['trades_df'])} trades)")
+                    
+                    summary_results.append({
+                        'Solution': idx,
+                        'Name': name,
+                        'PnL': res['total_pnl'],
+                        'Trades': len(res['trades_df']),
+                        'WinRate%': res.get('win_rate', 0.0),
+                        'PF': res.get('pf', 0.0),
+                        'MaxDD': res.get('max_dd', 0.0),
+                        'Sortino': res.get('sortino', 0.0)
+                    })
+                    
+                    if not res['equity_curve'].empty:
+                        equity_curves[f"Sol {idx}"] = res['equity_curve']
+                        
+                    print(f"Done. PnL: ${res['total_pnl']:,.0f} ({len(res['trades_df'])} trades)")
                 except Exception as e:
                     print(f"Error running solution {idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            if summary_results:
+                summary_df = pd.DataFrame(summary_results)
+                summary_path = os.path.join(RESULTS_DIR, f'comparison_summary_{timestamp}.csv')
+                summary_df.to_csv(summary_path, index=False)
+                print(f"\n=== Summary Report: {summary_path} ===")
+                print(summary_df.to_string())
                 
-            if generate_dashboard:
+                # Restore Multi-Solution Dashboard Generation
+                print("\nGenerating Multi-Solution HTML Dashboard...")
                 try:
-                    generate_dashboard(solutions_data)
-                    print("Dashboard generated.")
+                     import importlib
+                     reporting_module = importlib.import_module(f"strategies.{args.strategy}.reporting")
+                     generate_dashboard = reporting_module.generate_dashboard
+                     
+                     dash_filename = args.dashboard if args.dashboard else f"backtest_dashboard_{args.strategy}.html"
+                     cmp_dash_path = os.path.join(BASE_DIR, 'web', dash_filename)
+                     generate_dashboard(solutions_data, output_dir=os.path.join(BASE_DIR, 'web'), version='4.0', filename=dash_filename)
+                     print(f"Comparison Dashboard generated: {cmp_dash_path}")
                 except Exception as e:
-                    print(f"Error generating dashboard: {e}")
+                     print(f"Failed to generate Comparison Dashboard: {e}")
+                
+            if equity_curves:
+                plt.figure(figsize=(12, 6))
+                for label, curve in equity_curves.items():
+                    plt.plot(curve.index, curve.values, label=f"{label} (${curve.values[-1]:,.0f})", linewidth=2)
+                    
+                plt.title(f"Equity Curve Comparison - {os.path.basename(ga_file)}")
+                plt.xlabel("Date")
+                plt.ylabel("Cumulative PnL ($)")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                
+                plot_path = os.path.join(RESULTS_DIR, f'comparison_equity_{timestamp}.png')
+                plt.savefig(plot_path)
+                print(f"Comparison Plot: {plot_path}")
+                
             return
 
         else:
@@ -338,7 +439,7 @@ def main():
              print(f"Warning: No parameters provided and default not found at {default_params}. Using internal strategy defaults.")
     
     # 2. Run Single Backtest
-    run_backtest(args.strategy, args.data, params_dict, start_date=args.start, end_date=args.end)
+    run_backtest(args.strategy, args.data, params_dict, start_date=args.start, end_date=args.end, dashboard_path=args.dashboard)
 
 if __name__ == '__main__':
     main()
