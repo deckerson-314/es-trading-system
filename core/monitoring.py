@@ -223,7 +223,7 @@ def on_bar_update_handler(bars, hasNewBar, *, strategy, ib, contract, data_ref,
         # Update indicators
         update_indicators(strategy, data)
 
-        min_bars = _get_min_bars(strategy)
+        min_bars = strategy.min_bars_required
 
         # Process completed bar
         if should_check and len(data) >= max(2, min_bars):

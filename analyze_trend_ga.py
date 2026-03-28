@@ -6,7 +6,7 @@ from datetime import datetime
 import sys
 
 # === CONFIGURATION ===
-run_id = '2026-02-08-4'
+run_id = '2026-03-15-1'
 is_file = fr'c:\Trading\Trend\output\genetic_trades_is_{run_id}.csv'
 oos_file = fr'c:\Trading\Trend\output\genetic_trades_oos_{run_id}.csv'
 results_file = fr'c:\Trading\Trend\parameters\genetic_results_{run_id}.csv'

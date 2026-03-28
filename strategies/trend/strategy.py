@@ -31,7 +31,9 @@ class TrendStrategy(Strategy):
         self.timeframe = int(get_param_value(self.params_dict, 'Timeframe (minutes)', 15))
         
         # Trailing Stop
-        self.enable_trailing = get_param_value(self.params_dict, 'Enable Trailing Stop', True)
+        trailing_val = get_param_value(self.params_dict, 'Enable Trailing Stop', True)
+        if isinstance(trailing_val, (int, float)): self.enable_trailing = bool(int(trailing_val))
+        else: self.enable_trailing = trailing_val
         self.atr_length_ts = int(get_param_value(self.params_dict, 'ATR Length for Trailing Stop', 14))
         self.atr_mult_ts = float(get_param_value(self.params_dict, 'ATR Multiplier for Trailing Stop', 3.0))
         self.trailing_delay = int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5))
@@ -44,13 +46,28 @@ class TrendStrategy(Strategy):
         self.lookback_sell = int(get_param_value(self.params_dict, 'Sell Lookback', 20))
         
         # Filter Logic
-        self.enable_adx_filter = get_param_value(self.params_dict, 'Enable ADX Filter', False)
+        adx_filter_val = get_param_value(self.params_dict, 'Enable ADX Filter', False)
+        if isinstance(adx_filter_val, (int, float)): self.enable_adx_filter = bool(int(adx_filter_val))
+        else: self.enable_adx_filter = adx_filter_val
         self.adx_period = int(get_param_value(self.params_dict, 'ADX Period', 14))
         self.min_adx = float(get_param_value(self.params_dict, 'Min ADX Threshold', 20.0))
         
         self.atr_filter_period = int(get_param_value(self.params_dict, 'ATR Filter Period', 14))
 
         self.min_atr_points = float(get_param_value(self.params_dict, 'Min ATR (Points)', 0.5))
+
+        # RSI Filter
+        rsi_filter_val = get_param_value(self.params_dict, 'Enable RSI Filter', False)
+        if isinstance(rsi_filter_val, (int, float)): self.enable_rsi_filter = bool(int(rsi_filter_val))
+        else: self.enable_rsi_filter = rsi_filter_val
+        self.rsi_period = int(get_param_value(self.params_dict, 'RSI Period', 14))
+        self.rsi_max_buy = float(get_param_value(self.params_dict, 'RSI Max Buy Threshold', 70.0))
+        self.rsi_min_sell = float(get_param_value(self.params_dict, 'RSI Min Sell Threshold', 30.0))
+
+        # VWAP Filter
+        vwap_filter_val = get_param_value(self.params_dict, 'Enable VWAP Filter', False)
+        if isinstance(vwap_filter_val, (int, float)): self.enable_vwap_filter = bool(int(vwap_filter_val))
+        else: self.enable_vwap_filter = vwap_filter_val
 
         # Regime Filter (SMA)
         self.enable_sma_filter = get_param_value(self.params_dict, 'Enable SMA Filter', False)
@@ -99,7 +116,8 @@ class TrendStrategy(Strategy):
             self.adx_period if self.enable_adx_filter else 0,
             self.atr_filter_period,
             self.sma_period if self.enable_sma_filter else 0,
-            self.vol_ma_length if getattr(self, 'enable_vol_filter', False) else 0
+            self.vol_ma_length if getattr(self, 'enable_vol_filter', False) else 0,
+            self.rsi_period if getattr(self, 'enable_rsi_filter', False) else 0
         ]
         return max(lookbacks) + 10
 
@@ -113,6 +131,8 @@ class TrendStrategy(Strategy):
                 'Enable ADX Filter': self.enable_adx_filter,
                 'Min ADX': self.min_adx,
                 'Min ATR': self.min_atr_points,
+                'Enable RSI': getattr(self, 'enable_rsi_filter', False),
+                'Enable VWAP': getattr(self, 'enable_vwap_filter', False),
                 'Enable RTH': self.enable_rth_filter,
                 'RTH Start': self.rth_start_str,
                 'RTH End': self.rth_end_str
@@ -144,14 +164,25 @@ class TrendStrategy(Strategy):
         # ATR Length for TS
         if 'ATR Length for Trailing Stop' in params: self.atr_length_ts = int(params['ATR Length for Trailing Stop'])
         
+        # Boolean Filters (Optimized as 0/1 int)
+        if 'Enable ADX Filter' in params: self.enable_adx_filter = bool(int(params['Enable ADX Filter']))
+        if 'Enable Trailing Stop' in params: self.enable_trailing = bool(int(params['Enable Trailing Stop']))
+        
         # New Filters
         if 'SMA Period' in params: self.sma_period = int(params['SMA Period'])
         if 'Volume MA Length' in params: self.vol_ma_length = int(params['Volume MA Length'])
         if 'Min Volume Multiplier' in params: self.min_vol_mult = float(params['Min Volume Multiplier'])
         
         # Boolean Filters (Optimized as 0/1 int)
-        if 'Enable SMA Filter' in params: self.enable_sma_filter = int(params['Enable SMA Filter'])
-        if 'Enable Volume Filter' in params: self.enable_vol_filter = int(params['Enable Volume Filter'])
+        if 'Enable SMA Filter' in params: self.enable_sma_filter = bool(int(params['Enable SMA Filter']))
+        if 'Enable Volume Filter' in params: self.enable_vol_filter = bool(int(params['Enable Volume Filter']))
+        if 'Enable RSI Filter' in params: self.enable_rsi_filter = bool(int(params['Enable RSI Filter']))
+        if 'Enable VWAP Filter' in params: self.enable_vwap_filter = bool(int(params['Enable VWAP Filter']))
+
+        # Filter Parameters
+        if 'RSI Period' in params: self.rsi_period = int(params['RSI Period'])
+        if 'RSI Max Buy Threshold' in params: self.rsi_max_buy = float(params['RSI Max Buy Threshold'])
+        if 'RSI Min Sell Threshold' in params: self.rsi_min_sell = float(params['RSI Min Sell Threshold'])
 
     def calculate_indicators(self, df):
         """Calculate Donchian Channels, ATR, ADX."""
@@ -196,8 +227,36 @@ class TrendStrategy(Strategy):
             df['sma_regime'] = df['close'].rolling(self.sma_period).mean()
             
         # 5. Volume Filter
-        if self.enable_vol_filter:
+        if getattr(self, 'enable_vol_filter', False):
             df['vol_ma'] = df['volume'].rolling(self.vol_ma_length).mean()
+        
+        # 6. RSI Filter
+        if getattr(self, 'enable_rsi_filter', False):
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=self.rsi_period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_period).mean()
+            rs = gain / loss.replace(0, 1e-9)
+            df['rsi'] = 100 - (100 / (1 + rs))
+
+        # 7. VWAP Filter
+        if getattr(self, 'enable_vwap_filter', False):
+            # Typical Price * Volume
+            tp = (df['high'] + df['low'] + df['close']) / 3
+            pv = tp * df['volume']
+            # Rolling window for intra-day VWAP or full history?
+            # Standard VWAP is cumulative since session start.
+            # For backtest simplicity and consistency with Bollinger, we can use a rolling version 
+            # or cumulative if we have session logic.
+            # Let's use cumulative since session start (9:30 ET) if possible, 
+            # or a very long rolling window if not.
+            # Bollinger used cumulative sum for the day.
+            
+            # Group by date to reset VWAP each day
+            df['date'] = df.index.date
+            df['cum_pv'] = df.groupby('date')['volume'].transform(lambda x: (tp.loc[x.index] * x).cumsum())
+            df['cum_vol'] = df.groupby('date')['volume'].transform(lambda x: x.cumsum())
+            df['vwap'] = df['cum_pv'] / df['cum_vol'].replace(0, 1)
+            df.drop(columns=['date', 'cum_pv', 'cum_vol'], inplace=True)
             
         df.dropna(inplace=True)
         return df
@@ -242,10 +301,23 @@ class TrendStrategy(Strategy):
             # Short only if Close < SMA
             mask_sma_short = (df['close'] < df['sma_regime']).values
             
+        
         mask_vol = np.ones(len(df), dtype=bool)
-        if self.enable_vol_filter:
+        if getattr(self, 'enable_vol_filter', False):
             # Entry Volume > Avg Vol * Mult
             mask_vol = (df['volume'] > (df['vol_ma'] * self.min_vol_mult)).values
+
+        mask_rsi_long = np.ones(len(df), dtype=bool)
+        mask_rsi_short = np.ones(len(df), dtype=bool)
+        if getattr(self, 'enable_rsi_filter', False):
+            mask_rsi_long = (df['rsi'] < self.rsi_max_buy).values
+            mask_rsi_short = (df['rsi'] > self.rsi_min_sell).values
+
+        mask_vwap_long = np.ones(len(df), dtype=bool)
+        mask_vwap_short = np.ones(len(df), dtype=bool)
+        if getattr(self, 'enable_vwap_filter', False):
+            mask_vwap_long = (df['close'] > df['vwap']).values
+            mask_vwap_short = (df['close'] < df['vwap']).values
         
         # Breakout signals
         # We use 'close' for confirmation or 'high'/'low' for touch?
@@ -256,8 +328,8 @@ class TrendStrategy(Strategy):
         mask_rth = df['in_rth'].values if 'in_rth' in df.columns else np.ones(len(df), dtype=bool)
         mask_maint = (~df['in_maintenance'].values) if 'in_maintenance' in df.columns else np.ones(len(df), dtype=bool)
 
-        long_sig = (df['high'] > df['donchian_high']) & mask_adx & mask_atr & mask_sma_long & mask_vol & mask_rth & mask_maint
-        short_sig = (df['low'] < df['donchian_low']) & mask_adx & mask_atr & mask_sma_short & mask_vol & mask_rth & mask_maint
+        long_sig = (df['high'] > df['donchian_high']) & mask_adx & mask_atr & mask_sma_long & mask_vol & mask_rsi_long & mask_vwap_long & mask_rth & mask_maint
+        short_sig = (df['low'] < df['donchian_low']) & mask_adx & mask_atr & mask_sma_short & mask_vol & mask_rsi_short & mask_vwap_short & mask_rth & mask_maint
         
         if not self.enable_long: long_sig[:] = False
         if not self.enable_short: short_sig[:] = False
@@ -279,13 +351,14 @@ class TrendStrategy(Strategy):
             else:
                 stop_price = entry_price * (1 + self.initial_sl_pct / 100.0)
         
-        tp_price = 0.0
+        tp_price = None
         if self.tp_mult_atr > 0:
             atr = row.atr if hasattr(row, 'atr') else row['atr']
-            if direction == 1:
-                tp_price = entry_price + (atr * self.tp_mult_atr)
-            else:
-                tp_price = entry_price - (atr * self.tp_mult_atr)
+            if not pd.isna(atr) and atr > 0:
+                if direction == 1:
+                    tp_price = entry_price + (atr * self.tp_mult_atr)
+                else:
+                    tp_price = entry_price - (atr * self.tp_mult_atr)
 
         return {
             'entry_time': row.Index if not isinstance(row, pd.Series) else row.name,
@@ -317,7 +390,7 @@ class TrendStrategy(Strategy):
         if dir_ == -1 and high >= position['stop']: return True, 'Stop Loss', position['stop']
         
         # 2. Take Profit
-        if position['tp'] > 0:
+        if position['tp'] is not None and position['tp'] > 0:
             if dir_ == 1 and high >= position['tp']: return True, 'Take Profit', position['tp']
             if dir_ == -1 and low <= position['tp']: return True, 'Take Profit', position['tp']
             

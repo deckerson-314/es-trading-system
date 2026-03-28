@@ -5,7 +5,7 @@ Ported from ib_deployment_v4.py lines 1553-1573, 3882-3911
 import logging
 import asyncio
 import time as time_module
-from datetime import datetime
+from datetime import datetime, timedelta
 from ib_insync import Future
 
 
@@ -18,8 +18,10 @@ def get_front_es_contract(ib):
             if not cds:
                 raise ValueError("No ES contracts found")
             today = datetime.now().date()
+            # Customary ES roll happens 8 days before expiration (3rd Friday)
+            roll_cutoff = today + timedelta(days=8)
             future_cds = [cd for cd in cds
-                         if datetime.strptime(cd.contract.lastTradeDateOrContractMonth, '%Y%m%d').date() > today]
+                         if datetime.strptime(cd.contract.lastTradeDateOrContractMonth, '%Y%m%d').date() > roll_cutoff]
             if not future_cds:
                 raise ValueError("No future ES contract found")
             front = min(future_cds,

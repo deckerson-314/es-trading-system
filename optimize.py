@@ -250,6 +250,20 @@ DATA_SIZE = None
 MIN_TRADES_DAY = None
 MIN_TRADES_PEN_WEIGHT = None
 
+# New GA Weights and Limits
+GA_START_DATE = None
+GA_END_DATE = None
+WEIGHT_SORTINO = None
+WEIGHT_DRAWDOWN = None
+WEIGHT_PF = None
+WEIGHT_TRADES = None
+WEIGHT_PNL = None
+WEIGHT_PPT = None
+MIN_TRADE_DURATION = None
+MAX_WIN_RATE_CAP = None
+LIMIT_MAX_LOSS = None
+LIMIT_MIN_SORTINO = None
+
 # Multi-core configuration
 # Calculate optimal number of workers (use all cores minus 1 to leave one for system)
 # This will be recalculated in main() after multiprocessing is properly initialized
@@ -265,7 +279,7 @@ param_keys = []
 # ----------------------------------------------------------------------
 # Back-tester using shared strategy module
 # ----------------------------------------------------------------------
-def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=False):
+def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=False, mask=None):
     default_result = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0,
                      'trades_df': pd.DataFrame(), 'monthly_profit_stats': {'max_monthly_profit': 0, 'min_monthly_profit': 0, 'avg_monthly_profit': 0}}
     
@@ -286,9 +300,33 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     # strategy = BollingerBandStrategy(param_dict_local) # REMOVED
     strategy.update_optimizable_params(params)
     
+    # Resample logic for multiple timeframes
+    # This must happen BEFORE indicator calculation
+    tf = getattr(strategy, 'timeframe', 1)
+    if tf > 1:
+        # Resample OHLCV
+        df_in = df_in.resample(f'{tf}T').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        
+        # Resample Mask if present
+        if mask is not None:
+            mask = mask.resample(f'{tf}T').max().fillna(False).astype(bool)
+            # Reindex to match the resampled OHLCV (handling dropped bars)
+            mask = mask.reindex(df_in.index).fillna(False)
+
     try:
         # Calculate indicators & signals (Vectorized)
         df = strategy.calculate_indicators(df_in)
+        
+        # If mask is provided, slice the dataframe AFTER indicators are calculated
+        if mask is not None:
+            df = df[mask]
+            
         df = strategy.apply_filters(df)
         
         # New V4 Vectorized Signal Generation
@@ -314,9 +352,29 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     # Using itertuples is efficient enough for Python loop
     
     # Get Transaction Cost
-    transaction_cost = param_dict_local.get('Transaction Cost (Per Trade)', {'value': 20.0})['value']
+    transaction_cost = param_dict_local.get('Transaction Cost (Per Trade)', {'value': 15.0})['value']
     
+    # Track time for jump detection (only if mask provided)
+    last_time = None
+    tf_delta = pd.Timedelta(minutes=strategy.timeframe * 5) # 5x timeframe buffer for gaps
+
     for row in df.itertuples():
+        # Jump Detection: Close positions if we jumped over OOS periods
+        if mask is not None and last_time is not None:
+            if (row.Index - last_time) > tf_delta:
+                for pos in positions[:]:
+                    # Close at open of new period
+                    pnl = (row.open - pos['entry_price']) * pos['direction'] * 50 - transaction_cost
+                    trades.append(pos | {
+                        'exit_time': row.Index,
+                        'exit_price': row.open,
+                        'pnl': pnl,
+                        'reason': 'Gap: Period Transition'
+                    })
+                    positions.remove(pos)
+                pending_entry = None
+
+        last_time = row.Index
         # 1. Process Pending (Execute at Next Open)
         if pending_entry:
             dir_ = pending_entry['direction']
@@ -334,7 +392,7 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
             if should_exit:
                 pnl = (price - pos['entry_price']) * pos['direction'] * 50 - transaction_cost
                 # Use End of Bar for Exit Time to match BB_Strategy_v4.py logic
-                exit_time = row.Index + pd.Timedelta(minutes=strategy.timeframe)
+                exit_time = row.Index + pd.Timedelta(seconds=59)
                 trades.append(pos | {
                     'exit_time': exit_time,
                     'exit_price': price,
@@ -403,7 +461,8 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
          # Approximate total days from data
          # This assumes index is datetime
          try:
-             total_days = len(set(df_in.index.date)) or 1
+             # Use the potentially masked df to count actual traded days
+             total_days = len(set(df.index.date)) or 1
          except:
              total_days = 1
     else:
@@ -439,6 +498,23 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
 # ----------------------------------------------------------------------
 # Multi-objective GA setup
 # ----------------------------------------------------------------------
+
+# --- DYNAMIC WEIGHT LOADING ---
+import pandas as pd
+_csv_weights = (1.0, -1.0, 1.0, 3.0, 2.0, 2.0)
+try:
+    _temp_df = pd.read_csv(PARAM_CSV, comment='#', skip_blank_lines=True)
+    if 'Name' in _temp_df.columns and 'Value' in _temp_df.columns:
+        _w_sortino = float(_temp_df[_temp_df['Name'] == 'WEIGHT_SORTINO']['Value'].iloc[0]) if not _temp_df[_temp_df['Name'] == 'WEIGHT_SORTINO'].empty else 1.0
+        _w_dd = float(_temp_df[_temp_df['Name'] == 'WEIGHT_DRAWDOWN']['Value'].iloc[0]) if not _temp_df[_temp_df['Name'] == 'WEIGHT_DRAWDOWN'].empty else -1.0
+        _w_pf = float(_temp_df[_temp_df['Name'] == 'WEIGHT_PF']['Value'].iloc[0]) if not _temp_df[_temp_df['Name'] == 'WEIGHT_PF'].empty else 1.0
+        _w_trades = float(_temp_df[_temp_df['Name'] == 'WEIGHT_TRADES']['Value'].iloc[0]) if not _temp_df[_temp_df['Name'] == 'WEIGHT_TRADES'].empty else 3.0
+        _w_pnl = float(_temp_df[_temp_df['Name'] == 'WEIGHT_PNL']['Value'].iloc[0]) if not _temp_df[_temp_df['Name'] == 'WEIGHT_PNL'].empty else 2.0
+        _w_ppt = float(_temp_df[_temp_df['Name'] == 'WEIGHT_PPT']['Value'].iloc[0]) if not _temp_df[_temp_df['Name'] == 'WEIGHT_PPT'].empty else 2.0
+        _csv_weights = (_w_sortino, _w_dd, _w_pf, _w_trades, _w_pnl, _w_ppt)
+except Exception as e:
+    pass
+
 # Clear any existing creator classes to avoid conflicts
 if hasattr(creator, "FitnessMulti"):
     del creator.FitnessMulti
@@ -446,14 +522,7 @@ if hasattr(creator, "Individual"):
     del creator.Individual
 
 # Multi-objective fitness: (maximize Sortino, minimize Drawdown, maximize Profit Factor, maximize Avg Trades/Day, maximize Total Profit, maximize Avg Profit/Trade)
-# Weights: (1.0, -1.0, 1.0, 1.0, 2.0, 2.0)
-# - Sortino: maximize (higher is better)
-# - Max Drawdown: minimize (negated, so -1.0 weight means minimize)
-# - Profit Factor: maximize (higher is better)
-# - Avg Trades/Day: maximize (1.0 - Reduced from 5.0 to discourage noise)
-# - Total Profit: maximize (higher is better - direct optimization for profitability)
-# - Avg Profit/Trade: maximize (2.0 - New objective to prioritize quality trades/expectancy)
-creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0, 1.0, 1.0, 2.0, 2.0))
+creator.create("FitnessMulti", base.Fitness, weights=_csv_weights)
 creator.create("Individual", list, fitness=creator.FitnessMulti)
 
 def create_fitness_with_correct_weights():
@@ -464,7 +533,7 @@ def create_fitness_with_correct_weights():
         # Recreate the class if it has wrong weights
         if hasattr(creator, "FitnessMulti"):
             del creator.FitnessMulti
-        creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0, 1.0, 1.0, 2.0, 2.0))
+        creator.create("FitnessMulti", base.Fitness, weights=_csv_weights)
         return creator.FitnessMulti()
 
 def clamp_individual(ind):
@@ -512,340 +581,205 @@ def custom_mutate(ind):
     clamp_individual(ind)
     return ind,
 
-def evaluate_multi_objective(ind_and_df):
-    global param_keys, param_dict
-    ind, df = ind_and_df
-    params = dict(zip(param_keys, ind))
+def core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local=None):
+    """
+    Core evaluation logic shared by single-process and multi-process evaluators.
+    """
+    params = dict(zip(param_keys_local, ind))
     
     # Clamp & cast - ensure integer parameters are properly rounded
     for n, v in params.items():
-        if n not in param_dict:
+        if n not in param_dict_local:
             continue
-        mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
+        mn, mx, typ = param_dict_local[n]['min'], param_dict_local[n]['max'], param_dict_local[n]['type']
         v = max(mn, min(v, mx))
         if typ == 'int':
-            # Round to nearest integer for all int parameters
             params[n] = int(round(v))
         else:
             params[n] = float(v)
     
-    # Convert boolean parameters (0/1 int) to actual booleans
-    # Check if parameter was originally bool type but optimized as 0/1 int
+    # Convert boolean parameters
     for n in list(params.keys()):
-        if n in param_dict:
-            original_type = param_dict[n].get('type', '')
-            # If original type was bool but we have an int value (0 or 1), convert it
+        if n in param_dict_local:
+            original_type = param_dict_local[n].get('type', '')
             if original_type == 'bool' and isinstance(params[n], (int, float)):
                 params[n] = bool(int(round(params[n])))
     
-    # Handle TP method selection (mutually exclusive)
-    # If 'TP Method' parameter exists, convert to individual boolean flags
+    # Handle TP method selection
     if 'TP Method' in params:
         tp_method = int(round(params['TP Method']))
-        # 0 = Fixed BB at Entry TP, 1 = Fixed ATR TP, 2 = Opposite Bollinger Band TP
         params['Fixed BB at Entry TP'] = (tp_method == 0)
         params['Fixed ATR TP'] = (tp_method == 1)
         params['Opposite Bollinger Band TP'] = (tp_method == 2)
-        # Remove the TP Method parameter as it's not used directly by strategy
         params.pop('TP Method', None)
     
-    # Ensure critical integer parameters are properly set
-    # Bollinger Band Length
-    if 'Bollinger Band Length' in params:
-        params['Bollinger Band Length'] = max(1, int(round(params['Bollinger Band Length'])))
-    # ATR Lengths
-    if 'ATR Length for Trailing Stop' in params:
-        params['ATR Length for Trailing Stop'] = max(1, int(round(params['ATR Length for Trailing Stop'])))
-    if 'ATR Length for TP' in params:
-        params['ATR Length for TP'] = max(1, int(round(params['ATR Length for TP'])))
-    # Trailing Delay
+    # Ensure critical integer parameters
+    for pk in ['Bollinger Band Length', 'ATR Length for Trailing Stop', 'ATR Length for TP', 'Max Open Trades', 'RSI Period']:
+        if pk in params:
+            params[pk] = max(1 if pk != 'Trailing Delay (bars)' else 0, int(round(params[pk])))
+    
     if 'Trailing Delay (bars)' in params:
         params['Trailing Delay (bars)'] = max(0, int(round(params['Trailing Delay (bars)'])))
-    # Timeframe
-    params['Timeframe (minutes)'] = max(1, int(round(params.get('Timeframe (minutes)',
-                                                         param_dict['Timeframe (minutes)']['value']))))
-    # Max Open Trades
-    if 'Max Open Trades' in params:
-        params['Max Open Trades'] = max(1, int(round(params['Max Open Trades'])))
         
-    # [NEW] V5 Integer Parameters
-    if 'RSI Period' in params:
-        params['RSI Period'] = max(5, int(round(params['RSI Period'])))
-    if 'RSI Overbought' in params:
-        params['RSI Overbought'] = max(50, int(round(params['RSI Overbought'])))
-    if 'RSI Oversold' in params:
-        params['RSI Oversold'] = max(1, int(round(params['RSI Oversold'])))
-    
-    metrics = run_backtest(params, df, param_dict, suppress_output=True)
+    if 'Timeframe (minutes)' in params:
+        params['Timeframe (minutes)'] = max(1, int(round(params['Timeframe (minutes)'])))
+    elif 'Timeframe (minutes)' in param_dict_local:
+        params['Timeframe (minutes)'] = max(1, int(round(param_dict_local['Timeframe (minutes)']['value'])))
+
+    metrics = run_backtest(params, df_local, param_dict_local, suppress_output=True, mask=mask_local)
     
     # Get base metrics
-    sortino_raw = metrics['sortino']  # Keep raw value for checks
+    sortino_raw = metrics['sortino']
     sortino = metrics['sortino']
     max_dd = metrics['max_drawdown']
     pf = metrics['profit_factor']
     trades_df = metrics.get('trades_df', pd.DataFrame())
-    
-    # Calculate total PNL and win rate for constraints
     total_pnl = trades_df['pnl'].sum() if not trades_df.empty else 0
     win_rate = (trades_df['pnl'] > 0).sum() / len(trades_df) if not trades_df.empty else 0.0
+    avg_trades_day = metrics.get('avg_trades_day', 0.0)
     
-    # Check trade frequency constraints (use values from param_dict)
-    target_trades = param_dict.get('TARGET_TRADES_DAY', {'value': 2})['value']
-    min_trades = param_dict.get('MIN_TRADES_DAY', {'value': 1.0})['value']
-    avg_trades_day = metrics['avg_trades_day']
+    # GA Parameters from CSV
+    min_trades = param_dict_local.get('MIN_TRADES_DAY', {'value': 1.0})['value']
+    target_trades = param_dict_local.get('TARGET_TRADES_DAY', {'value': 2})['value']
+    trades_penalty_weight = param_dict_local.get('TRADES_PENALTY_WEIGHT', {'value': 0.5})['value']
+    min_win_rate = param_dict_local.get('MIN_WIN_RATE', {'value': 0.40})['value']
+    limit_max_loss = param_dict_local.get('LIMIT_MAX_LOSS', {'value': 50000.0})['value']
+    limit_min_sortino = param_dict_local.get('LIMIT_MIN_SORTINO', {'value': 1.0})['value']
     
-    # ====================================================================
-    # COMPLIANCE: Hard Constraints have been removed in favor of Graduated Penalties below
-    # to avoid evolutionary dead-ends for the Genetic Algorithm.
-    # ====================================================================
-    
-    # ====================================================================
-    # GRADUATED PENALTIES - Allow exploration while discouraging bad solutions
-    # CRITICAL FIX: Converted from hard constraints to graduated penalties
-    # Hard constraints were preventing exploration - 100% of solutions were eliminated
-    # Graduated penalties allow GA to explore unprofitable regions and evolve toward profitability
-    # ====================================================================
-    
-    # Penalty factor accumulates all penalties multiplicatively
-    constraint_penalty_factor = 1.0
-    
-    # CONSTRAINT 1: Minimum win rate (40%) - Graduated penalty
-    # Small violations get small penalty, large violations get large penalty
-    if not trades_df.empty and len(trades_df) >= 10:  # Need enough trades to evaluate
-        min_win_rate = param_dict.get('MIN_WIN_RATE', {'value': 0.40})['value']  # Configurable from CSV
-        if win_rate < min_win_rate:
-            # Graduated penalty: 0% violation = no penalty, 100% violation (0% win rate) = 90% penalty
-            violation_pct = (min_win_rate - win_rate) / min_win_rate  # 0 to 1 scale
-            # Penalty increases quadratically: small violations penalized lightly, large violations heavily
-            penalty = violation_pct ** 1.5  # Quadratic scaling
-            constraint_penalty_factor *= (1.0 - penalty * 0.9)  # Up to 90% reduction for severe violations
-    
-    # CONSTRAINT 2: Must be profitable (positive PNL) - Graduated penalty
-    # Allow exploration of unprofitable solutions but heavily penalize them
-    if total_pnl < 0:
-        # Graduated penalty based on loss magnitude
-        loss_magnitude = abs(total_pnl)
-        if loss_magnitude > 50000:  # Very large loss
-            penalty = 0.95  # 95% penalty
-        elif loss_magnitude > 10000:  # Large loss
-            penalty = 0.80 + (loss_magnitude - 10000) / 40000 * 0.15  # 80-95% penalty
-        elif loss_magnitude > 1000:  # Moderate loss
-            penalty = 0.50 + (loss_magnitude - 1000) / 9000 * 0.30  # 50-80% penalty
-        else:  # Small loss
-            penalty = 0.20 + (loss_magnitude / 1000) * 0.30  # 20-50% penalty
-        constraint_penalty_factor *= (1.0 - penalty)
-    
-    # CONSTRAINT 3: Negative Sortino - Graduated penalty
-    # Allow exploration but heavily penalize negative Sortino
-    if sortino_raw < 0:
-        # Graduated penalty: more negative = larger penalty
-        # Sortino of -1.0 gets 50% penalty, -5.0 gets 90% penalty
-        sortino_magnitude = abs(sortino_raw)
-        if sortino_magnitude > 5.0:
-            penalty = 0.95  # 95% penalty for very negative Sortino
-        elif sortino_magnitude > 2.0:
-            penalty = 0.80 + (sortino_magnitude - 2.0) / 3.0 * 0.15  # 80-95% penalty
-        elif sortino_magnitude > 1.0:
-            penalty = 0.50 + (sortino_magnitude - 1.0) / 1.0 * 0.30  # 50-80% penalty
-        else:
-            penalty = 0.30 + (sortino_magnitude / 1.0) * 0.20  # 30-50% penalty
-        constraint_penalty_factor *= (1.0 - penalty)
-        # Also cap Sortino at small positive value to prevent extreme negatives from dominating
-        sortino = max(0.01, sortino_raw * (1.0 - penalty * 0.5))  # Reduce but don't eliminate
-    
-    # Apply constraint penalties BEFORE other penalties
-    sortino *= constraint_penalty_factor
-    pf *= constraint_penalty_factor
-    
-    # ====================================================================
-    # SOFT PENALTIES - Apply to non-critical violations
-    # Applied BEFORE normalization and cap/floor
-    # ====================================================================
-    
-    # Penalty factor accumulates all penalties multiplicatively
-    penalty_factor = 1.0
-    
-    # 1. Trade frequency penalty (GRADUAL - allows exploration near threshold)
-    if avg_trades_day < min_trades:
-        # Penalty increases as we get further from minimum
-        penalty_factor_trades = 1.0 - (avg_trades_day / min_trades)  # 0 to 1 scale
-        # Aggressive penalty: reduce by up to 60% for very low trade frequency
-        penalty_factor *= (1.0 - penalty_factor_trades * 0.6)
-    # Additional penalty for very low trades (near zero)
-    if avg_trades_day < 0.5:
-        # Extra penalty for extremely low trade frequency
-        extra_penalty = (0.5 - avg_trades_day) / 0.5  # 0 to 1 scale
-        penalty_factor *= (1.0 - extra_penalty * 0.4)  # Additional 0-40% reduction
-    
-    # 1b. Penalty for EXCESS trades (above target) - discourage over-trading
-    # Target range: 2-5 trades/day (ideal: 3.5 trades/day)
-    if avg_trades_day > target_trades:
-        # Calculate excess above target
-        excess = avg_trades_day - target_trades
-        # Penalty increases with excess trades
-        # At 2x target (e.g., 7 trades/day when target is 3.5): 50% penalty
-        # At 3x target (e.g., 10.5 trades/day): 75% penalty
-        # At 4x target (e.g., 14 trades/day): 90% penalty
-        excess_ratio = excess / target_trades  # How many times over target
-        if excess_ratio >= 3.0:  # 4x target or more
-            penalty_factor *= 0.1  # 90% penalty (very severe)
-        elif excess_ratio >= 2.0:  # 3x target
-            penalty_factor *= 0.25  # 75% penalty
-        elif excess_ratio >= 1.0:  # 2x target
-            penalty_factor *= 0.5  # 50% penalty
-        else:  # Between target and 2x target
-            # Gradual penalty: 0% at target, 50% at 2x target
-            penalty_factor *= (1.0 - (excess_ratio - 1.0) * 0.5)
-    
-    # 2. Unrealistic high win rate (overfitting indicator)
-    if not trades_df.empty and win_rate > 0.95:
-        # Gradual penalty based on how unrealistic
-        excess_wr = (win_rate - 0.95) / 0.05  # 0 to 1 scale (95% to 100%)
-        penalty_factor *= (1.0 - excess_wr * 0.3)  # Reduce by up to 30%
-    
-
-    # ====================================================================
-    # GRADUATED PENALTY: Minimum trades per day
-    # OLD: Hard constraint (< 1.0 = -Infinity) -> CAUSED EVOLUTIONARY DEAD END
-    # NEW: Graduated penalty (0.9 is better than 0.0)
-    # ====================================================================
-    # Ensure min_trades is defined
-    min_trades = param_dict.get('MIN_TRADES_DAY', {'value': 1.0})['value']
-    
-    # Define penalty variable (default 0)
+    # 1. HARD PENALTY: Minimum trades per day
     low_trade_penalty = 0.0
     if avg_trades_day < min_trades:
         shortfall = min_trades - avg_trades_day
-        # Penalty scaling: 100.0 per trade deficit
-        # e.g. 0.99 deficit (1 trade total) -> Penalty 99.0
-        # This is enough to crush Sortino (range 0-1) into negative territory
         low_trade_penalty = shortfall * 100.0
         
-    # ====================================================================
-    # GRADUATED PENALTIES - Allow exploration while discouraging bad solutions
-
-    no_tp = (not params.get('Opposite Bollinger Band TP', False) and 
-             not params.get('Fixed ATR TP', False) and 
-             not params.get('Fixed BB at Entry TP', False))
-    if no_tp:
-        # Reduce fitness but don't eliminate
-        penalty_factor *= 0.3  # Reduce by 70%
+    # 2. GRADUATED PENALTIES
+    constraint_penalty_factor = 1.0
     
-    # 5. Max ATR Filter too high (allows high volatility - bad for mean reversion)
-    max_atr = params.get('Max ATR Filter (Points)', 10.0)
-    # Get ATR filter range from param_dict
-    atr_min = param_dict.get('Max ATR Filter (Points)', {}).get('min', 1.0)
-    atr_max = param_dict.get('Max ATR Filter (Points)', {}).get('max', 6.0)
-    if max_atr > atr_min + (atr_max - atr_min) * 0.7:  # Above 70% of range
-        # Penalty increases as Max ATR gets higher (allows more high volatility)
-        # At 70% of range: no penalty, at 100% of range: 50% penalty
-        high_vol_pct = (max_atr - (atr_min + (atr_max - atr_min) * 0.7)) / ((atr_max - atr_min) * 0.3)
-        high_vol_pct = min(1.0, max(0.0, high_vol_pct))  # Clamp 0-1
-        penalty_factor *= (1.0 - high_vol_pct * 0.5)  # Reduce by up to 50%
+    # Win Rate Constraint
+    if not trades_df.empty and len(trades_df) >= 10:
+        if win_rate < min_win_rate:
+            violation_pct = (min_win_rate - win_rate) / min_win_rate
+            penalty = violation_pct ** 1.5
+            constraint_penalty_factor *= (1.0 - penalty * 0.9)
     
-    # 6. Max ATR Filter too low (very restrictive - may reduce trade frequency too much)
-    if max_atr < atr_min + (atr_max - atr_min) * 0.2:  # Below 20% of range
-        # Gradual penalty based on how low
-        restrictive_pct = ((atr_min + (atr_max - atr_min) * 0.2) - max_atr) / ((atr_max - atr_min) * 0.2)
-        restrictive_pct = min(1.0, max(0.0, restrictive_pct))  # Clamp 0-1
-        penalty_factor *= (1.0 - restrictive_pct * 0.2)  # Reduce by up to 20% for very conservative ATR
+    # Profitability Constraint
+    if total_pnl < 0:
+        loss_magnitude = abs(total_pnl)
+        if loss_magnitude > limit_max_loss:
+            penalty = 0.95
+        elif loss_magnitude > 10000:
+            penalty = 0.80 + (loss_magnitude - 10000) / (limit_max_loss - 10000) * 0.15 if limit_max_loss > 10000 else 0.95
+        elif loss_magnitude > 1000:
+            penalty = 0.50 + (loss_magnitude - 1000) / 9000 * 0.30
+        else:
+            penalty = 0.20 + (loss_magnitude / 1000) * 0.30
+        constraint_penalty_factor *= (1.0 - penalty)
     
-    # Apply penalty factor to metrics
+    # Negative Sortino Constraint
+    if sortino_raw < 0:
+        sortino_magnitude = abs(sortino_raw)
+        if sortino_magnitude > 5.0:
+            penalty = 0.95
+        elif sortino_magnitude > 2.0:
+            penalty = 0.80 + (sortino_magnitude - 2.0) / 3.0 * 0.15
+        elif sortino_magnitude > limit_min_sortino:
+            penalty = 0.50 + (sortino_magnitude - limit_min_sortino) / (2.0 - limit_min_sortino) * 0.30 if limit_min_sortino < 2.0 else 0.80
+        else:
+            penalty = 0.30 + (sortino_magnitude / limit_min_sortino) * 0.20 if limit_min_sortino > 0 else 0.50
+        constraint_penalty_factor *= (1.0 - penalty)
+        sortino = max(0.01, sortino_raw * (1.0 - penalty * 0.5))
+    
+    sortino *= constraint_penalty_factor
+    pf *= constraint_penalty_factor
+    
+    # 3. SOFT PENALTIES
+    penalty_factor = 1.0
+    
+    # Trade frequency penalty
+    if avg_trades_day < min_trades:
+        penalty_factor_trades = 1.0 - (avg_trades_day / min_trades)
+        penalty_factor *= (1.0 - penalty_factor_trades * 0.6)
+    
+    # Excess trades penalty
+    if avg_trades_day > target_trades:
+        excess_ratio = (avg_trades_day - target_trades) / target_trades
+        if excess_ratio >= 3.0:
+            penalty_factor *= 0.1
+        elif excess_ratio >= 2.0:
+            penalty_factor *= 0.25
+        elif excess_ratio >= 1.0:
+            penalty_factor *= 0.5
+        else:
+            penalty_factor *= (1.0 - excess_ratio * trades_penalty_weight)
+            
+    # High Win Rate Penalty
+    max_win_rate_cap = param_dict_local.get('MAX_WIN_RATE_CAP', {'value': 0.95})['value']
+    if not trades_df.empty and win_rate > max_win_rate_cap:
+        excess_wr = (win_rate - max_win_rate_cap) / (1.0 - max_win_rate_cap) if max_win_rate_cap < 1.0 else 1.0
+        penalty_factor *= (1.0 - excess_wr * 0.3)
+    
+    # Min Trade Duration Penalty
+    min_trade_duration = param_dict_local.get('MIN_TRADE_DURATION', {'value': 2.0})['value']
+    if not trades_df.empty and 'entry_time' in trades_df.columns and 'exit_time' in trades_df.columns:
+        durations = (trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds() / 60
+        avg_duration = durations.mean()
+        if avg_duration < min_trade_duration:
+            penalty = (min_trade_duration - avg_duration) / min_trade_duration if min_trade_duration > 0 else 0
+            penalty_factor *= (1.0 - penalty * 0.2)
+            
+    # No TP Penalty
+    if not (params.get('Opposite Bollinger Band TP', False) or params.get('Fixed ATR TP', False) or params.get('Fixed BB at Entry TP', False)):
+        penalty_factor *= 0.3
+        
     sortino *= penalty_factor
     pf *= penalty_factor
     
-    # ====================================================================
-    # NORMALIZATION & FINAL CALCULATION
-    # Normalize objectives to 0-1 range before weighting.
-    # Prevents one objective from dominating.
-    # ====================================================================
+    # 4. NORMALIZATION
+    SORTINO_MAX = param_dict_local.get('NORM_SORTINO_MAX', {'value': 10.0})['value']
+    DD_MAX = param_dict_local.get('NORM_DD_MAX', {'value': 100000.0})['value']
+    PF_MAX = param_dict_local.get('NORM_PF_MAX', {'value': 5.0})['value']
+    TRADES_MAX = param_dict_local.get('NORM_TRADES_MAX', {'value': 3.0})['value']
+    PNL_MAX = param_dict_local.get('NORM_PNL_MAX', {'value': 200000.0})['value']
+    NORM_PPT_MAX = param_dict_local.get('NORM_PROFIT_TRADE_MAX', {'value': 250.0})['value']
     
-    # Normalization ranges - loaded from CSV for configurability
-    SORTINO_MAX = param_dict.get('NORM_SORTINO_MAX', {'value': 10.0})['value']
-    DD_MAX = param_dict.get('NORM_DD_MAX', {'value': 100000.0})['value']
-    PF_MAX = param_dict.get('NORM_PF_MAX', {'value': 5.0})['value']
-    TRADES_MAX = param_dict.get('NORM_TRADES_MAX', {'value': 3.0})['value']
-    PNL_MAX = param_dict.get('NORM_PNL_MAX', {'value': 200000.0})['value']
+    avg_profit_per_trade = total_pnl / len(trades_df) if not trades_df.empty else 0.0
     
-    # Normalize (No Floors)
-    normalized_sortino = sortino / SORTINO_MAX
-    normalized_dd = 1.0 - (max_dd / DD_MAX)
-    normalized_pf = pf / PF_MAX
-    normalized_trades = avg_trades_day  # Raw
-    normalized_pnl = total_pnl / PNL_MAX
+    normalized_sortino = min(sortino / SORTINO_MAX, 1.0)
+    normalized_dd = max_dd / DD_MAX
+    normalized_pf = min(pf / PF_MAX, 1.0)
+    normalized_trades = min(avg_trades_day / TRADES_MAX, 1.0)
+    normalized_pnl = min(total_pnl / PNL_MAX, 1.0)
+    normalized_ppt = min(avg_profit_per_trade / NORM_PPT_MAX, 1.0)
     
-    # Apply Penalties to ALL objectives to enforce constraints
-    # This implements "Constrained Dominance" via penalty functions
-    # A solution that fails constraints must be worse than any feasible solution
-    
-    # Apply specific Low Trade Penalty (Subtract from positive metrics, Add to negative/minimized ones)
-    normalized_trades -= low_trade_penalty
+    # Apply Low Trade Penalty (Subtractive)
     normalized_sortino -= low_trade_penalty
     normalized_pf -= low_trade_penalty
+    normalized_trades -= low_trade_penalty
     normalized_pnl -= low_trade_penalty
-    # Note: normalized_ppt penalty applied after its definition below (line ~830)
+    normalized_ppt -= low_trade_penalty
+    normalized_dd += low_trade_penalty # DD is minimized (so addition is penalty)
     
-    # For Drawdown (Minimized, where 1.0 is Best/NoDD and 0.0 is Worst/MaxDD)
-    # Wait, normalized_dd is 1.0 - (DD/Max). So 1.0 is Good.
-    # So we should SUBTRACT penalty from it too?
-    # Yes, make it lower (worse).
-    normalized_dd -= low_trade_penalty
-    
-    # Apply generic penalty factor logic (multiplicative)
+    # Apply Constraint Penalty (Subtractive)
+    if constraint_penalty_factor < 1.0:
+        penalty_hit = (1.0 - constraint_penalty_factor)
+        normalized_sortino -= penalty_hit
+        normalized_pf -= penalty_hit
+        normalized_trades -= penalty_hit
+        normalized_pnl -= penalty_hit
+        normalized_ppt -= penalty_hit
+        normalized_dd += penalty_hit
 
-    normalized_pnl *= penalty_factor
-    normalized_dd *= penalty_factor
-    normalized_sortino *= penalty_factor
-    normalized_pf *= penalty_factor
-    
-    # Cast
-    normalized_sortino = float(normalized_sortino)
-    normalized_dd = float(normalized_dd)
-    normalized_pf = float(normalized_pf)
-    normalized_trades = float(normalized_trades)
-    normalized_pnl = float(normalized_pnl)
+    return (float(normalized_sortino), float(normalized_dd), float(normalized_pf), 
+            float(normalized_trades), float(normalized_pnl), float(normalized_ppt))
 
-    
-    # CRITICAL FIX: Apply penalty to Trade Score too!
-    # (Applied above before normalization, or we apply here if normalization resets it?)
-    # Wait, we normalized 'avg_trades_day' into 'normalized_trades' on line 665
-    # Then we missed applying penalty_factor to it if lines 635-636 are BEFORE 665!
-    # Let's check block structure. 635 is BEFORE 665.
-    # So we must apply penalty AFTER normalization to be safe.
-    # CRITICAL FIX: Apply penalty to ALL metrics (Trades, PnL, DD) to ensure bad strategies are punished
-    # CRITICAL FIX: Apply penalty to ALL metrics (Trades, PnL, DD) to ensure bad strategies are punished
-    # Apply the specific Low Trade Penalty
-    normalized_trades = avg_trades_day - low_trade_penalty
-    
-    # Apply generic penalty factor
-    normalized_trades *= penalty_factor
-    normalized_pnl *= penalty_factor
-    normalized_dd *= penalty_factor
-    
-    normalized_trades = float(normalized_trades)
-    normalized_pnl = float(normalized_pnl)
-    normalized_dd = float(normalized_dd)
-    
-    # Calculate Avg Profit Per Trade (new metrics)
-    total_trades_count = len(metrics['trades_df']) if 'trades_df' in metrics else 0
-    avg_profit_per_trade = 0.0
-    if total_trades_count > 0:
-        avg_profit_per_trade = total_pnl / total_trades_count
-    
-    # Normalize Avg Profit Per Trade
-    # Range: 0 to NORM_PROFIT_TRADE_MAX (e.g. 200)
-    norm_profit_trade_max = param_dict.get('NORM_PROFIT_TRADE_MAX', {'value': 250.0})['value']
-    normalized_ppt = min(avg_profit_per_trade / norm_profit_trade_max, 1.0)
-    
-    # Apply penalty to this too (bad strategies shouldn't get credit for high ppt if they fail basic checks)
-    normalized_ppt *= penalty_factor
-    normalized_ppt -= low_trade_penalty  # Deferred from normalization block above
-    normalized_ppt = max(0.0001, normalized_ppt)
-    normalized_ppt = float(normalized_ppt)
-
-    # Return 6-objective fitness: (Sortino, DD, PF, Trades/Day, Total Profit, Avg Profit/Trade)
-    # DEAP will apply weights: (1.0, -1.0, 1.0, 1.0, 2.0, 2.0)
-    return (normalized_sortino, normalized_dd, normalized_pf, normalized_trades, normalized_pnl, normalized_ppt)
+def evaluate_multi_objective(ind_and_data):
+    global param_keys, param_dict
+    if len(ind_and_data) == 3:
+        ind, df, mask = ind_and_data
+    else:
+        ind, df = ind_and_data
+        mask = None
+    return core_evaluate(ind, df, param_dict, param_keys, mask)
 
 # Setup toolbox
 toolbox = base.Toolbox()
@@ -863,350 +797,33 @@ toolbox.register("select", tools.selNSGA2)
 # ----------------------------------------------------------------------
 # Global variables for worker processes (Shared memory optimization)
 _worker_df = None
+_worker_mask = None
 _worker_param_dict = None
 _worker_keys = None
 
-def init_worker(df_shared, param_dict_shared, keys_shared):
+def init_worker(df_shared, mask_shared, param_dict_shared, keys_shared):
     """
     Initialize worker process with shared data to avoid pickling overhead on every task.
     """
-    global _worker_df, _worker_param_dict, _worker_keys
+    global _worker_df, _worker_mask, _worker_param_dict, _worker_keys
     _worker_df = df_shared
+    _worker_mask = mask_shared
     _worker_param_dict = param_dict_shared
     _worker_keys = keys_shared
 
 # Module-level function for multiprocessing (must be at module level to be picklable)
 def _evaluate_worker(ind):
-    # Use shared memory globals if available (Initialized via init_worker), 
-    # otherwise fall back to old slow method (handling legacy logic if any, but we are rewriting caller too)
+    # Use shared memory globals initialized via init_worker
+    df_local = _worker_df
+    mask_local = _worker_mask
+    param_dict_local = _worker_param_dict
+    param_keys_local = _worker_keys
     
-    # NOTE: Calling function must now pass ONLY 'ind', not a tuple of args!
-    # If caller still passes tuple, we must handle it (Backwards compatibility check)
-    if isinstance(ind, tuple) and len(ind) == 4 and _worker_df is None:
-         # Legacy mode (Slow, causes WinError 1450 on large data)
-         ind, df_local, param_dict_local, param_keys_local = ind
-    else:
-         # Optimized mode
-         df_local = _worker_df
-         param_dict_local = _worker_param_dict
-         param_keys_local = _worker_keys
-    
-    args = (ind, df_local, param_dict_local, param_keys_local)
-
-    
-    # Use the passed parameters instead of globals
-    params = dict(zip(param_keys_local, ind))
-    
-    # Clamp & cast - ensure integer parameters are properly rounded
-    for n, v in params.items():
-        if n not in param_dict_local:
-            continue
-        mn, mx, typ = param_dict_local[n]['min'], param_dict_local[n]['max'], param_dict_local[n]['type']
-        v = max(mn, min(v, mx))
-        if typ == 'int':
-            # Round to nearest integer for all int parameters
-            params[n] = int(round(v))
-        else:
-            params[n] = float(v)
-    
-    # Convert boolean parameters (0/1 int) to actual booleans
-    # Check if parameter was originally bool type but optimized as 0/1 int
-    for n in list(params.keys()):
-        if n in param_dict_local:
-            original_type = param_dict_local[n].get('type', '')
-            # If original type was bool but we have an int value (0 or 1), convert it
-            if original_type == 'bool' and isinstance(params[n], (int, float)):
-                params[n] = bool(int(round(params[n])))
-    
-    # Handle TP method selection (mutually exclusive)
-    # If 'TP Method' parameter exists, convert to individual boolean flags
-    if 'TP Method' in params:
-        tp_method = int(round(params['TP Method']))
-        # 0 = Fixed BB at Entry TP, 1 = Fixed ATR TP, 2 = Opposite Bollinger Band TP
-        params['Fixed BB at Entry TP'] = (tp_method == 0)
-        params['Fixed ATR TP'] = (tp_method == 1)
-        params['Opposite Bollinger Band TP'] = (tp_method == 2)
-        # Remove the TP Method parameter as it's not used directly by strategy
-        params.pop('TP Method', None)
-    
-    # Ensure critical integer parameters are properly set
-    # Bollinger Band Length
-    if 'Bollinger Band Length' in params:
-        params['Bollinger Band Length'] = max(1, int(round(params['Bollinger Band Length'])))
-    # ATR Lengths
-    if 'ATR Length for Trailing Stop' in params:
-        params['ATR Length for Trailing Stop'] = max(1, int(round(params['ATR Length for Trailing Stop'])))
-    if 'ATR Length for TP' in params:
-        params['ATR Length for TP'] = max(1, int(round(params['ATR Length for TP'])))
-    # Trailing Delay
-    if 'Trailing Delay (bars)' in params:
-        params['Trailing Delay (bars)'] = max(0, int(round(params['Trailing Delay (bars)'])))
-    # Timeframe
-    params['Timeframe (minutes)'] = max(1, int(round(params.get('Timeframe (minutes)',
-                                                         param_dict_local['Timeframe (minutes)']['value']))))
-    # Max Open Trades
-    if 'Max Open Trades' in params:
-        params['Max Open Trades'] = max(1, int(round(params['Max Open Trades'])))
+    # Check for legacy mode (WinError 1450 handled via proper init_worker now)
+    if df_local is None:
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         
-    # [NEW] V5 Integer Parameters
-    if 'RSI Period' in params:
-        params['RSI Period'] = max(5, int(round(params['RSI Period'])))
-    if 'RSI Overbought' in params:
-        params['RSI Overbought'] = max(50, int(round(params['RSI Overbought'])))
-    if 'RSI Oversold' in params:
-        params['RSI Oversold'] = max(1, int(round(params['RSI Oversold'])))
-    
-    metrics = run_backtest(params, df_local, param_dict_local, suppress_output=True)
-    
-    # Get base metrics
-    sortino_raw = metrics['sortino']  # Keep raw value for checks
-    sortino = metrics['sortino']
-    max_dd = metrics['max_drawdown']
-    pf = metrics['profit_factor']
-    trades_df = metrics.get('trades_df', pd.DataFrame())
-    
-    # Calculate total PNL and win rate for constraints
-    total_pnl = trades_df['pnl'].sum() if not trades_df.empty else 0
-    win_rate = (trades_df['pnl'] > 0).sum() / len(trades_df) if not trades_df.empty else 0.0
-    
-    # Calculate avg_trades_day
-    avg_trades_day = metrics.get('avg_trades_day', 0.0)
-    
-    # ====================================================================
-    # GRADUATED PENALTY: Minimum trades per day
-    # OLD: Hard constraint (< 1.0 = -Infinity) -> CAUSED EVOLUTIONARY DEAD END
-    # NEW: Graduated penalty (0.9 is better than 0.0)
-    # ====================================================================
-    min_trades = param_dict_local.get('MIN_TRADES_DAY', {'value': 1.0})['value']
-    target_trades = param_dict_local.get('TARGET_TRADES_DAY', {'value': 2})['value']
-    
-    # We do NOT return immediately anymore. We calculate a penalty.
-    low_trade_penalty = 0.0
-    if avg_trades_day < min_trades:
-        # Distance from requirement (e.g. 1.0 - 0.2 = 0.8 shortfall)
-        shortfall = min_trades - avg_trades_day
-        # Penalty scaling: A severe penalty, but not infinite
-        # e.g. 0.8 shortfall * 100 = Score -80.0
-        # e.g. 0.1 shortfall * 100 = Score -10.0
-        low_trade_penalty = shortfall * 100.0
-
-    
-    # ====================================================================
-    # GRADUATED PENALTIES - Allow exploration while discouraging bad solutions
-    # CRITICAL FIX: Converted from hard constraints to graduated penalties
-    # Hard constraints were preventing exploration - 100% of solutions were eliminated
-    
-    constraint_penalty_factor = 1.0
-    
-    # CONSTRAINT 1: Minimum win rate - Graduated penalty
-    if not trades_df.empty and len(trades_df) >= 10:
-        min_win_rate = param_dict_local.get('MIN_WIN_RATE', {}).get('value', 0.40)  # Configurable from CSV
-        if win_rate < min_win_rate:
-            violation_pct = (min_win_rate - win_rate) / min_win_rate
-            penalty = violation_pct ** 1.5
-            constraint_penalty_factor *= (1.0 - penalty * 0.9)
-    
-    # CONSTRAINT 2: Must be profitable - Graduated penalty
-    if total_pnl < 0:
-        loss_magnitude = abs(total_pnl)
-        if loss_magnitude > 50000:
-            penalty = 0.95
-        elif loss_magnitude > 10000:
-            penalty = 0.80 + (loss_magnitude - 10000) / 40000 * 0.15
-        elif loss_magnitude > 1000:
-            penalty = 0.50 + (loss_magnitude - 1000) / 9000 * 0.30
-        else:
-            penalty = 0.20 + (loss_magnitude / 1000) * 0.30
-        constraint_penalty_factor *= (1.0 - penalty)
-    
-    # CONSTRAINT 3: Negative Sortino - Graduated penalty
-    if sortino_raw < 0:
-        sortino_magnitude = abs(sortino_raw)
-        if sortino_magnitude > 5.0:
-            penalty = 0.95
-        elif sortino_magnitude > 2.0:
-            penalty = 0.80 + (sortino_magnitude - 2.0) / 3.0 * 0.15
-        elif sortino_magnitude > 1.0:
-            penalty = 0.50 + (sortino_magnitude - 1.0) / 1.0 * 0.30
-        else:
-            penalty = 0.30 + (sortino_magnitude / 1.0) * 0.20
-        constraint_penalty_factor *= (1.0 - penalty)
-        sortino = max(0.01, sortino_raw * (1.0 - penalty * 0.5))
-    
-    # Apply constraint penalties BEFORE other penalties
-    sortino *= constraint_penalty_factor
-    pf *= constraint_penalty_factor
-    
-    # ====================================================================
-    # SOFT PENALTIES - Apply to non-critical violations
-    # ====================================================================
-    
-    penalty_factor = 1.0
-    
-    # 1. Trade frequency penalty
-    if avg_trades_day < min_trades:
-        penalty_factor_trades = 1.0 - (avg_trades_day / min_trades)
-        penalty_factor *= (1.0 - penalty_factor_trades * 0.6)
-    if avg_trades_day < 0.5:
-        extra_penalty = (0.5 - avg_trades_day) / 0.5
-        penalty_factor *= (1.0 - extra_penalty * 0.4)
-    
-    # 1b. Penalty for EXCESS trades (above target) - discourage over-trading
-    # Target range: 2-5 trades/day (ideal: 3.5 trades/day)
-    if avg_trades_day > target_trades:
-        # Calculate excess above target
-        excess = avg_trades_day - target_trades
-        # Penalty increases with excess trades
-        # At 2x target (e.g., 7 trades/day when target is 3.5): 50% penalty
-        # At 3x target (e.g., 10.5 trades/day): 75% penalty
-        # At 4x target (e.g., 14 trades/day): 90% penalty
-        excess_ratio = excess / target_trades  # How many times over target
-        if excess_ratio >= 3.0:  # 4x target or more
-            penalty_factor *= 0.1  # 90% penalty (very severe)
-        elif excess_ratio >= 2.0:  # 3x target
-            penalty_factor *= 0.25  # 75% penalty
-        elif excess_ratio >= 1.0:  # 2x target
-            penalty_factor *= 0.5  # 50% penalty
-        else:  # Between target and 2x target
-            # Gradual penalty: 0% at target, 50% at 2x target
-            penalty_factor *= (1.0 - (excess_ratio - 1.0) * 0.5)
-    
-    # 2. Unrealistic high win rate
-    if not trades_df.empty and win_rate > 0.95:
-        excess_wr = (win_rate - 0.95) / 0.05
-        penalty_factor *= (1.0 - excess_wr * 0.3)
-    
-    # 3. Very short average trade duration
-    if not trades_df.empty and 'entry_time' in trades_df.columns and 'exit_time' in trades_df.columns:
-        durations = (trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds() / 60
-        avg_duration = durations.mean() if len(durations) > 0 else 0
-        if avg_duration < 2.0:
-            penalty = (2.0 - avg_duration) / 2.0
-            penalty_factor *= (1.0 - penalty * 0.2)
-    
-    # 4. No TP enabled
-    no_tp = (not params.get('Opposite Bollinger Band TP', False) and 
-             not params.get('Fixed ATR TP', False) and 
-             not params.get('Fixed BB at Entry TP', False))
-    if no_tp:
-        penalty_factor *= 0.3
-    
-    # 5. Max ATR Filter too high (allows high volatility - bad for mean reversion)
-    max_atr = params.get('Max ATR Filter (Points)', 10.0)
-    # Get ATR filter range from param_dict
-    atr_min = param_dict_local.get('Max ATR Filter (Points)', {}).get('min', 1.0)
-    atr_max = param_dict_local.get('Max ATR Filter (Points)', {}).get('max', 6.0)
-    if max_atr > atr_min + (atr_max - atr_min) * 0.7:  # Above 70% of range
-        # Penalty increases as Max ATR gets higher (allows more high volatility)
-        # At 70% of range: no penalty, at 100% of range: 50% penalty
-        high_vol_pct = (max_atr - (atr_min + (atr_max - atr_min) * 0.7)) / ((atr_max - atr_min) * 0.3)
-        high_vol_pct = min(1.0, max(0.0, high_vol_pct))  # Clamp 0-1
-        penalty_factor *= (1.0 - high_vol_pct * 0.5)  # Reduce by up to 50%
-    
-    # 6. Max ATR Filter too low (very restrictive - may reduce trade frequency too much)
-    if max_atr < atr_min + (atr_max - atr_min) * 0.2:  # Below 20% of range
-        # Gradual penalty based on how low
-        restrictive_pct = ((atr_min + (atr_max - atr_min) * 0.2) - max_atr) / ((atr_max - atr_min) * 0.2)
-        restrictive_pct = min(1.0, max(0.0, restrictive_pct))  # Clamp 0-1
-        penalty_factor *= (1.0 - restrictive_pct * 0.2)  # Reduce by up to 20%
-    
-    # Apply penalty factor
-    sortino *= penalty_factor
-    pf *= penalty_factor
-    
-    # ====================================================================
-    # NORMALIZATION & FINAL CALCULATION
-    # ====================================================================
-    
-    # Load Constants
-    SORTINO_MAX = param_dict_local.get('NORM_SORTINO_MAX', {}).get('value', 10.0)
-    DD_MAX = param_dict_local.get('NORM_DD_MAX', {}).get('value', 100000.0)
-    PF_MAX = param_dict_local.get('NORM_PF_MAX', {}).get('value', 5.0)
-    TRADES_MAX = param_dict_local.get('NORM_TRADES_MAX', {}).get('value', 3.0)
-    PNL_MAX = param_dict_local.get('NORM_PNL_MAX', {}).get('value', 200000.0)
-    norm_profit_trade_max = param_dict_local.get('NORM_PROFIT_TRADE_MAX', {'value': 250.0})['value']
-    
-    # Calculate PPT
-    total_trades_count = len(metrics['trades_df']) if 'trades_df' in metrics else 0
-    avg_profit_per_trade = 0.0
-    if total_trades_count > 0:
-        avg_profit_per_trade = total_pnl / total_trades_count
-
-    
-
-    
-    # Calculate Avg Profit Per Trade (new metrics)
-    total_trades_count = len(metrics['trades_df']) if 'trades_df' in metrics else 0
-    avg_profit_per_trade = 0.0
-    if total_trades_count > 0:
-        avg_profit_per_trade = total_pnl / total_trades_count
-    
-    # Normalize Avg Profit Per Trade
-    # Range: 0 to NORM_PROFIT_TRADE_MAX (e.g. 200)
-    norm_profit_trade_max = param_dict_local.get('NORM_PROFIT_TRADE_MAX', {'value': 250.0})['value']
-    normalized_ppt = min(avg_profit_per_trade / norm_profit_trade_max, 1.0)
-    
-    # Apply penalty to this too (bad strategies shouldn't get credit for high ppt if they fail basic checks)
-    normalized_ppt *= penalty_factor
-    normalized_ppt = max(0.0001, normalized_ppt)
-    normalized_ppt = float(normalized_ppt)
-
-    # Normalize metrics (higher is better for all, except DD which is minimized by weight)
-    # CRITICAL CHANGE: Removed max(0.0001) floor. Allow negative values to preserve gradient.
-    
-    # 1. Sortino: Range [-Inf, CAP]. 
-    # If negative, it flows through directly.
-    normalized_sortino = min(sortino / SORTINO_MAX, 1.0) # Assuming 1.0 is the cap
-    
-    # 2. Drawdown: Range [0, Inf]. Minimization objective.
-    # We pass the raw normalized ratio. Weight is -1.0, so higher DD = lower fitness.
-    normalized_dd = max_dd / DD_MAX
-    
-    # 3. Profit Factor: Range [0, CAP]. 
-    normalized_pf = min(pf / PF_MAX, 1.0)
-    
-    # 4. Trades: Range [0, CAP]. 
-    normalized_trades = min(avg_trades_day / TRADES_MAX, 1.0)
-    
-    # 5. Total PnL: Range [-Inf, CAP]. 
-    normalized_pnl = min(total_pnl / PNL_MAX, 1.0)
-    
-    # 6. Avg PPT: Range [-Inf, CAP]. 
-    normalized_ppt = min(avg_profit_per_trade / norm_profit_trade_max, 1.0)
-    
-    # Final check: Apply penalty for constraints
-    # If penalty_factor < 1.0, we reduce the positive scores.
-    # For negative scores, multiplying by 0.5 makes them "less bad" (closer to 0), which is WRONG.
-    # We want Bad * Penalty = WORSE.
-    # So if Score > 0: Score * Penalty.
-    # If Score < 0: Score / Penalty (make it more negative)? Or Score - Penalty?
-    # Simple approach: Apply penalty as a scalar reduction to everything.
-    
-    # CRITICAL FIX: Apply specific Low Trade Penalty to ALL objectives
-    # This prevents "1-Trade Wonders" (High Sortino/PF, Low Trades) from surviving
-    normalized_trades -= low_trade_penalty
-    normalized_sortino -= low_trade_penalty
-    normalized_pf -= low_trade_penalty
-    normalized_pnl -= low_trade_penalty
-    normalized_ppt -= low_trade_penalty
-    
-    # For DD (minimized, 0.0 is Best), ADD penalty (make it worse/larger)
-    normalized_dd += low_trade_penalty
-
-    if constraint_penalty_factor < 1.0:
-        penalty_hit = (1.0 - constraint_penalty_factor) # e.g. 0.2
-        # Apply strict reduction
-        normalized_sortino -= penalty_hit
-        normalized_pf -= penalty_hit
-        normalized_trades -= penalty_hit
-        normalized_pnl -= penalty_hit
-        normalized_ppt -= penalty_hit
-        # For DD (minimized), ADD penalty
-        normalized_dd += penalty_hit
-
-
-    # Return 6-objective fitness
-    return (normalized_sortino, normalized_dd, normalized_pf, normalized_trades, normalized_pnl, normalized_ppt)
+    return core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local)
 
 def parallel_evaluate(individuals, df, param_dict_local, param_keys_local, pool=None):
     # Check if interrupt was requested
@@ -1678,7 +1295,9 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
         ga_params = ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
                      'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                      'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
-                     'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+                     'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE',
+                     'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
+                     'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO']
 
         # Determine optimized params set for quick lookup
         optimized_params = set(param_keys)
@@ -2262,6 +1881,9 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             'Take Profit Criteria': [],
             'Stop Loss Criteria': [],
             'GA Criteria': [],
+            'Fitness Weights': [],
+            'Hard Limits & Constraints': [],
+            'Normalization Ranges': [],
             'Other': []
         }
         
@@ -2279,7 +1901,9 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         'Daily Maintenance Start (HH:MM)', 'Daily Maintenance End (HH:MM)',
                         'Weekend Maintenance Start Day', 'Weekend Maintenance Start Time (HH:MM)',
                         'Weekend Maintenance End Day', 'Weekend Maintenance End Time (HH:MM)',
-                        'Maintenance Buffer Minutes']
+                        'Maintenance Buffer Minutes', 'Transaction Cost (Per Trade)',
+                        'Enable RSI Filter', 'RSI Period', 'RSI Overbought', 'RSI Oversold',
+                        'Enable VWAP Filter']
         
         tp_params = ['TP Method', 'Opposite Bollinger Band TP', 'Fixed ATR TP', 'Fixed BB at Entry TP',
                     'ATR Length for TP', 'ATR Multiplier for TP']
@@ -2291,7 +1915,15 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         ga_params = ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
                      'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                      'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
-                     'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+                     'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE']
+        
+        fitness_weights = ['WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT']
+        
+        limits_params = ['MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
+                         'MIN_WIN_RATE', 'SORTINO_CAP']
+                         
+        norm_params = ['NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 
+                       'NORM_PNL_MAX', 'NORM_PROFIT_TRADE_MAX']
         
         # Group ALL parameters from param_dict (not just optimizable ones)
         for pname in param_dict_local.keys():
@@ -2307,6 +1939,12 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                 groups['Stop Loss Criteria'].append(pname)
             elif pname in ga_params:
                 groups['GA Criteria'].append(pname)
+            elif pname in fitness_weights:
+                groups['Fitness Weights'].append(pname)
+            elif pname in limits_params:
+                groups['Hard Limits & Constraints'].append(pname)
+            elif pname in norm_params:
+                groups['Normalization Ranges'].append(pname)
             else:
                 # Default to Other if not found
                 groups['Other'].append(pname)
@@ -2319,7 +1957,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     ga_criteria_params = set(['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
                               'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                               'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
-                              'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT'])
+                              'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE',
+                              'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
+                              'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
+                              'NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 
+                              'NORM_PNL_MAX', 'NORM_PROFIT_TRADE_MAX', 'MIN_WIN_RATE', 'SORTINO_CAP'])
     
     # Determine which parameters are optimizable
     # Parameters in param_keys are optimizable (they were used to build PARAM_RANGES)
@@ -2656,12 +2298,12 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         }
         
         notes = [
-            '<strong>Constraint:</strong> No Floor (Negative Values Allowed). Goal: Maximize. Penalized if < 0.',
-            '<strong>Constraint:</strong> Minimize. Penalty: Geometric increase if DD > Limit.',
+            '<strong>Constraint:</strong> Maximize. Penalized if < LIMIT_MIN_SORTINO.',
+            '<strong>Constraint:</strong> Minimize. Penalty: Geometric increase if DD > LIMIT_MAX_LOSS.',
             '<strong>Constraint:</strong> Maximize. Penalty: Small linear penalty if < 1.0.',
-            '<strong>Hard Constraint:</strong> <code>-Infinity</code> if < 1 trade/day.<br><strong>Soft Constraint:</strong> Penalty if trades > Target.',
-            '<strong>Goal:</strong> Maximize Profit ($).<br>No Floor. Negative PnL allowed to preserve gradient.',
-            '<strong>Goal:</strong> High quality trades (> $250/trade).<br>Graduated Penalty if WinRate < 40%.'
+            '<strong>Graduated Soft Constraint:</strong> Substantial reduction if < MIN_TRADES_DAY. Soft Constraint: Penalty if trades > TARGET_TRADES_DAY.',
+            '<strong>Goal:</strong> Maximize Profit ($). No Floor.',
+            '<strong>Goal:</strong> Maximize Profit Per Trade. Penalized if WinRate < MAX_WIN_RATE_CAP or Duration < MIN_TRADE_DURATION.'
         ]
         
         for i, (name, weight, direction, note) in enumerate(zip(weight_names, weights, directions, notes)):
@@ -2970,24 +2612,11 @@ def verify_config_compatibility(saved_config, current_config):
 def main():
     global POP_SIZE, NUM_GEN, CX_PB, MUT_PB, MUT_MU, MUT_SIGMA
     
-    # CRITICAL: Ensure FitnessMulti class has correct weights (5) before starting
-    # This fixes issues where the class might have been created with old 4-weight definition
-    if hasattr(creator, 'FitnessMulti'):
-        if len(creator.FitnessMulti.weights) != 6:
-            print(f"WARNING: FitnessMulti has {len(creator.FitnessMulti.weights)} weights, expected 6. Recreating...")
-            del creator.FitnessMulti
-            if hasattr(creator, "Individual"):
-                del creator.Individual
-            creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0, 1.0, 1.0, 2.0, 2.0))
-            creator.create("Individual", list, fitness=creator.FitnessMulti)
-            print(f"FitnessMulti recreated with weights: {creator.FitnessMulti.weights}")
-    else:
-        # Create if it doesn't exist
-        creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0, 1.0, 1.0, 2.0, 2.0))
-        if not hasattr(creator, "Individual"):
-            creator.create("Individual", list, fitness=creator.FitnessMulti)
+    # Parameters will be loaded below, and FitnessMulti recreated if weights changed
     global TARGET_TRADES_DAY, TRADES_PENALTY_WEIGHT, DD_WEIGHT
     global DATA_SPLITS, DATA_SIZE, MIN_TRADES_DAY, MIN_TRADES_PEN_WEIGHT
+    global GA_START_DATE, GA_END_DATE, WEIGHT_SORTINO, WEIGHT_DRAWDOWN, WEIGHT_PF, WEIGHT_TRADES, WEIGHT_PNL, WEIGHT_PPT
+    global MIN_TRADE_DURATION, MAX_WIN_RATE_CAP, LIMIT_MAX_LOSS, LIMIT_MIN_SORTINO
     global PARAM_RANGES, param_keys, param_dict, param_df
     
     print("# Genetic Optimization for Bollinger Band Strategy - Version 3.0")
@@ -3025,7 +2654,13 @@ def main():
             'GA Criteria': ['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
                            'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                            'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
-                           'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT']
+                           'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT',
+                           'GA_START_DATE', 'GA_END_DATE'],
+            'Fitness Weights': ['WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT'],
+            'Hard Limits & Constraints': ['MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
+                                         'MIN_WIN_RATE', 'SORTINO_CAP'],
+            'Normalization Ranges': ['NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 
+                                    'NORM_PNL_MAX', 'NORM_PROFIT_TRADE_MAX']
         }
         
         # Filter out section headers
@@ -3049,29 +2684,76 @@ def main():
     group_and_print_params(param_df)
     print("\n========================================\n")
     
-    # Set GA configuration from parameters
-    POP_SIZE = param_dict.get('POP_SIZE', {'value': 20})['value']
+    # Set GA configuration from parameters with robust fallback
+    def get_config_val(name, default_val):
+        d = param_dict.get(name, {})
+        v = d.get('value')
+        if pd.isna(v) or v is None:
+            return default_val
+        return v
+
+    POP_SIZE = get_config_val('POP_SIZE', 20)
     if args.pop:
         POP_SIZE = args.pop
         print(f"Override: POP_SIZE set to {POP_SIZE}")
 
-    NUM_GEN = param_dict.get('NUM_GEN', {'value': 10})['value']
+    NUM_GEN = get_config_val('NUM_GEN', 10)
     if args.gen:
         NUM_GEN = args.gen
         print(f"Override: NUM_GEN set to {NUM_GEN}")
-    CX_PB = param_dict.get('CX_PB', {'value': 0.7})['value']
-    MUT_PB = param_dict.get('MUT_PB', {'value': 0.2})['value']
-    MUT_MU = param_dict.get('MUT_MU', {'value': 0.0})['value']
-    MUT_SIGMA = param_dict.get('MUT_SIGMA', {'value': 0.1})['value']
-    TARGET_TRADES_DAY = param_dict.get('TARGET_TRADES_DAY', {'value': 2})['value']
-    TRADES_PENALTY_WEIGHT = param_dict.get('TRADES_PENALTY_WEIGHT', {'value': 0.5})['value']
-    DD_WEIGHT = param_dict.get('DD_WEIGHT', {'value': 0.3})['value']
-    DATA_SPLITS = param_dict.get('DATA_SPLITS', {'value': 0.7})['value']
-    DATA_SIZE = param_dict.get('DATA_SIZE', {'value': 100000})['value']
-    USE_INTERLEAVED = param_dict.get('USE_INTERLEAVED_SPLIT', {'value': True})['value'] if 'USE_INTERLEAVED_SPLIT' in param_dict else True
-    NUM_PERIODS = param_dict.get('NUM_SPLIT_PERIODS', {'value': 5})['value'] if 'NUM_SPLIT_PERIODS' in param_dict else 5
-    MIN_TRADES_DAY = param_dict.get('MIN_TRADES_DAY', {'value': 1.0})['value']
-    MIN_TRADES_PEN_WEIGHT = param_dict.get('MIN_TRADES_PEN_WEIGHT', {'value': -100.0})['value']
+
+    CX_PB = get_config_val('CX_PB', 0.7)
+    MUT_PB = get_config_val('MUT_PB', 0.2)
+    MUT_MU = get_config_val('MUT_MU', 0.0)
+    MUT_SIGMA = get_config_val('MUT_SIGMA', 0.1)
+    TARGET_TRADES_DAY = get_config_val('TARGET_TRADES_DAY', 2)
+    TRADES_PENALTY_WEIGHT = get_config_val('TRADES_PENALTY_WEIGHT', 0.5)
+    DD_WEIGHT = get_config_val('DD_WEIGHT', 0.3)
+    DATA_SPLITS = get_config_val('DATA_SPLITS', 0.7)
+    DATA_SIZE = get_config_val('DATA_SIZE', 100000)
+    USE_INTERLEAVED = get_config_val('USE_INTERLEAVED_SPLIT', True)
+    NUM_PERIODS = get_config_val('NUM_SPLIT_PERIODS', 5)
+    MIN_TRADES_DAY = get_config_val('MIN_TRADES_DAY', 1.0)
+    MIN_TRADES_PEN_WEIGHT = get_config_val('MIN_TRADES_PEN_WEIGHT', -100.0)
+
+    
+    # Load new GA parameters with safety checks for missing/NaN values
+    def get_ga_val(name, default):
+        d = param_dict.get(name, {})
+        v = d.get('value')
+        if pd.isna(v) or v == '' or v is None:
+            return default
+        return v
+
+    GA_START_DATE = get_ga_val('GA_START_DATE', '2024-01-01')
+    GA_END_DATE = get_ga_val('GA_END_DATE', '2024-12-31')
+    WEIGHT_SORTINO = get_ga_val('WEIGHT_SORTINO', 1.0)
+    WEIGHT_DRAWDOWN = get_ga_val('WEIGHT_DRAWDOWN', -1.0)
+    WEIGHT_PF = get_ga_val('WEIGHT_PF', 1.0)
+    WEIGHT_TRADES = get_ga_val('WEIGHT_TRADES', 3.0)
+    WEIGHT_PNL = get_ga_val('WEIGHT_PNL', 2.0)
+    WEIGHT_PPT = get_ga_val('WEIGHT_PPT', 2.0)
+    MIN_TRADE_DURATION = get_ga_val('MIN_TRADE_DURATION', 2.0)
+    MAX_WIN_RATE_CAP = get_ga_val('MAX_WIN_RATE_CAP', 0.95)
+    LIMIT_MAX_LOSS = get_ga_val('LIMIT_MAX_LOSS', 50000.0)
+    LIMIT_MIN_SORTINO = get_ga_val('LIMIT_MIN_SORTINO', 1.0)
+
+    
+    # CRITICAL: Ensure FitnessMulti class has correct weights from CSV
+    target_weights = (WEIGHT_SORTINO, WEIGHT_DRAWDOWN, WEIGHT_PF, WEIGHT_TRADES, WEIGHT_PNL, WEIGHT_PPT)
+    if hasattr(creator, 'FitnessMulti'):
+        if creator.FitnessMulti.weights != target_weights:
+            print(f"NOTICE: FitnessMulti weights changed from {creator.FitnessMulti.weights} to {target_weights}. Recreating...")
+            del creator.FitnessMulti
+            if hasattr(creator, "Individual"):
+                del creator.Individual
+            creator.create("FitnessMulti", base.Fitness, weights=target_weights)
+            creator.create("Individual", list, fitness=creator.FitnessMulti)
+            print(f"FitnessMulti recreated with weights: {creator.FitnessMulti.weights}")
+    else:
+        creator.create("FitnessMulti", base.Fitness, weights=target_weights)
+        if not hasattr(creator, "Individual"):
+            creator.create("Individual", list, fitness=creator.FitnessMulti)
     
     # Set numeric ranges for the GA
     # Include int/float parameters, but exclude:
@@ -3081,6 +2763,9 @@ def main():
                               'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                               'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                               'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT',
+                              'GA_START_DATE', 'GA_END_DATE', 
+                              'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
+                              'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
                               'NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 
                               'NORM_PNL_MAX', 'NORM_PROFIT_TRADE_MAX', 'MIN_WIN_RATE', 'SORTINO_CAP'])
     
@@ -3133,11 +2818,27 @@ def main():
     }
     
     DATA_CSV = 'Bollinger/data/ES_full_1min_continuous_ratio_adjusted.csv'
-    df = pd.read_csv(DATA_CSV, header=None,
-                     names=['datetime', 'open', 'high', 'low', 'close', 'volume'],
-                     parse_dates=['datetime'], index_col='datetime')
+    # Use timezone-aware loading matching backtest.py fixes
+    df = pd.read_csv(DATA_CSV, header=None, names=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    if df['datetime'].dt.tz is None:
+        # Localize naive timestamps as UTC and convert to US/Eastern
+        df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern').dt.tz_localize(None)
+    else:
+        # Convert tz-aware timestamps to US/Eastern
+        df['datetime'] = df['datetime'].dt.tz_convert('US/Eastern').dt.tz_localize(None)
+    df.set_index('datetime', inplace=True)
+
+    
+    # Apply Date Range Slicing BEFORE anything else
+    print(f"\n=== Slicing Data Range: {GA_START_DATE} to {GA_END_DATE} ===")
+    original_size = len(df)
+    df = df.loc[GA_START_DATE:GA_END_DATE]
+    print(f"Data range sliced: {original_size} -> {len(df)} rows")
+    
     if DATA_SIZE > 0:
         df = df.tail(DATA_SIZE)
+        print(f"Applied DATA_SIZE tail: {len(df)} rows")
     
     # Check if we should use interleaved periods or simple split
     # USE_INTERLEAVED and NUM_PERIODS are already loaded above
@@ -3156,24 +2857,31 @@ def main():
         is_periods = []
         oos_periods = []
         
+        # Create Boolean Mask for In-Sample rows (same length as df)
+        is_mask = pd.Series(False, index=df.index)
+        
         for i in range(NUM_PERIODS):
             start_idx = i * period_size
             end_idx = (i + 1) * period_size if i < NUM_PERIODS - 1 else len(df)
-            period = df.iloc[start_idx:end_idx].copy()
             
             # Alternate: even indices (0, 2, 4...) are IS, odd (1, 3, 5...) are OOS
             if i % 2 == 0:
+                is_mask.iloc[start_idx:end_idx] = True
+                period = df.iloc[start_idx:end_idx]
                 is_periods.append(period)
                 print(f"  Period {i+1}: IS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
             else:
+                period = df.iloc[start_idx:end_idx]
                 oos_periods.append(period)
                 print(f"  Period {i+1}: OOS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
         
-        # Combine all IS periods and all OOS periods (will maintain chronological order)
-        in_sample = pd.concat(is_periods).sort_index() if is_periods else pd.DataFrame()
-        oos = pd.concat(oos_periods).sort_index() if oos_periods else pd.DataFrame()
+        # in_sample is now the FULL continuous dataframe for history preservation
+        # But evaluation will only happen on is_mask periods
+        in_sample = df.copy()
+        # Create virtual OOS for metrics/dashboard (still used for some logic)
+        oos = df[~is_mask]
         
-        print(f"\nCombined IS: {len(in_sample):,} rows ({len(in_sample)/len(df)*100:.1f}%)")
+        print(f"\nIS Mask coverage: {is_mask.sum():,} rows ({is_mask.sum()/len(df)*100:.1f}%)")
         if len(in_sample) > 0:
             print(f"  Date range: {in_sample.index[0]} to {in_sample.index[-1]}")
         else:
@@ -3189,9 +2897,14 @@ def main():
     else:
         # Simple chronological split (original approach)
         split = int(len(df) * DATA_SPLITS)
-        in_sample, oos = df.iloc[:split], df.iloc[split:]
+        # Create mask for simple split too for consistent evaluator logic
+        is_mask = pd.Series(False, index=df.index)
+        is_mask.iloc[:split] = True
+        
+        in_sample = df.copy() # Full DF but eval on mask
+        oos = df.iloc[split:]
         print(f"\n=== Using Simple Chronological Split ===")
-        print(f"IS: {len(in_sample)} rows ({len(in_sample)/len(df)*100:.1f}%)")
+        print(f"IS: {is_mask.sum()} rows ({is_mask.sum()/len(df)*100:.1f}%)")
         print(f"OOS: {len(oos)} rows ({len(oos)/len(df)*100:.1f}%)")
         print("=" * 50)
     
@@ -3415,7 +3128,7 @@ def main():
     # Initialize workers with global data (in_sample dataframe) so we don't pickle it every task
     persistent_pool = multiprocessing.Pool(processes=NUM_WORKERS, 
                                           initializer=init_worker, 
-                                          initargs=(in_sample, param_dict, param_keys))
+                                          initargs=(in_sample, is_mask, param_dict, param_keys))
     
     # Main evolution loop with NSGA-II
     # If in dashboard mode, skip loop by setting NUM_GEN = start_gen
@@ -3504,7 +3217,7 @@ def main():
                             if idx >= len(offspring): continue
                             sample_params = dict(zip(param_keys, offspring[idx]))
                             # Run a quick diagnostic
-                            sample_metrics = run_backtest(sample_params, in_sample, param_dict, suppress_output=True)
+                            sample_metrics = run_backtest(sample_params, in_sample, param_dict, suppress_output=True, mask=is_mask)
                             trades_df = sample_metrics.get('trades_df', pd.DataFrame())
                             total_trades = len(trades_df)
                             days = (trades_df['exit_time'].max() - trades_df['entry_time'].min()).days if not trades_df.empty and len(trades_df) > 1 else 0
@@ -3523,9 +3236,9 @@ def main():
                 # Fallback to sequential evaluation
                 print(f"  Falling back to sequential evaluation...")
                 fits = []
-                for i, (ind, df) in enumerate([(ind, in_sample) for ind in offspring]):
+                for i, (ind, df_eval, mask_eval) in enumerate([(ind, in_sample, is_mask) for ind in offspring]):
                     try:
-                        fit = toolbox.evaluate((ind, df))
+                        fit = toolbox.evaluate((ind, df_eval, mask_eval))
                         fits.append(fit)
                     except KeyboardInterrupt:
                         print("\n\nInterrupted during sequential evaluation. Saving checkpoint...")

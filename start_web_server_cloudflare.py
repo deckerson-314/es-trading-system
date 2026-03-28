@@ -54,11 +54,9 @@ def start_cloudflare_tunnel(port):
             print("  - Permanent subdomain option (with account)")
             print("="*60)
             
-            # Start cloudflared in background
+            # Start cloudflared in background (let output pass through to parent terminal)
             cloudflared_process = subprocess.Popen(
                 ['cloudflared', 'tunnel', '--url', f'http://127.0.0.1:{port}'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 text=True
             )
             
@@ -71,10 +69,10 @@ def start_cloudflare_tunnel(port):
                 time.sleep(1)
                 # The URL is typically printed to stderr
                 # For now, we'll just indicate it's running
-                print(f"\n✅ Cloudflare Tunnel active!")
-                print(f"🌐 Check the output above for your public URL")
-                print(f"   (Usually starts with: https://xxxx-xxxx.trycloudflare.com)")
-                print(f"📱 Access from anywhere using that URL")
+                print(f"\nCloudflare Tunnel active!")
+                print(f"Check the output above for your public URL")
+                print(f"(Usually starts with: https://xxxx-xxxx.trycloudflare.com)")
+                print(f"Access from anywhere using that URL")
                 print("="*60 + "\n")
                 return cloudflared_process, None
             except:
@@ -98,8 +96,8 @@ def main():
     
     # Check if index.html exists
     if not (WEB_DIR / 'index.html').exists():
-        print("⚠️  Warning: index.html not found in web/ directory")
-        print("   Creating a basic index.html...")
+        print("Warning: index.html not found in web/ directory")
+        print("Creating a basic index.html...")
         (WEB_DIR / 'index.html').write_text("""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -351,13 +349,13 @@ def main():
     # Start HTTP server
     with socketserver.TCPServer(("", PORT), CustomHTTPRequestHandler) as httpd:
         print("="*60)
-        print("🚀 Trading Strategy Web Server")
+        print("STARTING: Trading Strategy Web Server")
         print("="*60)
-        print(f"📁 Serving directory: {WEB_DIR.absolute()}")
-        print(f"🌐 Local URL: http://127.0.0.1:{PORT}")
-        print(f"🌐 Network URL: http://{get_local_ip()}:{PORT}")
+        print(f"Serving directory: {WEB_DIR.absolute()}")
+        print(f"Local URL: http://127.0.0.1:{PORT}")
+        print(f"Network URL: http://{get_local_ip()}:{PORT}")
         print("="*60)
-        print("\n💡 Remote Access Options:")
+        print("\nRemote Access Options:")
         print("   1. Cloudflare Tunnel (FREE, unlimited bandwidth)")
         print("   2. Port Forwarding (permanent, requires router access)")
         print("   3. VPN (most secure)")
@@ -379,10 +377,10 @@ def main():
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\n\n🛑 Shutting down server...")
+            print("\n\nShutting down server...")
             if cloudflared_process:
                 cloudflared_process.terminate()
-            print("✅ Server stopped")
+            print("Server stopped")
             sys.exit(0)
 
 def get_local_ip():

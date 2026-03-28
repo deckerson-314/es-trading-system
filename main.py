@@ -403,12 +403,32 @@ async def update_ui_periodically():
 
 
 def ensure_connected_and_subscribed():
-    """Re-subscribe to market data after reconnection."""
+    """Re-subscribe to market data after reconnection.
+    
+    CRITICAL: Must clear old event handlers before creating new subscription.
+    If cancelHistoricalData fails (common during reconnection), the old bars_obj
+    event handler survives and both old+new fire on each bar, causing double entries.
+    """
     global bars_obj, contract
     if not ib.isConnected():
         return
 
     try:
+        if bars_obj is not None:
+            # CRITICAL: Clear event handlers FIRST, before cancelling the subscription.
+            # This prevents the old handler from firing even if cancel fails.
+            try:
+                bars_obj.updateEvent.clear()
+                logging.info("Cleared old bar event handlers")
+            except Exception as e:
+                logging.warning(f"Failed to clear old event handlers: {e}")
+
+            try:
+                logging.info("Cancelling previous market data subscription...")
+                ib.cancelHistoricalData(bars_obj)
+            except Exception as e:
+                logging.warning(f"Failed to cancel old bars (handlers already cleared): {e}")
+
         bars_obj = request_historical_data_with_retry(ib, contract)
         bars_obj.updateEvent += lambda bars, hasNewBar: on_bar_update_handler(
             bars, hasNewBar, strategy=strategy, ib=ib, contract=contract,
@@ -511,8 +531,9 @@ async def main():
 
         # Startup protection checks
         logging.info("Running startup protection checks...")
-        close_orphaned_positions(ib, contract, positions, live_tracker)
+        # Protect FIRST so they are added to 'positions' tracking
         protect_existing_positions(ib, contract, positions, strategy, data_ref['data'], live_tracker)
+        close_orphaned_positions(ib, contract, positions, live_tracker)
         check_and_recreate_tp_orders(ib, contract, positions, strategy, data_ref['data'], live_tracker)
 
         # Generate initial dashboard

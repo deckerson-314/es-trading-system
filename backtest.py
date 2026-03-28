@@ -122,6 +122,17 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
                  df = pd.read_csv(data_path, header=None, parse_dates=True, index_col=0)
                  df.columns = ['open', 'high', 'low', 'close', 'volume']
             
+            # Ensure DatetimeIndex — handle both tz-aware and naive timestamps
+            df.index = pd.to_datetime(df.index)
+            if getattr(df.index, 'tz', None) is not None:
+                # Timestamps have timezone info (e.g., -04:00 offsets from live_data.csv)
+                df.index = df.index.tz_convert('US/Eastern').tz_localize(None)
+            else:
+                # Timestamps are already naive — assume they're Eastern.
+                # DO NOT force utc=True on naive timestamps, as this reinterprets them
+                # as UTC and shifts all data by 4-5 hours.
+                pass
+
             if start_date: df = df.loc[start_date:]
             if end_date: df = df.loc[:end_date]
             
@@ -138,7 +149,19 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
             log(f"ERROR initializing strategy: {e}", log_file)
             return result_package
 
-        # 3. Calculate Indicators & Filters
+        # 3. Timeframe Resampling
+        tf = getattr(strategy, 'timeframe', 1)
+        if tf > 1:
+            if not suppress_log: log(f"Resampling data to {tf} minute candles...", log_file)
+            df = df.resample(f'{tf}T').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+
+        # 4. Calculate Indicators & Filters
         if not suppress_log: log("Calculating indicators...", log_file)
         df = strategy.calculate_indicators(df)
         
@@ -160,7 +183,10 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
         open_positions = []
         rows = df.itertuples()
         
-        transaction_cost = params_dict.get('Transaction Cost (Per Trade)', {'value': 0.0})['value'] if isinstance(params_dict.get('Transaction Cost (Per Trade)'), dict) else 0.0
+        if isinstance(params_dict.get('Transaction Cost (Per Trade)'), dict):
+            transaction_cost = params_dict['Transaction Cost (Per Trade)']['value']
+        else:
+            transaction_cost = 15.0 # Standard default if missing from CSV
         
         # Optimized loop (similar to v5)
         # Note: Ideally this simulation logic should be in core/engine.py or strategy.backtest()
@@ -181,7 +207,7 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
                 should_exit, reason, price = strategy.check_exit(pos, row, df)
                 
                 if should_exit:
-                    exit_time = row.Index + pd.Timedelta(minutes=5) # Approx timeframe
+                    exit_time = row.Index + pd.Timedelta(seconds=59) # End of the 1m bar 
                     pnl_points = (price - pos['entry_price']) * pos['direction']
                     pnl_currency = pnl_points * 50 - transaction_cost # Hardcoded ES multiplier
                     

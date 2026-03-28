@@ -238,14 +238,14 @@ def generate_overlay_chart(trade_row, ohlc_df, output_dir):
         print(f"Error plotting overlay: {e}")
         return None
 
-def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", output_dir="web/comparison_charts"):
+def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", output_dir="web/comparison_charts", data_path=LIVE_DATA_PATH):
     """
     Reads comparison metrics and generates overlay charts for unmatched/matched trades.
     """
     if not os.path.exists(csv_path):
-        print(f"Metrics file not found: {csv_path}")
-        return
-
+         print(f"Metrics file not found: {csv_path}")
+         return
+         
     os.makedirs(output_dir, exist_ok=True)
     df = pd.read_csv(csv_path)
     
@@ -255,7 +255,7 @@ def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", out
     if 'BT Time' in df.columns: df['BT Time'] = pd.to_datetime(df['BT Time'])
     
     # Load OHLC
-    ohlc_df = load_ohlc_data(LIVE_DATA_PATH)
+    ohlc_df = load_ohlc_data(data_path)
     
     # Generate Aggregate Plots
     agg_fig = generate_aggregate_plots(df)
@@ -291,12 +291,12 @@ def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", out
         <h2>Global Metrics</h2>
         <iframe src="aggregate_metrics.html"></iframe>
         
-        <h2>Trade Detail Gallery (Last 50 Trades)</h2>
+        <h2>Trade Detail Gallery (Last 100 Trades)</h2>
         <div class="grid">
     """
     
     # Sort descending time
-    df_rev = df.sort_values('SortTime', ascending=False).head(50)
+    df_rev = df.sort_values('SortTime', ascending=False).head(100)
     
     for _, row in df_rev.iterrows():
         status = row['Status']

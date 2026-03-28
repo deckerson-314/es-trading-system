@@ -4,6 +4,7 @@ Ported from ib_deployment_v4.py lines 1575-3752
 """
 import logging
 import asyncio
+import pandas as pd
 from datetime import datetime
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 
@@ -16,7 +17,9 @@ def cancel_all_pending(ib, contract, live_tracker=None):
         es_positions = []
         if contract:
             try:
-                es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+                # Check for ANY ES position, not just the currently resolved one
+                # This ensures we don't 'Global Cancel' during roll weeks
+                es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES']
             except:
                 pass
 
@@ -96,15 +99,24 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None):
     if contract is None:
         return
 
-    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
+    # Filter for symbol ES to handle roll periods
+    es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES']
     for pos in es_positions:
         if pos.position == 0:
             continue
 
-        # Check if this position is tracked
+        # Check if this position is tracked (with correct direction and quantity)
         is_tracked = False
         for bracket in positions:
-            if bracket.get('direction') == (1 if pos.position > 0 else -1):
+            bracket_dir = bracket.get('direction')
+            # Check quantity via stopLoss or entry order
+            bracket_qty = 0
+            for k in ['stopLoss', 'entry', 'takeProfit']:
+                if bracket.get(k) and hasattr(bracket[k], 'totalQuantity'):
+                    bracket_qty = abs(bracket[k].totalQuantity)
+                    break
+            
+            if bracket_dir == (1 if pos.position > 0 else -1) and bracket_qty == abs(pos.position):
                 is_tracked = True
                 break
 
@@ -113,9 +125,10 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None):
             close_action = 'SELL' if pos.position > 0 else 'BUY'
             close_order = MarketOrder(action=close_action, totalQuantity=abs(pos.position), transmit=True)
             try:
-                ib.placeOrder(contract, close_order)
-                ib.sleep(2)
-                logging.info("Orphaned position closed")
+                # CRITICAL: Use the position's OWN contract (March/June/etc)
+                ib.placeOrder(pos.contract, close_order)
+                ib.sleep(1)
+                logging.info(f"Orphaned {pos.contract.localSymbol} position closed")
                 if live_tracker:
                     add_to_live_tracker(live_tracker, 'warning',
                         f"Closed orphaned position: {pos.position} contracts")
@@ -128,20 +141,28 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
     if contract is None or data is None or data.empty:
         return
 
-    es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
-    for pos in es_positions:
+    # Look for ALL ES positions to ensure legacy ones stay protected during roll
+    try:
+        es_pos_list = [p for p in ib.positions() if p.contract.symbol == 'ES']
+    except Exception as e:
+        logging.error(f"Error fetching positions in protect_existing: {e}")
+        return
+
+    for pos in es_pos_list:
         if pos.position == 0:
             continue
-
+            
         qty = abs(pos.position)
         direction = 1 if pos.position > 0 else -1
+        conId = pos.contract.conId
 
-        # Check if position has an active stop
+        # Check if position has an active stop at the exchange level
         has_stop = False
         for trade in ib.trades():
             order = trade.order
-            is_stop = getattr(order, 'auxPrice', 0) > 0 and getattr(order, 'lmtPrice', 0) == 0
-            if (trade.isActive() and is_stop and trade.contract.conId == contract.conId
+            is_stop = (isinstance(order, StopOrder) or 
+                      (getattr(order, 'auxPrice', 0) > 0 and getattr(order, 'lmtPrice', 0) == 0))
+            if (trade.isActive() and is_stop and trade.contract.conId == conId
                     and abs(order.totalQuantity) == qty):
                 order_dir = 1 if order.action == 'SELL' else -1
                 if order_dir == direction:
@@ -149,28 +170,50 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
                     break
 
         if not has_stop:
-            logging.warning(f"UNPROTECTED POSITION: {qty} contracts. Adding stop loss...")
-            current_price = data['close'].iloc[-1]
-            pos_dict = strategy.setup_position(current_price, direction, data.iloc[-1], data)
+            logging.warning(f"UNPROTECTED POSITION: {qty} {pos.contract.localSymbol} contracts. Adding stop loss...")
+            
+            # baseline for SL: Use position's avgCost if it's a legacy contract, 
+            # otherwise use current market price.
+            avg_cost = getattr(pos, 'avgCost', 0) / 50.0  # Convert to index points
+            if avg_cost <= 0:
+                avg_cost = data['close'].iloc[-1]
+            
+            # Strategy expects current_price to calculate distances
+            pos_dict = strategy.setup_position(avg_cost, direction, data.iloc[-1], data)
 
+            if pd.isna(pos_dict['stop']) or pos_dict['stop'] <= 0:
+                logging.error(f"Cannot recreate stop: Invalid stop price calculated.")
+                continue
+
+            oca_group = f"bracket_{pos.contract.conId}_{direction}"
             stop_order = StopOrder(
                 action='SELL' if direction == 1 else 'BUY',
                 totalQuantity=qty,
-                stopPrice=round(pos_dict['stop'] * 4) / 4,
+                stopPrice=round(float(pos_dict['stop']) * 4) / 4,
+                ocaGroup=oca_group, ocaType=1,
                 tif='GTC', transmit=True
             )
-            ib.placeOrder(contract, stop_order)
-            logging.info(f"Re-created protective stop at {stop_order.stopPrice}")
-
-            positions.append({
-                'entry': MarketOrder(action='BUY' if direction == 1 else 'SELL', totalQuantity=qty),
-                'stopLoss': stop_order, 'takeProfit': None,
-                'direction': direction, 'position_dict': pos_dict,
-                'entry_time': datetime.now(), 'entry_price': current_price
-            })
-            if live_tracker:
-                add_to_live_tracker(live_tracker, 'warning',
-                    f"Added protective stop at ${stop_order.stopPrice:.2f}")
+            
+            # Place on the SPECIFIC contract of the position (March or June)
+            try:
+                # Ensure exchange is set for validation
+                pos.contract.exchange = 'CME'
+                ib.placeOrder(pos.contract, stop_order)
+                logging.info(f"Re-protected {pos.contract.localSymbol} at SL: {stop_order.auxPrice}")
+                
+                # Update internal tracking
+                positions.append({
+                    'entry': MarketOrder(action='BUY' if direction == 1 else 'SELL', totalQuantity=qty),
+                    'stopLoss': stop_order, 'takeProfit': None,
+                    'direction': direction, 'position_dict': pos_dict,
+                    'entry_time': datetime.now(), 'entry_price': avg_cost,
+                    'contract': pos.contract # Store the specific contract
+                })
+                if live_tracker:
+                    add_to_live_tracker(live_tracker, 'warning',
+                        f"Added protective stop for {pos.contract.localSymbol} at ${stop_order.auxPrice:.2f}")
+            except Exception as e:
+                logging.error(f"Failed to place protective order for legacy contract: {e}")
 
 
 def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker=None):
@@ -209,19 +252,28 @@ def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_t
                 pos_dict = bracket.get('position_dict', {})
                 tp = pos_dict.get('tp')
 
-            if tp is None or tp == 0:
+            if tp is None or pd.isna(tp) or tp <= 0:
                 continue
 
             tp = round(float(tp) * 4) / 4
+            
+            # Final sanity check: TP must be on the correct side of current price
+            if (direction == 1 and tp <= current_price) or (direction == -1 and tp >= current_price):
+                logging.warning(f"Skipping TP recreation: price {tp} is already reached or on wrong side of {current_price}")
+                continue
             qty = 1
             stop_order = bracket.get('stopLoss')
             if stop_order and hasattr(stop_order, 'totalQuantity'):
                 qty = abs(stop_order.totalQuantity)
 
             tp_action = 'SELL' if direction == 1 else 'BUY'
+            
+            # Deterministic group naming to ensure linkage with existing SL
+            oca_group = bracket.get('ocaGroup', f"bracket_{contract.conId}_{direction}")
+            
             new_tp_order = LimitOrder(
                 action=tp_action, totalQuantity=qty, lmtPrice=tp,
-                tif='GTC', transmit=True
+                tif='GTC', ocaGroup=oca_group, ocaType=1, transmit=True
             )
 
             logging.info(f"Recreating TP order: {tp_action} {qty} @ {tp:.2f}")

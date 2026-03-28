@@ -156,10 +156,15 @@ def get_front_es_contract():
             if not cds:
                 raise ValueError("No ES contracts found")
             today = datetime.now().date()
-            future_cds = [cd for cd in cds if datetime.strptime(cd.contract.lastTradeDateOrContractMonth, '%Y%m%d').date() > today]
+            # Customary ES roll happens 8 days before expiration (3rd Friday)
+            roll_cutoff = today + timedelta(days=8)
+            future_cds = [cd for cd in cds if datetime.strptime(cd.contract.lastTradeDateOrContractMonth, '%Y%m%d').date() > roll_cutoff]
             if not future_cds:
-                raise ValueError("No future ES contract found")
-            front = min(future_cds, key=lambda cd: datetime.strptime(cd.contract.lastTradeDateOrContractMonth, '%Y%m%d'))
+                # Fallback to absolute front if no future contracts meetings criteria
+                front_contract_details = sorted(cds, key=lambda cd: datetime.strptime(cd.contract.lastTradeDateOrContractMonth, '%Y%m%d'))[0]
+                front = front_contract_details
+            else:
+                front = min(future_cds, key=lambda cd: datetime.strptime(cd.contract.lastTradeDateOrContractMonth, '%Y%m%d'))
             ib.qualifyContracts(front.contract)
             logging.info(f"Resolved front ES contract: {front.contract.conId} exp {front.contract.lastTradeDateOrContractMonth}")
             return front.contract
