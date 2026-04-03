@@ -213,8 +213,8 @@ class TrendStrategy(Strategy):
             neg_dm = np.where((down > up) & (down > 0), down, 0.0)
             
             tr_s = tr.rolling(self.adx_period).sum()
-            pos_dm_s = pd.Series(pos_dm).rolling(self.adx_period).sum()
-            neg_dm_s = pd.Series(neg_dm).rolling(self.adx_period).sum()
+            pos_dm_s = pd.Series(pos_dm, index=df.index).rolling(self.adx_period).sum()
+            neg_dm_s = pd.Series(neg_dm, index=df.index).rolling(self.adx_period).sum()
             
             # Avoid div by zero
             pos_di = 100 * (pos_dm_s / tr_s.replace(0, 1))
