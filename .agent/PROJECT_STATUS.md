@@ -1,5 +1,5 @@
-> **Last Updated:** 2026-04-03 17:50 ET
-> **Updated By:** Conversation (Functional Test Plan Expansion)
+> **Last Updated:** 2026-04-03 19:20 ET
+> **Updated By:** Conversation (Test Bench Implementation)
 
 ---
 
@@ -54,13 +54,13 @@ c:\Trading\
 - **Cloudflare Dashboard** — Tunnel restarted and stable at `https://directories-equal-ecology-gif.trycloudflare.com`.
 - **Order Modification Safety** — Trailing stops now correctly modify existing orders on the exchange while preserving OCA group linkage.
 - **Strategy Functional Test Plan** — Comprehensive blueprint completed (April 3).
+- **Functional Test Bench** — 26 pytest tests passing (`tests/test_trend_functional.py`). Covers crossover logic, kill switches, 6 filter gates, DoE grid, trailing stop ratchet/delay, ATR-TP precision, channel exit, and backtest parity.
 
 ### ⚠️ Known Issues / Recently Fixed (may need restart to take effect)
 1. **Fixed in this session (Apr 3):**
-   - Expanded `STRATEGY_FUNCTIONAL_TEST_PLAN.md` with:
-     - **Three Pillar Approach**: Truth Table (Synthetic), Action Log (Backtest), Shadow Auditor (Live).
-     - **Design of Experiments (DoE)**: Grid-based filter stress testing.
-     - **Exit & Management Verification**: Trailing stop "Ratchet" and "Delay" tests.
+   - **ADX Index Alignment Bug** — `pd.Series(pos_dm)` in `strategy.py:216-217` created a RangeIndex instead of DatetimeIndex. This caused pandas alignment to fill all ADX values with NaN, making the ADX filter **silently drop all rows**. The ADX filter never actually worked. Fixed by passing `index=df.index`. Production params had `Enable ADX Filter = 0`, so live/paper was unaffected.
+   - Implemented complete Functional Test Bench (26 tests).
+   - Expanded `STRATEGY_FUNCTIONAL_TEST_PLAN.md` with Three Pillars, DoE, and Exit Verification.
 
 2. **Trend strategy still needs:**
    - Its own `reporting.py` module (currently uses Bollinger's)
@@ -76,20 +76,18 @@ c:\Trading\
 ---
 
 ## Changes Made This Session
-### Phase 9: Functional Verification & Test Bench Architecture (Apr 3)
-- **Defined the Three Pillars**:
-    - **Truth Table**: Synthetic unit testing for mathematical gate precision.
-    - **Action Log**: Explanatory backtest output to record exactly why historical signals were rejected.
-    - **Shadow Auditor**: Real-time monitor to audit "Live vs Backtest" data interaction.
-- **Implementation of DoE logic**: Designed a stress-testing framework to systematically verify filter interactions (`AND` logic gates, `OFAT` isolation).
-- **Exit Logic Audit**: Expanded the plan to include functional verification for Trailing Stops (Ratchet/Delay), Take Profits, and Support-based exits.
-- **Environmental Parity**: Updated success criteria to require identical results between vectorized backtests and bar-by-bar live simulation.
+### Phase 9b: Functional Test Bench Implementation (Apr 3 — Evening)
+- **Created `tests/helpers/synthetic_data.py`**: Factory functions for artificial OHLCV (sine-wave warmup, breakout scenarios, trending paths).
+- **Created `tests/test_trend_functional.py`**: 26 pytest tests across 7 classes — full Pillar A (Truth Table) coverage.
+- **Fixed ADX Bug**: `pd.Series(pos_dm)` index alignment in `strategies/trend/strategy.py`.
+
+### Phase 9a: Functional Test Plan Architecture (Apr 3 — Earlier)
+- Defined Three Pillars (Truth Table, Action Log, Shadow Auditor).
+- Designed DoE stress-testing and Exit Logic verification.
+- Updated Environmental Parity success criteria.
 
 ### Phase 8: GA Synchronization & Robustness (Mar 28)
-- **Synchronized Trade Exit Logic**: Updated `optimize.py` simulation loop to use `+59s` (bar-end) logic, matching `backtest.py` and the live bot.
-- **Timezone-Aware Data Loading**: Implemented explicit localization (UTC -> US/Eastern) in the GA loading block to ensure RTH filters align with 9:30 AM - 4:00 PM market hours.
-- **Robust Parameter Loading**: Refactored GA configuration to handle missing/NaN fields in strategy and GA parameter CSVs safely.
-- **Fitness Multi Fix**: Resolved a crash where the Deap GA population would fail to initialize if fitness weights were missing or empty in the CSV.
+- Synchronized trade exit logic, timezone-aware data loading, robust parameter loading.
 
 ---
 
@@ -99,14 +97,19 @@ c:\Trading\
 2. **`_get_min_bars(strategy)`**: Dynamically determines min bars from strategy attributes
 3. **`_indicators_ready(data)`**: Checks for any non-OHLCV columns rather than hardcoded column names
 4. **The "Truth Table" Approach**: Testing the logic in isolation from market data to ensure 100% precision before running GA.
+5. **Sine-wave warmup bars**: Synthetic data uses bounded oscillation to give indicators real values without triggering spurious Donchian crossovers.
 
 ---
 
 ## Files Modified This Session
 ```
-STRATEGY_FUNCTIONAL_TEST_PLAN.md — UPDATED (Three Pillars, DoE, Exit Verification)
-.agent/PROJECT_STATUS.md          — UPDATED (Latest Apr 3 Status)
-.agent/HANDOFF.md                 — UPDATED (Latest Apr 3 Status)
+tests/helpers/__init__.py          — NEW (package init)
+tests/helpers/synthetic_data.py    — NEW (OHLCV generators for test bench)
+tests/test_trend_functional.py     — NEW (26 functional tests)
+strategies/trend/strategy.py       — FIXED (ADX index alignment bug)
+STRATEGY_FUNCTIONAL_TEST_PLAN.md   — UPDATED (Three Pillars, DoE, Exit Verification)
+.agent/PROJECT_STATUS.md           — UPDATED
+.agent/HANDOFF.md                  — UPDATED
 ```
 
 ---
@@ -115,12 +118,13 @@ STRATEGY_FUNCTIONAL_TEST_PLAN.md — UPDATED (Three Pillars, DoE, Exit Verificat
 
 ### Immediate Priority
 The Trend strategy paper trading is **currently running**.
-1. **Implement Pillar A (Truth Table)**: Create `tests/test_strategy_v5_functional.py` to generate artificial candles and verify the "Truth Table" for all entry filters.
-2. **Implement Pillar B (Action Log)**: Add a `verbose` flag to `TrendStrategy` to output "Reason for Rejection" during backtests.
-3. **Audit Trailing Stops**: Build a synthetic scenario to prove the "Ratchet" logic for the Trailing Stop works as expected during a pullback.
+1. ~~**Implement Pillar A (Truth Table)**~~ — ✅ Complete (26 tests in `tests/test_trend_functional.py`).
+2. **Implement Pillar B (Action Log)**: Add a `verbose` flag to `TrendStrategy.calculate_entry_signals()` to output "Reason for Rejection" during backtests.
+3. ~~**Audit Trailing Stops**~~ — ✅ Complete (Ratchet + Delay tests passing).
 
 ### Suggested Next Steps
-1. **Develop Rejection Gallery**: Create the `rejection_gallery.py` tool to visualize these "Near-Misses."
-2. **Validate Trend GA optimization** — `python optimize.py --strategy trend --cores 12` (Now using extended 2026 data).
-3. **Create Trend-specific reporting** — `strategies/trend/reporting.py` for Donchian-specific charts.
-4. **Consider adding a `min_bars_required` property** to the base Strategy class for cleaner architecture.
+1. **Develop Rejection Gallery**: Create `rejection_gallery.py` to visualize "Near-Miss" trades.
+2. **Re-evaluate ADX filter** — Now that the ADX bug is fixed, re-run GA optimization with `Enable ADX Filter = 1` to see if ADX adds value.
+3. **Validate Trend GA optimization** — `python optimize.py --strategy trend --cores 12`.
+4. **Create Trend-specific reporting** — `strategies/trend/reporting.py` for Donchian-specific charts.
+5. **Run functional tests** — `python -m pytest tests/test_trend_functional.py -v` (should take ~1s).

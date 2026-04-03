@@ -1,32 +1,31 @@
 # Handoff: ES Trading System - Phase 9 (Functional Verification)
 
-## Current Status (2026-04-03)
-We have shifted focus from statistical GA optimization to **Functional Verification**. A comprehensive **Strategy Functional Test Plan** has been developed to prove that the bot's logic is 100% precise across all environments.
+## Current Status (2026-04-03 19:20 ET)
+**Pillar A (Truth Table) is COMPLETE.** 26 functional tests pass in ~1 second. A critical ADX bug was found and fixed during implementation.
 
-### Core Architecture Update
-- **Strategic Blueprint**: `STRATEGY_FUNCTIONAL_TEST_PLAN.md` defines the test bench.
-- **The Three Pillars**:
-    1. **Truth Table**: Synthetic unit testing with artificial candles (Isolation).
-    2. **Action Log**: Explanatory backtest output (History).
-    3. **Shadow Auditor**: Live "Near-Miss" monitoring (Reality).
+### What Was Accomplished
+- **Test Bench Created**: `tests/test_trend_functional.py` — 26 tests across 7 classes covering all entry filters, exit mechanisms, DoE grid, and backtest parity.
+- **Synthetic Data Helpers**: `tests/helpers/synthetic_data.py` — Factory functions for artificial OHLCV data.
+- **ADX Bug Fixed**: `strategies/trend/strategy.py:216-217` — `pd.Series(pos_dm)` lacked `index=df.index`, causing index misalignment that silently made ADX filter drop ALL data rows. ADX filter never worked. Production had `Enable ADX Filter = 0`, so live/paper was unaffected.
+
+### Still Outstanding
+- **Pillar B (Action Log)**: Add `verbose` flag to `TrendStrategy.calculate_entry_signals()` for "Reason for Rejection" output.
+- **Pillar C (Shadow Auditor)**: Live "Near-Miss" monitoring (lower priority).
 
 ## Immediate Next Steps (For next agent)
-1.  **Implement 'Pillar A' (Truth Table)**:
-    -   Create `tests/test_strategy_v5_functional.py`.
-    -   Develop a helper to generate "Step Function" OHLCV data where an indicator (e.g., ADX) crosses a threshold while price stays at a breakout level.
-    -   Assert that `TrendStrategy` triggers/blocks trades at exactly the right bar.
-2.  **Implement 'Pillar B' (Action Log)**:
-    -   Add a `verbose=False` parameter to `TrendStrategy.calculate_entry_signals`.
-    -   When `True`, it should print/log the specific reason for every rejection (e.g., "ADX 19.5 < 20.0").
-3.  **Verify Trailing Stop Logic**:
-    -   Create a "Ratchet Test" scenario (Price: 100 -> 110 -> 105 -> 115).
-    -   Verify the stop loss never move downwards during the dip.
+1. **Implement Pillar B (Action Log)**: Add verbose rejection logging to `TrendStrategy`.
+2. **Re-evaluate ADX filter**: Now that the bug is fixed, test ADX in GA optimization.
+3. **Develop Rejection Gallery**: `rejection_gallery.py` to visualize near-miss trades.
+4. **Create Trend-specific reporting**: `strategies/trend/reporting.py`.
 
 ## Contextual Warnings
-- **Environmental Parity**: The logic MUST behave the same in vectorized backtests and bar-by-bar live updates. Use the "Shadow Auditor" to prove this if discrepancies arise.
-- **DoE (Design of Experiments)**: When testing filters, use a grid approach (OFAT) to isolate each filter and ensure no "logic leaks" (unintended ORs instead of ANDs).
+- **ADX filter is now functional** — any previous GA results with `Enable ADX Filter = 1` are invalid (ADX was broken). Re-run optimization.
+- **Environmental Parity**: Logic must behave the same in vectorized backtests and bar-by-bar live simulation.
+- **Test command**: `python -m pytest tests/test_trend_functional.py -v` (should pass 26/26 in ~1s).
 
 ## Key Files
 - `STRATEGY_FUNCTIONAL_TEST_PLAN.md`: The main blueprint.
-- `strategies/trend/strategy.py`: The "Brain" needing the audit flag.
+- `tests/test_trend_functional.py`: 26 functional tests (Pillar A).
+- `tests/helpers/synthetic_data.py`: OHLCV generators.
+- `strategies/trend/strategy.py`: TrendStrategy (ADX bug fixed).
 - `tests/test_strategy_v5.py`: Existing tests (mostly Bollinger).
