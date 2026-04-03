@@ -6,7 +6,9 @@ import logging
 import traceback
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime
+from core.charting import create_trade_chart
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 import pytz
 
@@ -16,9 +18,13 @@ from core.account import get_account_summary, format_duration, add_to_live_track
 def check_entries(strategy, ib, contract, data, positions, params_dict, 
                   live_tracker, dashboard_state, send_email_fn, idx, latest_row):
     """Check entry signals and place bracket orders if triggered."""
-    if len(positions) >= strategy.max_open_trades:
+    # --- Re-entrancy & Bar Debounce Guards ---
+    if getattr(check_entries, 'is_processing', False):
+        logging.debug("Entry check already in progress, skipping.")
         return
-    if len(data) < 2:
+    
+    if getattr(check_entries, 'last_idx', None) == idx:
+        logging.debug(f"Already processed bar {idx} for entries. Skipping.")
         return
 
     # Extra Safety: Check for active orders for this contract to prevent double entry
@@ -27,16 +33,13 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
         logging.info(f"Entry blocked: {len(active_orders)} active orders already exist for {contract.localSymbol}")
         return
 
-    # Defense-in-depth: Prevent duplicate entries from stacked event handlers.
-    # If two bar handlers fire on the same bar (due to reconnection handler stacking),
-    # block the second entry within 30 seconds of the first.
-    now = datetime.now()
-    if hasattr(check_entries, '_last_entry_time') and check_entries._last_entry_time is not None:
-        elapsed = (now - check_entries._last_entry_time).total_seconds()
-        if elapsed < 30:
-            logging.warning(f"Entry blocked: duplicate entry attempt {elapsed:.1f}s after last entry (handler stacking guard)")
-            return
+    # --- Position Count Check (THE STORM FIX) ---
+    max_trades = getattr(strategy, 'max_open_trades', 1)
+    if len(positions) >= max_trades:
+        logging.info(f"Entry blocked: Max trades ({len(positions)}/{max_trades}) already open")
+        return
 
+    # --- Signal Check ---
     # Check filters
     in_maint = latest_row.get('in_maintenance', False)
     if not (latest_row.get('in_rth', True) and latest_row.get('atr_filter', True) and
@@ -65,88 +68,107 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
     if not (enter_long or enter_short):
         return
 
-    direction = 1 if enter_long else -1
-    action = 'BUY' if direction == 1 else 'SELL'
-    qty = 1
-
-    # Setup position using strategy
-    entry_price = latest_row['close']
-    position_dict = strategy.setup_position(entry_price, direction, latest_row, data)
-    stop_price = position_dict['stop']
-    tp = position_dict.get('tp')
-
-    # Round to ES tick size (0.25) and validate
-    entry_price = round(float(entry_price) * 4) / 4
+    # Record this bar as processed once a signal is detected or we reach this point
+    check_entries.last_idx = idx
+    check_entries.is_processing = True
     
-    # SL Validation
-    if stop_price is None or pd.isna(stop_price) or stop_price <= 0:
-        logging.error(f"CRITICAL: Invalid Stop Price ({stop_price}). Cannot enter trade.")
-        add_to_live_tracker(live_tracker, 'error', "Entry blocked: Invalid SL price")
-        return
-    stop_price = round(float(stop_price) * 4) / 4
+    try:
+        direction = 1 if enter_long else -1
+        action = 'BUY' if direction == 1 else 'SELL'
+        qty = strategy.qty if hasattr(strategy, 'qty') else 1
 
-    # TP Validation
-    valid_tp = False
-    if tp is not None and not pd.isna(tp) and tp > 0:
-        tp = round(float(tp) * 4) / 4
-        # Additional safety: ensure TP is not on the wrong side of entry
-        if direction == 1 and tp > entry_price: valid_tp = True
-        elif direction == -1 and tp < entry_price: valid_tp = True
+        # Setup position using strategy
+        entry_price = latest_row['close']
+        position_dict = strategy.setup_position(entry_price, direction, latest_row, data)
+        stop_price = position_dict['stop']
+        tp = position_dict.get('tp')
+
+        # Round to ES tick size (0.25) and validate
+        entry_price = round(float(entry_price) * 4) / 4
         
-        if not valid_tp:
-            logging.warning(f"Invalid TP price {tp} relative to entry {entry_price}. TP disabled.")
+        # SL Validation
+        if stop_price is None or pd.isna(stop_price) or stop_price <= 0:
+            logging.error(f"CRITICAL: Invalid Stop Price ({stop_price}). Cannot enter trade.")
+            add_to_live_tracker(live_tracker, 'error', "Entry blocked: Invalid SL price")
+            return
+        stop_price = round(float(stop_price) * 4) / 4
+
+        # TP Validation
+        valid_tp = False
+        if tp is not None and not pd.isna(tp) and tp > 0:
+            tp = round(float(tp) * 4) / 4
+            if (direction == 1 and tp > entry_price) or (direction == -1 and tp < entry_price):
+                valid_tp = True
+            
+            if not valid_tp:
+                logging.warning(f"Invalid TP price {tp} relative to entry {entry_price}. TP disabled.")
+                tp = None
+        else:
             tp = None
-    else:
-        tp = None
 
-    # Create bracket order with parent-child relationships and OCA group
-    oca_group = f"bracket_{datetime.now().strftime('%M%S%f')}"
-    entry_order = MarketOrder(action=action, totalQuantity=qty, transmit=False)
-    check_entries._last_entry_time = datetime.now()  # Record entry time for dedup guard
-    trade = ib.placeOrder(contract, entry_order)
-    ib.sleep(1)
+        # Create bracket order
+        oca_group = f"bracket_{datetime.now().strftime('%M%S%f')}"
+        entry_order = MarketOrder(action=action, totalQuantity=qty, transmit=False)
+        
+        # Place entry order
+        trade = ib.placeOrder(contract, entry_order)
+        
+        # --- ATOMIC TRACKING ---
+        # Add to positions list IMMEDIATELY to prevent re-entrant checks from seeing empty list
+        entry_time = datetime.now()
+        bracket = {
+            'entry': entry_order, 'stopLoss': None, 'takeProfit': None,
+            'direction': direction, 'position_dict': position_dict,
+            'entry_time': entry_time, 'entry_price': entry_price,
+            'ocaGroup': oca_group # Store for protection logic
+        }
+        positions.append(bracket)
 
-    entry_order_id = entry_order.orderId
-    if entry_order_id == 0 and trade and trade.order:
-        entry_order_id = trade.order.orderId
-    if entry_order_id == 0:
-        logging.error("Failed to get entry orderId, cannot create bracket")
-        return
+        # Wait brief moment for IB to assign OrderId/PermID
+        ib.sleep(1)
 
-    # Stop loss (GTC for ES futures after-hours execution)
-    stop_action = 'SELL' if direction == 1 else 'BUY'
-    stop_order = StopOrder(
-        action=stop_action, totalQuantity=qty, stopPrice=stop_price,
-        parentId=entry_order_id, tif='GTC',
-        ocaGroup=oca_group if tp is not None else None,
-        ocaType=1 if tp is not None else None,
-        transmit=False if tp is not None else True
-    )
+        entry_order_id = entry_order.orderId
+        if entry_order_id == 0 and trade and trade.order:
+            entry_order_id = trade.order.orderId
+        if entry_order_id == 0:
+            logging.error("Failed to get entry orderId, cannot link bracket orders accurately")
 
-    # Take profit
-    tp_order = None
-    if tp is not None:
-        tp_action = 'SELL' if direction == 1 else 'BUY'
-        tp_order = LimitOrder(
-            action=tp_action, totalQuantity=qty, lmtPrice=tp,
+        # Stop loss
+        stop_action = 'SELL' if direction == 1 else 'BUY'
+        stop_order = StopOrder(
+            action=stop_action, totalQuantity=qty, stopPrice=stop_price,
             parentId=entry_order_id, tif='GTC',
-            ocaGroup=oca_group, ocaType=1,
-            transmit=True
+            ocaGroup=oca_group if tp is not None else None,
+            ocaType=1 if tp is not None else None,
+            transmit=False if tp is not None else True
         )
-        ib.placeOrder(contract, stop_order)
-        ib.placeOrder(contract, tp_order)
-    else:
-        ib.placeOrder(contract, stop_order)
+        bracket['stopLoss'] = stop_order
+
+        # Take profit
+        tp_order = None
+        if tp is not None:
+            tp_action = 'SELL' if direction == 1 else 'BUY'
+            tp_order = LimitOrder(
+                action=tp_action, totalQuantity=qty, lmtPrice=tp,
+                parentId=entry_order_id, tif='GTC',
+                ocaGroup=oca_group, ocaType=1,
+                transmit=True
+            )
+            bracket['takeProfit'] = tp_order
+            ib.placeOrder(contract, stop_order)
+            ib.placeOrder(contract, tp_order)
+        else:
+            ib.placeOrder(contract, stop_order)
+
+    except Exception as e:
+        logging.error(f"Failed to place orders: {e}")
+        logging.error(traceback.format_exc())
+        if 'bracket' in locals() and bracket in positions:
+            positions.remove(bracket)
+    finally:
+        check_entries.is_processing = False
 
     ib.sleep(0.5)
-
-    entry_time = datetime.now()
-    bracket = {
-        'entry': entry_order, 'stopLoss': stop_order, 'takeProfit': tp_order,
-        'direction': direction, 'position_dict': position_dict,
-        'entry_time': entry_time, 'entry_price': entry_price
-    }
-    positions.append(bracket)
 
     # Entry email with risk/reward
     account = get_account_summary(ib, data, contract)
@@ -168,7 +190,9 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
         f"Cash=${account.get('TotalCashValue', 'N/A')}",
         f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
     ]
-    send_email_fn("BB Strategy - Trade OPEN", "\n".join(msg_lines))
+    dir_str = 'L' if direction == 1 else 'S'
+    subj = f"[BB] O: {dir_str} {qty}@{entry_price:.2f}"
+    send_email_fn(subj, "\n".join(msg_lines))
     tp_str = f"${tp:.2f}" if tp else "None"
     logging.info(f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} @ {entry_price:.2f}, "
                  f"SL: {stop_price:.2f}, TP: {tp_str}")
@@ -190,20 +214,19 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
     for bracket in positions[:]:
         try:
             entry_order = bracket['entry']
-            entry_trade = None
-            for trade in ib.trades():
-                if trade.order.permId == entry_order.permId:
-                    entry_trade = trade
-                    break
-            if not entry_trade or entry_trade.isActive():
-                continue
+            entry_trade = next((t for t in ib.trades() if t.order.permId == entry_order.permId), None)
+            
+            # If entry trade is not filled yet, cancel it
+            if entry_trade and entry_trade.isActive():
+                ib.cancelOrder(entry_trade.order)
+                logging.info(f"Cancelled active entry order during {reason_label} exit")
 
             # Use bracket's contract if available, fallback to global
             bracket_contract = bracket.get('contract', contract)
             es_positions = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
             
             if not es_positions or es_positions[0].position == 0:
-                positions.remove(bracket)
+                if bracket in positions: positions.remove(bracket)
                 continue
 
             actual_pos = es_positions[0].position
@@ -216,24 +239,35 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
                     try: ib.cancelOrder(order)
                     except: pass
 
+            if bracket in positions: positions.remove(bracket)
+
             close_order = MarketOrder(action=close_action, totalQuantity=actual_qty, transmit=True)
             close_trade = ib.placeOrder(bracket_contract, close_order)
-            ib.sleep(2)
+            ib.sleep(1)
 
-            if close_trade.orderStatus and close_trade.orderStatus.filled > 0:
-                exit_price = close_trade.orderStatus.avgFillPrice
-                direction = bracket.get('direction', 0)
-                entry_price = bracket.get('entry_price', 0)
-                pnl = (exit_price - entry_price) * direction * 50
-
-                logging.info(f"Position closed ({reason_label}): Exit @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
-                add_to_live_tracker(live_tracker, 'trade',
-                    f"{reason_label} EXIT: @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
-
-            positions.remove(bracket)
+            logging.info(f"Tracked position closed ({reason_label}): {close_action} {actual_qty} {bracket_contract.localSymbol}")
+            if live_tracker:
+                add_to_live_tracker(live_tracker, 'trade', f"{reason_label} EXIT: {bracket_contract.localSymbol}")
         except Exception as e:
-            logging.error(f"Error closing position ({reason_label}): {e}")
-            logging.error(traceback.format_exc())
+            logging.error(f"Error closing tracked position ({reason_label}): {e}")
+
+    # --- NEW: Close any UNTRACKED ES positions (Safety Catch) ---
+    try:
+        all_es_pos = [p for p in ib.positions() if p.contract.symbol == 'ES' and p.position != 0]
+        for pos in all_es_pos:
+            # We already tried to close tracked ones. If any ES position remains, it's either
+            # one we just placed an order for (wait for fill) or a truly untracked one.
+            # To be safe, we check if there are active orders for this contract.
+            active_for_this = [t for t in ib.trades() if t.contract.conId == pos.contract.conId and t.isActive()]
+            if not active_for_this:
+                logging.warning(f"UNTRACKED ES POSITION FOUND during {reason_label} exit: {pos.position} {pos.contract.localSymbol}. Closing...")
+                close_action = 'SELL' if pos.position > 0 else 'BUY'
+                close_order = MarketOrder(action=close_action, totalQuantity=abs(pos.position), transmit=True)
+                ib.placeOrder(pos.contract, close_order)
+                if live_tracker:
+                    add_to_live_tracker(live_tracker, 'warning', f"Closed untracked {pos.contract.localSymbol} ({reason_label})")
+    except Exception as e:
+        logging.error(f"Error closing untracked positions during {reason_label}: {e}")
 
     # Send notification email
     try:
@@ -320,12 +354,27 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
         # --- Check if position closed (TP or Stop filled) ---
         # Look specifically for the contract associated with this bracket
         pos_for_bracket = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
-        position_still_open = any(p.position != 0 for p in pos_for_bracket)
+        current_pos = sum(p.position for p in pos_for_bracket)
+        
+        # Determine if we've successfully seen this position in the portfolio yet
+        if not bracket.get('position_verified'):
+            if current_pos != 0:
+                bracket['position_verified'] = True
+            else:
+                # Fast exit edge case: if TP/Stop hit perfectly before broker positions sync
+                stop_filled = stop_trade and getattr(stop_trade, 'orderStatus', None) and stop_trade.orderStatus.status == 'Filled'
+                tp_filled = tp_trade and getattr(tp_trade, 'orderStatus', None) and tp_trade.orderStatus.status == 'Filled'
+                if not (stop_filled or tp_filled):
+                    continue  # Wait for ib.positions() to sync
+        
+        position_still_open = (current_pos != 0)
         
         if not position_still_open:
             _record_trade_close(ib, bracket_contract, bracket, entry_trade, stop_order, tp_order,
                                stop_trade, tp_trade, dir_, latest_row, positions,
                                completed_trades, live_tracker, send_email_fn, data)
+            if bracket in positions:
+                positions.remove(bracket)
             continue
 
         current_price = latest_row['close']
@@ -341,7 +390,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 logging.warning(f"CRITICAL: Stop {stop_price:.2f} breached, order PreSubmitted. Manual close.")
                 _force_close_position(ib, bracket_contract, bracket, positions, completed_trades,
                                       live_tracker, send_email_fn, entry_trade, current_price,
-                                      "Manual Close (PreSubmitted Stop)")
+                                      "Manual Close (PreSubmitted Stop)", data=data)
                 continue
 
         # --- Strategy-Specific Signal Exit (The "Soft Exit") ---
@@ -352,7 +401,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                     logging.info(f"STRATEGY SIGNAL EXIT: {exit_reason} triggered @ {latest_row['close']:.2f}")
                     _force_close_position(ib, bracket_contract, bracket, positions, completed_trades,
                                           live_tracker, send_email_fn, entry_trade, latest_row['close'],
-                                          f"Strategy Exit ({exit_reason})")
+                                          f"Strategy Exit ({exit_reason})", data=data)
                     continue
             except Exception as e:
                 logging.error(f"Error checking strategy signal exit: {e}")
@@ -397,7 +446,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
 
 
 def _force_close_position(ib, contract, bracket, positions, completed_trades,
-                          live_tracker, send_email_fn, entry_trade, current_price, reason):
+                          live_tracker, send_email_fn, entry_trade, current_price, reason, data=None):
     """Force close a position with market order (PreSubmitted stop handler)."""
     try:
         # Cancel existing orders
@@ -410,12 +459,19 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
         bracket_contract = bracket.get('contract', contract)
         es_pos = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
         if not es_pos or es_pos[0].position == 0:
-            positions.remove(bracket)
+            if bracket in positions:
+                positions.remove(bracket)
             return
 
         actual_pos = es_pos[0].position
+        dir_ = 1 if actual_pos > 0 else -1
         close_action = 'SELL' if actual_pos > 0 else 'BUY'
         close_order = MarketOrder(action=close_action, totalQuantity=abs(actual_pos), transmit=True)
+        
+        # Remove bracket proactively before sleep yields to event loop to avoid re-entrancy duplications
+        if bracket in positions:
+            positions.remove(bracket)
+            
         close_trade = ib.placeOrder(bracket_contract, close_order)
         ib.sleep(3)
 
@@ -423,9 +479,9 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
         es_after = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
         if not es_after or es_after[0].position == 0:
             entry_price = bracket.get('entry_price', 0)
-            direction = 1 if actual_pos > 0 else -1
             exit_price = close_trade.fills[0].execution.price if close_trade.fills else current_price
-            pnl = (exit_price - entry_price) * direction * 50 if entry_price else 0
+            qty = abs(actual_pos)
+            pnl = (exit_price - entry_price) * dir_ * 50 * qty if entry_price else 0
 
             # Check commission report for accurate PnL
             if close_trade.fills:
@@ -434,14 +490,32 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                         pnl = f.commissionReport.realizedPNL
                         break
 
-            msg = (f"TRADE CLOSE - {reason}\n{'='*50}\n"
-                   f"Entry: ${entry_price:.2f}\nExit: ${exit_price:.2f}\nPNL: ${pnl:,.2f}")
-            send_email_fn("BB Strategy - Trade CLOSE", msg)
-            add_to_live_tracker(live_tracker, 'trade',
-                f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
-            positions.remove(bracket)
+            # Metadata for reporting
+            exit_time = datetime.now()
+            entry_time = bracket.get('entry_time')
+            duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
+            
+            # Use unified reporting helper
+            _send_trade_close_notification(
+                ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
+                duration_str, exit_time, data, send_email_fn, live_tracker
+            )
+            
+            # Record in completed trades for dashboard
+            completed_trades.append({
+                'exit_time': exit_time, 'entry_time': entry_time,
+                'direction': 'LONG' if dir_ == 1 else 'SHORT',
+                'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
+                'pnl': pnl, 'reason': reason, 'duration': duration_str
+            })
+            if len(completed_trades) > 50:
+                del completed_trades[:-50]
+        else:
+            logging.error(f"Force close failed: Position still exists for {bracket_contract.localSymbol}")
+
     except Exception as e:
         logging.error(f"CRITICAL: Failed to force close: {e}")
+        import traceback
         logging.error(traceback.format_exc())
 
 
@@ -485,28 +559,152 @@ def _update_opposite_bb_tp(ib, contract, data, bracket, tp_order, dir_, live_tra
             logging.error(f"Failed to modify TP order: {e}")
 
 
+def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
+                                   duration_str, exit_time, data, send_email_fn, live_tracker):
+    """Unified helper for detailed trade closure reporting with analytics and charting."""
+    entry_time = bracket.get('entry_time')
+    stop_order = bracket.get('stopLoss')
+    tp_order = bracket.get('takeProfit')
+    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+    tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+
+    # MFE / MAE Calculation
+    mfe_pts = 0
+    mae_pts = 0
+    if entry_time and data is not None and not data.empty:
+        try:
+            # Standardize index to compare with naive times if needed
+            idx = data.index
+            localized_entry = entry_time
+            localized_exit = exit_time
+            if idx.tz is not None:
+                if localized_entry.tzinfo is None: localized_entry = pd.Timestamp(localized_entry).tz_localize(idx.tz)
+                if localized_exit.tzinfo is None: localized_exit = pd.Timestamp(localized_exit).tz_localize(idx.tz)
+            else:
+                if localized_entry.tzinfo is not None: localized_entry = localized_entry.replace(tzinfo=None)
+                if localized_exit.tzinfo is not None: localized_exit = localized_exit.replace(tzinfo=None)
+
+            # Slice data during trade duration
+            trade_mask = (idx >= localized_entry) & (idx <= localized_exit)
+            tdf = data.loc[trade_mask]
+            if not tdf.empty:
+                if dir_ == 1: # LONG
+                    mfe_pts = tdf['high'].max() - entry_price
+                    mae_pts = tdf['low'].min() - entry_price
+                else: # SHORT
+                    mfe_pts = entry_price - tdf['low'].min()
+                    mae_pts = entry_price - tdf['high'].max()
+        except Exception as e:
+            logging.warning(f"Failed to calculate MAE/MFE: {e}")
+
+    # Risk metrics
+    contract_multiplier = 50
+    risk_dollars = abs(entry_price - curr_stop) * contract_multiplier * qty if curr_stop else 0
+    reward_dollars = abs(entry_price - tp_price) * contract_multiplier * qty if tp_price else None
+    rr_ratio = reward_dollars / risk_dollars if (reward_dollars and risk_dollars > 0) else None
+    r_multiple = pnl / risk_dollars if risk_dollars > 0 else 0
+    
+    mfe_dollars = mfe_pts * contract_multiplier * qty
+    mae_dollars = mae_pts * contract_multiplier * qty
+
+    # Email Body Content
+    account = get_account_summary(ib, data, bracket.get('contract'))
+    msg_lines = [
+        f"TRADE CLOSE - {reason.upper()}",
+        f"{'='*60}",
+        f"Signal:      {'LONG' if dir_==1 else 'SHORT'}",
+        f"Volume:      {qty} contract(s)",
+        f"Entry:       ${entry_price:.2f} ({entry_time.strftime('%H:%M:%S') if entry_time else 'N/A'})",
+        f"Exit:        ${exit_price:.2f} ({exit_time.strftime('%H:%M:%S')})",
+        f"Duration:    {duration_str}",
+        f"Reason:      {reason}",
+        f"",
+        f"EXCURSION STATS",
+        f"{'-'*30}",
+        f"MFE (Max Fav): +${mfe_dollars:,.2f} (+{mfe_pts:.2f} pts)",
+        f"MAE (Max Adv): ${mae_dollars:,.2f} ({mae_pts:.2f} pts)",
+        f"",
+        f"FINANCIAL PERFORMANCE",
+        f"{'-'*30}",
+        f"Net PnL:     ${pnl:,.2f}",
+        f"R-Multiple:  {r_multiple:.2f}R",
+        f"Initial Risk: ${risk_dollars:,.2f}",
+        f"Risk/Reward: {rr_ratio:.2f}:1" if rr_ratio else "Risk/Reward: N/A",
+        f"",
+        f"ACCOUNT CONTEXT",
+        f"{'-'*30}",
+        f"Net Liquidity: ${account.get('NetLiquidation', 0):,.2f}",
+        f"Session PnL:   ${account.get('RealizedPNL', 0):,.2f}",
+        f"Equity Value:  ${account.get('EquityWithLoanValue', 0):,.2f}",
+        f"Timestamp:     {exit_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    ]
+    
+    dir_code = "L" if dir_ == 1 else "S"
+    # Subject [TR-P] etc is handled by main.py wrapper
+    subj = f"C: {dir_code} {qty}@{exit_price:.2f} ({'+' if pnl>0 else ''}${pnl:.0f})"
+    
+    # Charting
+    chart_path = os.path.join(os.getcwd(), 'temp', f'trade_chart_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+    chart_attached = False
+    if data is not None and not data.empty:
+        try:
+            chart_attached = create_trade_chart(
+                data, entry_time, exit_time, dir_code, chart_path,
+                sl_price=curr_stop, tp_price=tp_price, entry_price=entry_price
+            )
+            if not chart_attached:
+                logging.warning("create_trade_chart returned False")
+        except Exception as e:
+            logging.error(f"Chart generation failed: {e}")
+            
+    # Dispatch Email
+    try:
+        if chart_attached:
+            send_email_fn(subj, "\n".join(msg_lines), attachment_path=chart_path)
+        else:
+            send_email_fn(subj, "\n".join(msg_lines))
+    except Exception as e:
+        logging.error(f"Failed to dispatch close email: {e}")
+
+
 def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order,
                         stop_trade, tp_trade, dir_, latest_row, positions,
-                        completed_trades, live_tracker, send_email_fn, data):
-    """Record a completed trade and clean up."""
-    # Determine exit reason
+                        completed_trades, live_tracker, send_email_fn, data, 
+                        reason='Unknown'):
+    """Record a completed trade and clean up. Improved reason discovery."""
+    # Determine exit reason from orders if not explicitly provided or marked as Manual
     exit_trade = None
-    reason = 'Unknown'
-    for trade in ib.trades():
-        if tp_order and trade.order.permId == tp_order.permId and trade.filled():
-            exit_trade = trade; reason = 'TP'; break
-        elif trade.order.permId == stop_order.permId and trade.filled():
-            exit_trade = trade; reason = 'Stop'; break
+    if reason in ['Unknown', 'Manual / External']:
+        # 1. Check current session trades
+        for trade in ib.trades():
+            if trade.contract.conId == contract.conId and trade.filled():
+                if tp_order and trade.order.permId == getattr(tp_order, 'permId', 0):
+                    exit_trade = trade; reason = 'Take Profit'; break
+                elif stop_order and trade.order.permId == getattr(stop_order, 'permId', 0):
+                    exit_trade = trade; reason = 'Stop Loss'; break
+        
+        # 2. Deep Search: Check recent fills (crucial for ghost-bracket reconciliation)
+        if reason in ['Unknown', 'Manual / External']:
+            for fill in reversed(ib.fills()):
+                if fill.contract.conId == contract.conId:
+                    p_id = getattr(fill.execution, 'permId', 0)
+                    if tp_order and p_id != 0 and p_id == getattr(tp_order, 'permId', -1):
+                        reason = 'Take Profit'; break
+                    elif stop_order and p_id != 0 and p_id == getattr(stop_order, 'permId', -1):
+                        reason = 'Stop Loss'; break
+        
+        # Final fallback: if position is closed but no fill found, it's external
+        if reason in ['Unknown', 'Manual / External']:
+            reason = 'Manual / External'
 
     entry_price = bracket.get('entry_price', 0)
     entry_time = bracket.get('entry_time')
     if not entry_price and entry_trade and entry_trade.fills:
         entry_price = entry_trade.fills[0].execution.price
 
-    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0))
-    tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
     qty = abs(stop_order.totalQuantity) if stop_order and hasattr(stop_order, 'totalQuantity') else 1
 
+    exit_price = 0
     if exit_trade and exit_trade.fills:
         exit_price = exit_trade.fills[0].execution.price
         pnl = 0
@@ -514,49 +712,51 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
             if f.commissionReport and hasattr(f.commissionReport, 'realizedPNL'):
                 pnl = f.commissionReport.realizedPNL; break
         if pnl == 0 and entry_price > 0:
-            pnl = (exit_price - entry_price) * dir_ * 50
+            pnl = (exit_price - entry_price) * dir_ * 50 * qty
     else:
-        exit_price = latest_row['close']
-        pnl = (exit_price - entry_price) * dir_ * 50 if entry_price > 0 else 0
+        # Fallback 1: Scan recent fills for this contract to find the actual manual/untracked execution
+        fallback_fill = None
+        expected_side = 'SLD' if dir_ == 1 else 'BOT'
+        for f in reversed(ib.fills()):
+            if f.contract.conId == contract.conId and hasattr(f, 'execution') and f.execution.side == expected_side:
+                if abs(f.execution.shares) >= qty:
+                    fallback_fill = f; break
+                
+        if fallback_fill:
+            exit_price = fallback_fill.execution.price
+            pnl = (exit_price - entry_price) * dir_ * 50 * qty if entry_price > 0 else 0
+        else:
+            # Fallback 2: Guess using price
+            exit_price = latest_row['close'] if latest_row is not None and (isinstance(latest_row, dict) and 'close' in latest_row or hasattr(latest_row, 'close')) else 0
+            if exit_price == 0 and data is not None and not data.empty:
+                exit_price = data['close'].iloc[-1]
+            pnl = (exit_price - entry_price) * dir_ * 50 * qty if entry_price > 0 else 0
 
-    # Duration
+    # Duration and Notification
     exit_time = datetime.now()
     duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
 
-    # Risk metrics
-    contract_multiplier = 50
-    risk_dollars = abs(entry_price - curr_stop) * contract_multiplier * qty
-    reward_dollars = abs(entry_price - tp_price) * contract_multiplier * qty if tp_price else None
-    rr_ratio = reward_dollars / risk_dollars if (tp_price and risk_dollars > 0) else None
-    r_multiple = pnl / risk_dollars if risk_dollars > 0 else 0
+    _send_trade_close_notification(
+        ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
+        duration_str, exit_time, data, send_email_fn, live_tracker
+    )
 
-    # Email
-    account = get_account_summary(ib, data, contract)
-    msg_lines = [
-        f"TRADE CLOSE - {'LONG' if dir_==1 else 'SHORT'}",
-        f"{'='*50}",
-        f"Entry: ${entry_price:.2f}  |  Exit: ${exit_price:.2f}",
-        f"Reason: {reason}  |  Duration: {duration_str}",
-        f"SL: ${curr_stop:.2f} (Risk: ${risk_dollars:,.2f})",
-        f"TP: ${tp_price:.2f} (Reward: ${reward_dollars:,.2f})" if tp_price else "TP: None",
-        f"R:R: {rr_ratio:.2f}:1" if rr_ratio else "R:R: N/A",
-        f"PNL: ${pnl:,.2f}  |  R-Multiple: {r_multiple:.2f}R",
-        f"NetLiq: ${account.get('NetLiquidation', 0):,.2f}",
-        f"Time: {exit_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    ]
-    send_email_fn("BB Strategy - Trade CLOSE", "\n".join(msg_lines))
-    logging.info(f"TRADE CLOSE: {reason} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}, R: {r_multiple:.2f}")
+    logging.info(f"TRADE CLOSE: {reason} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
     add_to_live_tracker(live_tracker, 'trade',
-        f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}, {r_multiple:.2f}R")
-
+        f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
+    
+    # Risk calculation for completed record
+    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+    initial_risk = abs(entry_price - curr_stop) * 50 * qty if curr_stop else 0
+    r_multiple = pnl / initial_risk if initial_risk > 0 else 0
+    
     # Record completed trade
     completed_trades.append({
         'exit_time': exit_time, 'entry_time': entry_time,
         'direction': 'LONG' if dir_ == 1 else 'SHORT',
         'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
         'pnl': pnl, 'r_multiple': r_multiple, 'reason': reason,
-        'duration': duration_str, 'initial_risk': risk_dollars,
-        'initial_reward': reward_dollars
+        'duration': duration_str
     })
     if len(completed_trades) > 50:
         del completed_trades[:-50]
@@ -570,4 +770,5 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
                     except: pass
                     break
 
-    positions.remove(bracket)
+    if bracket in positions:
+        positions.remove(bracket)

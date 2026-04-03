@@ -22,26 +22,38 @@ def check_credentials():
         return False
     return True
 
-def send_email(subject: str, body: str) -> bool:
+def send_email(subject: str, body: str, attachment_path: str = None) -> bool:
     """
     Send an email notification using Gmail SMTP (SSL).
     
     Args:
         subject: The subject line of the email.
         body: The plain text body of the email.
+        attachment_path: Optional path to an image to attach.
         
     Returns:
         bool: True if email was sent successfully, False otherwise.
     """
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.image import MIMEImage
+    
     if not check_credentials():
         return False
         
     try:
-        msg = MIMEText(body)
+        msg = MIMEMultipart()
         msg['Subject'] = subject
         msg['From'] = EMAIL_FROM
         msg['To'] = EMAIL_TO
         
+        msg.attach(MIMEText(body, 'plain'))
+        
+        if attachment_path and os.path.exists(attachment_path):
+            with open(attachment_path, 'rb') as f:
+                img_data = f.read()
+            image = MIMEImage(img_data, name=os.path.basename(attachment_path))
+            msg.attach(image)
+            
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(EMAIL_FROM, EMAIL_PWD)
             server.send_message(msg)
@@ -51,3 +63,4 @@ def send_email(subject: str, body: str) -> bool:
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
         return False
+

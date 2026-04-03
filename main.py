@@ -52,10 +52,11 @@ from tools.notifications.email_service import send_email
 # Core modules (ported from ib_deployment_v4.py)
 from core.connection import get_front_es_contract, connect_with_retry, request_historical_data_with_retry
 from core.account import get_account_summary, format_duration, add_to_live_tracker, add_error
-from core.execution import check_entries, check_exits
+from core.execution import check_entries, check_exits, _close_all_positions
 from core.protection import (cancel_all_pending, cleanup_orphaned_orders, close_orphaned_positions,
                               protect_existing_positions, check_and_recreate_tp_orders,
-                              periodic_protection_check, run_reconnection_safety_sequence)
+                              periodic_protection_check, run_reconnection_safety_sequence,
+                              reconcile_positions)
 from core.monitoring import update_indicators, on_bar_update_handler
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -185,7 +186,6 @@ live_tracker = []
 error_log = []
 bar_log = []
 completed_trades = []
-open_fills_log = []
 portfolio_realized_pnl = None
 last_data_receipt = {'time': datetime.now()}
 
@@ -196,6 +196,7 @@ dashboard_stats = {
     'trades_opened': 0, 'trades_closed': 0, 'orders_placed': 0,
     'orders_filled': 0, 'orders_cancelled': 0, 'reconnections': 0
 }
+seen_perm_ids = set() # Track unique executions to avoid duplicates
 
 # Disconnect tracking
 disconnect_start_time = None
@@ -248,6 +249,16 @@ def log_execution(trade, fill):
         realized = fill.commissionReport.realizedPNL if fill.commissionReport else 0.0
         perm_id = fill.execution.permId if hasattr(fill, 'execution') else 0
 
+        # Deduplication Check
+        global seen_perm_ids
+        if perm_id and perm_id in seen_perm_ids:
+            logging.debug(f"Skipping duplicate execution log for PermID: {perm_id}")
+            return
+        if perm_id:
+            seen_perm_ids.add(perm_id)
+            if len(seen_perm_ids) > 1000: pass # basic cleanup if needed
+
+        # 3. Log execution to CSV (always, for audit trail)
         with open(csv_path, 'a', newline='') as f:
             if not file_exists:
                 f.write("Time,Symbol,Side,Price,Qty,Commission,RealizedPNL,PermID\n")
@@ -256,58 +267,8 @@ def log_execution(trade, fill):
 
         logging.info(f"💾 Execution Logged: {side} {shares} @ {price} (Comm: {comm})")
 
-        # FIFO trade pairing
-        matched = None
-        if side == 'BOT':
-            for i, f in enumerate(open_fills_log):
-                if f['side'] == 'SLD': matched = open_fills_log.pop(i); break
-        elif side == 'SLD':
-            for i, f in enumerate(open_fills_log):
-                if f['side'] == 'BOT': matched = open_fills_log.pop(i); break
-
-        if matched:
-            entry_price = matched['price']
-            exit_price = price
-            multiplier = 50
-            if side == 'SLD':
-                pnl = (exit_price - entry_price) * shares * multiplier
-                direction = 'LONG'
-            else:
-                pnl = (entry_price - exit_price) * shares * multiplier
-                direction = 'SHORT'
-            duration = fill_dt - matched['dt']
-            duration_str = str(duration).split('.')[0]
-
-            reason = 'Live Fill'
-            for bracket in positions:
-                if bracket.get('stopLoss') and bracket['stopLoss'].permId == perm_id:
-                    reason = 'Stop Loss'; break
-                if bracket.get('takeProfit') and bracket['takeProfit'].permId == perm_id:
-                    reason = 'Take Profit'; break
-
-            completed_trades.append({
-                'exit_time': fill_dt, 'direction': direction, 'qty': shares,
-                'entry_price': entry_price, 'exit_price': exit_price,
-                'pnl': pnl - comm - matched['comm'], 'r_multiple': 0,
-                'duration': duration_str, 'reason': reason
-            })
-            add_to_live_tracker(live_tracker, 'trade', f"CLOSE ({reason}): {direction} PnL=${pnl:.2f}")
-
-            try:
-                msg = (f"TRADE CLOSE - {direction} ({reason})\n{'='*30}\n"
-                       f"Entry: ${entry_price:.2f}\nExit: ${exit_price:.2f}\n"
-                       f"PnL: ${pnl:.2f}\nDuration: {duration_str}")
-                send_email("BB Strategy - Trade CLOSE", msg)
-            except: pass
-        else:
-            open_fills_log.append({
-                'time': fill_time, 'dt': fill_dt, 'side': side,
-                'qty': shares, 'price': price, 'comm': comm
-            })
-            logging.info(f"🆕 New Position Opened: {side} @ {price}")
-
     except Exception as e:
-        logging.error(f"Failed to log execution to CSV: {e}")
+        logging.error(f"Failed to log execution: {e}")
 
 ib.execDetailsEvent += log_execution
 
@@ -329,7 +290,7 @@ def check_disconnect_status():
                 pos_info = f"{len(positions)} tracked position(s)" if positions else "No tracked positions"
                 msg = (f"API DISCONNECT ALERT\n{'='*50}\n\nDisconnected for: {dur_str}\n"
                        f"Open Positions: {pos_info}\n\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                send_email("BB Strategy - API DISCONNECTED ⚠️", msg)
+                custom_send_email("API DISCONNECTED ⚠️", msg)
                 disconnect_email_sent = True
                 add_to_live_tracker(live_tracker, 'warning', f"Disconnect alert ({dur_str})")
 
@@ -338,7 +299,7 @@ def check_disconnect_status():
         dur_str = format_duration(dur)
         msg = (f"API RECONNECTION\n{'='*50}\n\nRestored after: {dur_str}\n"
                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        send_email("BB Strategy - API RECONNECTED", msg)
+        custom_send_email("API RECONNECTED", msg)
         logging.info(f"Reconnection email sent (was disconnected {dur_str})")
         disconnect_start_time = None
         disconnect_email_sent = False
@@ -353,8 +314,8 @@ async def update_ui_periodically():
         try:
             if dashboard_state:
                 dashboard_state.is_connected = ib.isConnected()
-                if connection_start_time:
-                    dashboard_state.total_uptime_seconds = (datetime.now() - connection_start_time).total_seconds()
+                dashboard_state.total_uptime_seconds = total_uptime_seconds
+                dashboard_state.connection_start_time = connection_start_time
 
                 # Update positions
                 pos_data = []
@@ -379,9 +340,33 @@ async def update_ui_periodically():
                             'lmtPrice': t.order.lmtPrice, 'auxPrice': t.order.auxPrice,
                             'status': t.orderStatus.status
                         })
-                dashboard_state.active_orders = orders_data
+                # Update positions only if connected or if we want to show last known
+                if ib.isConnected():
+                    pos_data = []
+                    for p in ib.portfolio():
+                        if not contract or p.contract.symbol == contract.symbol:
+                            pos_data.append({
+                                'symbol': p.contract.symbol, 'position': p.position,
+                                'avgCost': p.averageCost,
+                                'marketValue': p.marketValue,
+                                'realizedPNL': p.realizedPNL,
+                                'unrealizedPNL': p.unrealizedPNL
+                            })
+                    dashboard_state.positions = pos_data
 
-                # Update live tracker and completed trades on dashboard
+                    # Update orders
+                    orders_data = []
+                    for t in ib.trades():
+                        if not t.isDone():
+                            orders_data.append({
+                                'orderId': t.order.orderId, 'orderType': t.order.orderType,
+                                'action': t.order.action, 'totalQuantity': t.order.totalQuantity,
+                                'lmtPrice': t.order.lmtPrice, 'auxPrice': t.order.auxPrice,
+                                'status': t.orderStatus.status
+                            })
+                    dashboard_state.active_orders = orders_data
+
+                # Always update live tracker and completed trades on dashboard
                 dashboard_state.live_tracker = live_tracker[-200:]
                 dashboard_state.bar_log = bar_log[-20:]
                 dashboard_state.completed_trades = completed_trades[-50:]
@@ -390,10 +375,10 @@ async def update_ui_periodically():
                 status_path = os.path.join(WEB_DIR, f"{args.mode.lower()}_status.js")
                 update_dashboard(dashboard_state, dash_path, status_path)
 
-            # Security guard checks
-            if guard:
+            # Security guard checks (only if connected)
+            if guard and ib.isConnected():
                 guard.check_connection(ib, positions)
-                if ib.isConnected() and contract:
+                if contract:
                     guard.check_orphaned_orders(ib, contract, positions)
 
         except Exception as e:
@@ -434,7 +419,7 @@ def ensure_connected_and_subscribed():
             bars, hasNewBar, strategy=strategy, ib=ib, contract=contract,
             data_ref=data_ref, positions=positions, completed_trades=completed_trades,
             live_tracker=live_tracker, bar_log=bar_log, dashboard_state=dashboard_state,
-            send_email_fn=send_email, output_dir=args.output_dir,
+            send_email_fn=custom_send_email, output_dir=args.output_dir,
             last_data_receipt=last_data_receipt
         )
         logging.info(f"Subscribed to market data ({len(bars_obj)} bars)")
@@ -465,11 +450,28 @@ if os.name == 'nt':
 
 
 # =============================================================================
+def make_custom_email_fn():
+    strat_tag = "BB" if 'boll' in args.strategy.casefold() else ("TR" if 'trend' in args.strategy.casefold() else "BOT")
+    mode_tag = "L" if args.mode.casefold() == 'live' else "P"
+    prefix = f"[{strat_tag}-{mode_tag}]"
+    
+    def custom_send_email(subj, body, attachment_path=None):
+        cleaned_subj = subj.replace("[BB] ", "").replace("[TR] ", "").replace("BB Strategy - ", "")
+        final_subj = f"{prefix} {cleaned_subj}"
+        return send_email(final_subj, body, attachment_path)
+    return custom_send_email
+
+custom_send_email = make_custom_email_fn()
+
+# =============================================================================
 # MAIN LOOP
 # =============================================================================
 async def main():
     global contract, dashboard_state, guard, bars_obj
     global connection_start_time, total_uptime_seconds, portfolio_realized_pnl
+    global last_unrealized_alert_tier, last_heartbeat_time
+    last_unrealized_alert_tier = 0
+    last_heartbeat_time = datetime.now()
 
     protection_task = None
 
@@ -482,6 +484,15 @@ async def main():
         # Auto-resolve front-month ES contract
         contract = get_front_es_contract(ib)
         cancel_all_pending(ib, contract, live_tracker)
+
+        # --- SELF-HEALING STARTUP ---
+        # Sync internal state with reality immediately after connection
+        try:
+            reconcile_positions(ib, contract, positions, live_tracker, 
+                              completed_trades=completed_trades, send_email_fn=custom_send_email,
+                              data=data_ref['data'])
+        except Exception as e:
+            logging.error(f"Startup reconciliation failed: {e}")
 
         # Initialize Dashboard
         dashboard_state = DashboardState(
@@ -517,10 +528,19 @@ async def main():
 
         # Portfolio PnL callback (most accurate source)
         def on_portfolio_update(item):
-            global portfolio_realized_pnl
+            global portfolio_realized_pnl, last_unrealized_alert_tier
             if item.contract.symbol == 'ES' and item.contract.conId == contract.conId:
                 portfolio_realized_pnl = (getattr(item, 'realizedPNL', None) or
                                           getattr(item, 'realizedPnl', None))
+                unrealized = getattr(item, 'unrealizedPNL', getattr(item, 'unrealizedPnl', None))
+                if unrealized is not None:
+                    if unrealized < 0:
+                        tier = int(-unrealized // 100) * 100
+                        if tier >= 500 and tier > last_unrealized_alert_tier:
+                            last_unrealized_alert_tier = tier
+                            custom_send_email(f"🚨W: -${tier}", f"Unrealized PNL target crossed: -${tier}\nDetails:\n{item}")
+                    elif unrealized > -100:
+                        last_unrealized_alert_tier = 0  # Reset when largely recovered
 
         ib.updatePortfolioEvent += on_portfolio_update
 
@@ -552,10 +572,12 @@ async def main():
         # Start async tasks
         asyncio.create_task(update_ui_periodically())
         protection_task = asyncio.create_task(
-            periodic_protection_check(ib, contract, positions, strategy, data_ref['data'], live_tracker)
+            periodic_protection_check(ib, contract, positions, strategy, data_ref['data'], live_tracker,
+                                     send_email_fn=custom_send_email, close_all_fn=_close_all_positions,
+                                     completed_trades=completed_trades)
         )
 
-        send_email("Trading Bot Started", f"Bot started in {args.mode} mode on port {args.port}\n"
+        custom_send_email("START", f"Bot started in {args.mode} mode on port {args.port}\n"
                    f"Contract: {contract.localSymbol}\nStrategy: {args.strategy}")
 
         # Main loop
@@ -582,7 +604,7 @@ async def main():
                     # Post-reconnection safety
                     await asyncio.sleep(2)
                     run_reconnection_safety_sequence(ib, contract, positions, strategy,
-                                                     data_ref['data'], live_tracker)
+                                                     data_ref['data'], live_tracker, completed_trades)
 
                     # Force an immediate dashboard update after reconnection
                     if dashboard_state:
@@ -593,13 +615,31 @@ async def main():
                         update_dashboard(dashboard_state, dash_path, status_path)
                         add_to_live_tracker(live_tracker, 'info', 'Dashboard refreshed after reconnection')
 
+                # 30-Min Heartbeat Status
+                now = datetime.now()
+                if (now - last_heartbeat_time).total_seconds() >= 1800:
+                    last_heartbeat_time = now
+                    if positions:
+                        total_pos = sum(p.position for p in ib.positions() if p.contract.symbol == 'ES')
+                        pos_str = "L" if total_pos > 0 else "S"
+                        unpnl = dashboard_state.account_info.get('UnrealizedPNL', 0)
+                        subj = f"STAT: {pos_str} {abs(total_pos)} PNL:${unpnl:,.0f}"
+                        msg = (f"Status Update: {now.strftime('%H:%M')}\n"
+                               f"Positions: {total_pos}\nUnrealized: ${unpnl:,.2f}\n"
+                               f"NetLiq: ${dashboard_state.account_info.get('NetLiquidation', 0):,.2f}")
+                        custom_send_email(subj, msg)
+
                 # Data liveness check
-                time_since = (datetime.now() - last_data_receipt['time']).total_seconds()
+                time_since = (now - last_data_receipt['time']).total_seconds()
                 if time_since > 60:
                     logging.warning(f"⚠️ DATA STALLED! No bars for {time_since:.1f}s. Restarting data...")
                     add_to_live_tracker(live_tracker, 'warning', 'Data Stalled - Forcing Restart')
                     ensure_connected_and_subscribed()
-                    last_data_receipt['time'] = datetime.now()
+                    if time_since > 180:
+                        subj = "🚨 STALL: POS OPEN!" if positions else "⚠️ STALL: FLAT"
+                        msg = f"No tick data received for {time_since:.1f}s!\nPositions: {len(positions)}\nTime: {now.strftime('%H:%M:%S')}"
+                        custom_send_email(subj, msg)
+                    last_data_receipt['time'] = now
 
                 await asyncio.sleep(10)
 
@@ -631,7 +671,7 @@ async def main():
             if ib.isConnected():
                 ib.disconnect()
         except: pass
-        send_email("Trading Bot Stopped", f"Bot stopped in {args.mode} mode")
+        custom_send_email("STOP", f"Bot stopped in {args.mode} mode")
         logging.info("Shutdown complete.")
 
 

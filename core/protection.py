@@ -8,7 +8,9 @@ import pandas as pd
 from datetime import datetime
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 
-from core.account import add_to_live_tracker
+from core.account import get_account_summary, add_to_live_tracker
+import pandas as pd
+import pytz
 
 
 def cancel_all_pending(ib, contract, live_tracker=None):
@@ -69,20 +71,33 @@ def cleanup_orphaned_orders(ib, contract, positions):
         return
 
     tracked_perm_ids = set()
+    tracked_order_ids = set()
     for bracket in positions:
         for key in ['entry', 'stopLoss', 'takeProfit']:
             order = bracket.get(key)
-            if order and hasattr(order, 'permId') and order.permId != 0:
-                tracked_perm_ids.add(order.permId)
+            if order:
+                if hasattr(order, 'permId') and order.permId != 0:
+                    tracked_perm_ids.add(order.permId)
+                if hasattr(order, 'orderId') and order.orderId != 0:
+                    tracked_order_ids.add(order.orderId)
 
     orphaned = []
     for trade in ib.trades():
         if trade.contract.conId == contract.conId and trade.isActive():
-            if trade.order.permId not in tracked_perm_ids:
-                # Check if parent is a filled entry (child of bracket)
-                parent_id = getattr(trade.order, 'parentId', 0)
-                if parent_id == 0 or parent_id not in tracked_perm_ids:
-                    orphaned.append(trade)
+            perm_id = trade.order.permId
+            order_id = trade.order.orderId
+            parent_id = getattr(trade.order, 'parentId', 0)
+
+            # Order is NOT orphaned if its PermID or OrderID is explicitly tracked
+            if perm_id in tracked_perm_ids or order_id in tracked_order_ids:
+                continue
+
+            # Order is NOT orphaned if its parent OrderID is explicitly tracked
+            if parent_id != 0 and parent_id in tracked_order_ids:
+                continue
+            
+            # If no tracking match found, it's an orphan
+            orphaned.append(trade)
 
     for trade in orphaned:
         try:
@@ -94,7 +109,7 @@ def cleanup_orphaned_orders(ib, contract, positions):
             logging.warning(f"Error cancelling orphaned order: {e}")
 
 
-def close_orphaned_positions(ib, contract, positions, live_tracker=None):
+def close_orphaned_positions(ib, contract, positions, live_tracker=None, completed_trades=None, data=None):
     """Close positions that don't match any tracked bracket."""
     if contract is None:
         return
@@ -126,12 +141,33 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None):
             close_order = MarketOrder(action=close_action, totalQuantity=abs(pos.position), transmit=True)
             try:
                 # CRITICAL: Use the position's OWN contract (March/June/etc)
-                ib.placeOrder(pos.contract, close_order)
-                ib.sleep(1)
+                close_trade = ib.placeOrder(pos.contract, close_order)
+                ib.sleep(2)  # Wait slightly longer for fill
                 logging.info(f"Orphaned {pos.contract.localSymbol} position closed")
                 if live_tracker:
                     add_to_live_tracker(live_tracker, 'warning',
                         f"Closed orphaned position: {pos.position} contracts")
+                        
+                # --- NEW: Record orphaned closure to dashboard ---
+                if completed_trades is not None:
+                    exit_price = close_trade.fills[0].execution.price if close_trade and close_trade.fills else (data['close'].iloc[-1] if data is not None and not data.empty else 0)
+                    pnl = 0
+                    if close_trade and close_trade.fills:
+                        for f in close_trade.fills:
+                            if f.commissionReport and hasattr(f.commissionReport, 'realizedPNL'):
+                                pnl = f.commissionReport.realizedPNL; break
+
+                    entry_price = getattr(pos, 'avgCost', 0) / 50.0  # ES multiplier
+                    completed_trades.append({
+                        'exit_time': datetime.now(), 'entry_time': None,
+                        'direction': 'LONG' if pos.position > 0 else 'SHORT',
+                        'qty': abs(pos.position), 'entry_price': entry_price, 'exit_price': exit_price,
+                        'pnl': pnl, 'r_multiple': 0, 'reason': 'Orphan Auto-Close',
+                        'duration': 'Auto-Closed'
+                    })
+                    if len(completed_trades) > 50:
+                        del completed_trades[:-50]
+
             except Exception as e:
                 logging.error(f"Failed to close orphaned position: {e}")
 
@@ -185,11 +221,19 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
                 logging.error(f"Cannot recreate stop: Invalid stop price calculated.")
                 continue
 
+            # Clamp stop loss to ensure validity against current market price
+            calc_stop = float(pos_dict['stop'])
+            curr_px = float(data['close'].iloc[-1])
+            if direction == 1:
+                valid_stop = min(calc_stop, curr_px - 0.25)
+            else:
+                valid_stop = max(calc_stop, curr_px + 0.25)
+
             oca_group = f"bracket_{pos.contract.conId}_{direction}"
             stop_order = StopOrder(
                 action='SELL' if direction == 1 else 'BUY',
                 totalQuantity=qty,
-                stopPrice=round(float(pos_dict['stop']) * 4) / 4,
+                stopPrice=round(valid_stop * 4) / 4,
                 ocaGroup=oca_group, ocaType=1,
                 tif='GTC', transmit=True
             )
@@ -229,7 +273,7 @@ def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_t
         if not getattr(strategy, 'opposite_bb_tp', False) and not bracket.get('position_dict', {}).get('tp'):
             continue
 
-        # Check if TP exists and is active
+        # 1. Check if TP handle in bracket is active
         tp_active = False
         if tp_order:
             for trade in ib.trades():
@@ -237,6 +281,33 @@ def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_t
                     tp_active = trade.isActive() or (trade.orderStatus and
                         trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending'])
                     break
+
+        # 2. Safety: Look for ANY active Limit order for this contract with correct parentId
+        if not tp_active:
+            entry_order = bracket.get('entry')
+            entry_id = entry_order.orderId if entry_order and hasattr(entry_order, 'orderId') else 0
+            
+            for trade in ib.trades():
+                if trade.contract.conId == contract.conId and trade.isActive():
+                    order = trade.order
+                    is_limit = isinstance(order, LimitOrder) or getattr(order, 'lmtPrice', 0) > 0
+                    
+                    # Match by parentId (strongest link)
+                    if is_limit and entry_id != 0 and getattr(order, 'parentId', 0) == entry_id:
+                        tp_active = True
+                        bracket['takeProfit'] = order # Repair the handle
+                        logging.info(f"Repaired TP handle for tracked position (parent link: {entry_id})")
+                        break
+                    
+                    # Match by Action and Quantity (fallback for when parentId is lost or not yet assigned)
+                    action = 'SELL' if direction == 1 else 'BUY'
+                    if (is_limit and order.action == action and 
+                        abs(order.totalQuantity) == 1 and # Adjust if handling multi-lot
+                        trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
+                        tp_active = True
+                        bracket['takeProfit'] = order
+                        logging.debug(f"Assumed active order {order.permId} is the TP for bracket")
+                        break
 
         if tp_active:
             continue
@@ -295,25 +366,156 @@ def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_t
             logging.error(f"Error recreating TP: {e}")
 
 
-async def periodic_protection_check(ib, contract, positions, strategy, data, live_tracker=None):
-    """Every-60s async task: cleanup -> protect -> recreate TP."""
+def reconcile_positions(ib, contract, positions, live_tracker=None, 
+                        completed_trades=None, send_email_fn=None, data=None):
+    """
+    SELF-HEALING: Sync internal 'positions' list with actual IBKR positions.
+    Purges 'Ghost Brackets' that exist in our tracking but not in TWS.
+    """
+    if not ib.isConnected():
+        return
+
+    # Import lazy-load to avoid circular dependency
+    from core.execution import _record_trade_close
+
+    try:
+        # 1. Get all actual ES positions
+        # Use symbol 'ES' to handle roll-over contracts safely
+        actual_es_pos = [p for p in ib.positions() if p.contract.symbol == 'ES']
+        
+        # 2. Iterate through our internal tracking list
+        for bracket in positions[:]:
+            direction = bracket.get('direction')
+            qty = 0
+            # Resolve quantity from available order handles
+            for k in ['stopLoss', 'entry', 'takeProfit']:
+                if bracket.get(k) and hasattr(bracket[k], 'totalQuantity'):
+                    qty = abs(bracket[k].totalQuantity)
+                    break
+            
+            # Find matching actual position
+            match = next((p for p in actual_es_pos 
+                        if (1 if p.position > 0 else -1) == direction and abs(p.position) == qty), None)
+            
+            if match is None:
+                # 30-SECOND GRACE PERIOD: 
+                # Don't immediately purge. A fill might have just happened and we're waiting for the event.
+                first_missing = bracket.get('first_missing_time')
+                if first_missing is None:
+                    bracket['first_missing_time'] = datetime.now()
+                    continue # Wait for next cycle
+                
+                missing_duration = (datetime.now() - first_missing).total_seconds()
+                if missing_duration < 30:
+                    logging.debug(f"Position {direction} missing from TWS for {missing_duration:.1f}s. Waiting for grace period...")
+                    continue
+
+                # This is a GHOST BRACKET (tracked but not in TWS for > 30s)
+                logging.warning(f"GHOST POSITION DETECTED: Tracked {'LONG' if direction==1 else 'SHORT'} "
+                             f"({qty} contracts) but not found in TWS for {missing_duration:.1f}s. Recording as Manual Close...")
+                
+                # Cleanup associated orders immediately to prevent 'improper price' storm
+                for order_key in ['stopLoss', 'takeProfit']:
+                    order = bracket.get(order_key)
+                    if order:
+                        # Find and cancel any active trades for this order
+                        for trade in ib.trades():
+                            if trade.order.permId == getattr(order, 'permId', 0) and trade.isActive():
+                                try:
+                                    ib.cancelOrder(trade.order)
+                                    logging.info(f"Cancelled orphaned {order_key} for ghost bracket: {trade.order.permId}")
+                                except: pass
+
+                # Record the trade as "Unknown" (triggers deep-search in execution.py)
+                try:
+                    # Mock row for price discovery
+                    latest_row = {'close': 0}
+                    if data is not None and not data.empty:
+                        latest_row = data.iloc[-1]
+                    
+                    _record_trade_close(
+                        ib, contract, bracket, 
+                        bracket.get('entry'), bracket.get('stopLoss'), bracket.get('takeProfit'),
+                        None, None, direction, latest_row, positions,
+                        completed_trades, live_tracker, send_email_fn, data,
+                        reason='Unknown'
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to record ghost bracket closure: {e}")
+
+                if bracket in positions:
+                    positions.remove(bracket)
+                if live_tracker:
+                    add_to_live_tracker(live_tracker, 'warning', f"Purged ghost position ({qty} contracts)")
+            else:
+                # Position found in TWS - reset the missing timer
+                bracket.pop('first_missing_time', None)
+
+    except Exception as e:
+        logging.error(f"Error in reconcile_positions: {e}")
+
+
+async def periodic_protection_check(ib, contract, positions, strategy, data, live_tracker=None, 
+                                 send_email_fn=None, close_all_fn=None, completed_trades=None):
+    """Every-60s async task: maintenance -> cleanup -> protect -> recreate TP."""
     while True:
         await asyncio.sleep(60)
-        if ib.isConnected() and contract is not None:
-            try:
-                cleanup_orphaned_orders(ib, contract, positions)
-                close_orphaned_positions(ib, contract, positions, live_tracker)
-                protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
-                check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
-            except Exception as e:
-                logging.error(f"Error in periodic protection check: {e}")
+        if not ib.isConnected() or contract is None:
+            continue
+            
+        try:
+            # --- 1. Maintenance & RTH Force Exit Check (Robust Safety) ---
+            # We recreate a dummy single-row DF to check current filters
+            if strategy and hasattr(strategy, 'apply_filters'):
+                now_et = datetime.now(pytz.timezone('US/Eastern'))
+                dummy_df = pd.DataFrame(index=[now_et])
+                # Fill with enough dummy data to avoid strategy crashes
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    dummy_df[col] = 0
+                
+                try:
+                    # Apply filters to current time
+                    filtered = strategy.apply_filters(dummy_df)
+                    
+                    # Also reconcile positions with TWS every minute
+                    reconcile_positions(ib, contract, positions, live_tracker, 
+                                      completed_trades=completed_trades, send_email_fn=send_email_fn, data=data)
+                    if not filtered.empty:
+                        row = filtered.iloc[0]
+                        force_maint = row.get('force_exit', False)
+                        force_rth = row.get('force_exit_rth', False)
+                        
+                        if force_maint or force_rth:
+                            reason = "Maintenance" if force_maint else "RTH End"
+                            # Check if ANY ES position exists (tracked or orphaned)
+                            es_pos = [p for p in ib.positions() if p.contract.symbol == 'ES' and p.position != 0]
+                            if es_pos or positions:
+                                if close_all_fn and send_email_fn:
+                                    logging.warning(f"⚠️ {reason.upper()} APPROACHING (Periodic Check) - Closing all ES positions")
+                                    acct_fn = lambda: get_account_summary(ib, data, contract)
+                                    close_all_fn(reason, ib, contract, positions, data, 
+                                                 live_tracker, send_email_fn, strategy=strategy, account_fn=acct_fn)
+                except Exception as e:
+                    logging.error(f"Error checking maintenance in periodic loop: {e}")
+
+            # --- 2. Standard Protection Checks ---
+            cleanup_orphaned_orders(ib, contract, positions)
+            close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
+            protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
+            check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
+        except Exception as e:
+            logging.error(f"Error in periodic protection check: {e}")
 
 
-def run_reconnection_safety_sequence(ib, contract, positions, strategy, data, live_tracker=None):
-    """Post-reconnection safety: cleanup -> close orphans -> protect -> recreate TP."""
+def run_reconnection_safety_sequence(ib, contract, positions, strategy, data, live_tracker=None, completed_trades=None):
+    """Post-reconnection safety: reconcile -> cleanup -> close orphans -> protect -> recreate TP."""
     logging.info("Running post-reconnection safety sequence...")
+    # 0. Sync internal state with reality (THE STABILITY FIX)
+    reconcile_positions(ib, contract, positions, live_tracker)
+    
+    # 1. Standard safety checks
     cleanup_orphaned_orders(ib, contract, positions)
-    close_orphaned_positions(ib, contract, positions, live_tracker)
+    close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
     protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
     check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
     logging.info("Safety sequence complete")

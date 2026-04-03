@@ -319,17 +319,17 @@ class TrendStrategy(Strategy):
             mask_vwap_long = (df['close'] > df['vwap']).values
             mask_vwap_short = (df['close'] < df['vwap']).values
         
-        # Breakout signals
-        # We use 'close' for confirmation or 'high'/'low' for touch?
-        # Trend systems usually stop-entry at the breakout level. 
-        # For this vectorized backtest, we assume fill if High > DonchianHigh
-        
+        # Breakout signals (Crossover logic to prevent trade storms)
+        # Only trigger on the BAR that first breaks the level
+        long_sig = (df['high'] > df['donchian_high']) & (df['high'].shift(1) <= df['donchian_high'].shift(1))
+        short_sig = (df['low'] < df['donchian_low']) & (df['low'].shift(1) >= df['donchian_low'].shift(1))
+
         # Time filter masks
         mask_rth = df['in_rth'].values if 'in_rth' in df.columns else np.ones(len(df), dtype=bool)
         mask_maint = (~df['in_maintenance'].values) if 'in_maintenance' in df.columns else np.ones(len(df), dtype=bool)
 
-        long_sig = (df['high'] > df['donchian_high']) & mask_adx & mask_atr & mask_sma_long & mask_vol & mask_rsi_long & mask_vwap_long & mask_rth & mask_maint
-        short_sig = (df['low'] < df['donchian_low']) & mask_adx & mask_atr & mask_sma_short & mask_vol & mask_rsi_short & mask_vwap_short & mask_rth & mask_maint
+        long_sig = long_sig & mask_adx & mask_atr & mask_sma_long & mask_vol & mask_rsi_long & mask_vwap_long & mask_rth & mask_maint
+        short_sig = short_sig & mask_adx & mask_atr & mask_sma_short & mask_vol & mask_rsi_short & mask_vwap_short & mask_rth & mask_maint
         
         if not self.enable_long: long_sig[:] = False
         if not self.enable_short: short_sig[:] = False
@@ -385,14 +385,17 @@ class TrendStrategy(Strategy):
         
         dir_ = position['direction']
         
+        stop_price = position.get('stop', 0)
+        tp_price = position.get('tp')
+        
         # 1. Stop Loss
-        if dir_ == 1 and low <= position['stop']: return True, 'Stop Loss', position['stop']
-        if dir_ == -1 and high >= position['stop']: return True, 'Stop Loss', position['stop']
+        if dir_ == 1 and low <= stop_price: return True, 'Stop Loss', stop_price
+        if dir_ == -1 and high >= stop_price: return True, 'Stop Loss', stop_price
         
         # 2. Take Profit
-        if position['tp'] is not None and position['tp'] > 0:
-            if dir_ == 1 and high >= position['tp']: return True, 'Take Profit', position['tp']
-            if dir_ == -1 and low <= position['tp']: return True, 'Take Profit', position['tp']
+        if tp_price is not None and tp_price > 0:
+            if dir_ == 1 and high >= tp_price: return True, 'Take Profit', tp_price
+            if dir_ == -1 and low <= tp_price: return True, 'Take Profit', tp_price
             
         # 3. Channel Exit (Reversal)
         # If Long, and Price drops below Donchian Low (Support broken) -> Exit

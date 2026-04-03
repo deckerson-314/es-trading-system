@@ -146,8 +146,8 @@ def main():
     live_trades_path = r'c:\Trading\paper_logs\live_trades.csv'
     params_path = r'c:\Trading\strategies\trend\parameters\trend_strategy_params_testing_ultra_high.csv'
     
-    analysis_start = pd.Timestamp("2026-03-27 09:30:00")
-    analysis_end = pd.Timestamp("2026-03-27 13:15:00")
+    analysis_start = pd.Timestamp("2026-03-31 12:00:00")
+    analysis_end = pd.Timestamp("2026-03-31 16:00:00")
 
     print(f"--- Running Comparison for Trend Strategy (Analysis Window: {analysis_start.date()} to {analysis_end.date()}) ---")
 
