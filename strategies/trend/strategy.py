@@ -275,65 +275,149 @@ class TrendStrategy(Strategy):
         )
         return df
 
-    def calculate_entry_signals(self, df):
+    def calculate_entry_signals(self, df, verbose=False):
         """
         Long if High > Donchian High.
         Short if Low < Donchian Low.
         """
-        # Vectorized implementation
-        # Note: Signal generation usually implies "Close crossed" or "High touched"
-        # Strategy: Enter if Price breaks the level.
+        # --- 1. Core Breakout Signals (Candidates) ---
+        # Trigger on the BAR that first breaks the level
+        long_breakout = (df['high'] > df['donchian_high']) & (df['high'].shift(1) <= df['donchian_high'].shift(1))
+        short_breakout = (df['low'] < df['donchian_low']) & (df['low'].shift(1) >= df['donchian_low'].shift(1))
         
-        # Filter masks
-        mask_adx = np.ones(len(df), dtype=bool)
-        if self.enable_adx_filter:
-            mask_adx = (df['adx'] > self.min_adx).values
-            
-        mask_atr = (df['atr_filter'] > self.min_atr_points).values
+        # --- 2. Individual Filter Masks ---
+        masks = {}
         
-        # New Filter Masks
-        mask_sma_long = np.ones(len(df), dtype=bool)
-        mask_sma_short = np.ones(len(df), dtype=bool)
+        # ADX Filter
+        masks['ADX'] = (df['adx'] > self.min_adx).values if self.enable_adx_filter else np.ones(len(df), dtype=bool)
         
+        # ATR Filter
+        masks['ATR'] = (df['atr_filter'] > self.min_atr_points).values
+        
+        # SMA Filter (Regime)
         if self.enable_sma_filter:
-            # Long only if Close > SMA
-            mask_sma_long = (df['close'] > df['sma_regime']).values
-            # Short only if Close < SMA
-            mask_sma_short = (df['close'] < df['sma_regime']).values
+            masks['SMA_Long'] = (df['close'] > df['sma_regime']).values
+            masks['SMA_Short'] = (df['close'] < df['sma_regime']).values
+        else:
+            masks['SMA_Long'] = masks['SMA_Short'] = np.ones(len(df), dtype=bool)
             
-        
-        mask_vol = np.ones(len(df), dtype=bool)
+        # Volume Filter
         if getattr(self, 'enable_vol_filter', False):
-            # Entry Volume > Avg Vol * Mult
-            mask_vol = (df['volume'] > (df['vol_ma'] * self.min_vol_mult)).values
+            masks['VOL'] = (df['volume'] > (df['vol_ma'] * self.min_vol_mult)).values
+        else:
+            masks['VOL'] = np.ones(len(df), dtype=bool)
 
-        mask_rsi_long = np.ones(len(df), dtype=bool)
-        mask_rsi_short = np.ones(len(df), dtype=bool)
+        # RSI Filter
         if getattr(self, 'enable_rsi_filter', False):
-            mask_rsi_long = (df['rsi'] < self.rsi_max_buy).values
-            mask_rsi_short = (df['rsi'] > self.rsi_min_sell).values
+            masks['RSI_Long'] = (df['rsi'] < self.rsi_max_buy).values
+            masks['RSI_Short'] = (df['rsi'] > self.rsi_min_sell).values
+        else:
+            masks['RSI_Long'] = masks['RSI_Short'] = np.ones(len(df), dtype=bool)
 
-        mask_vwap_long = np.ones(len(df), dtype=bool)
-        mask_vwap_short = np.ones(len(df), dtype=bool)
+        # VWAP Filter
         if getattr(self, 'enable_vwap_filter', False):
-            mask_vwap_long = (df['close'] > df['vwap']).values
-            mask_vwap_short = (df['close'] < df['vwap']).values
+            masks['VWAP_Long'] = (df['close'] > df['vwap']).values
+            masks['VWAP_Short'] = (df['close'] < df['vwap']).values
+        else:
+            masks['VWAP_Long'] = masks['VWAP_Short'] = np.ones(len(df), dtype=bool)
         
-        # Breakout signals (Crossover logic to prevent trade storms)
-        # Only trigger on the BAR that first breaks the level
-        long_sig = (df['high'] > df['donchian_high']) & (df['high'].shift(1) <= df['donchian_high'].shift(1))
-        short_sig = (df['low'] < df['donchian_low']) & (df['low'].shift(1) >= df['donchian_low'].shift(1))
+        # Time Filters
+        masks['RTH'] = df['in_rth'].values if 'in_rth' in df.columns else np.ones(len(df), dtype=bool)
+        masks['MAINT'] = (~df['in_maintenance'].values) if 'in_maintenance' in df.columns else np.ones(len(df), dtype=bool)
+        
+        # Side Enables
+        masks['ENABLE_L'] = np.full(len(df), self.enable_long)
+        masks['ENABLE_S'] = np.full(len(df), self.enable_short)
 
-        # Time filter masks
-        mask_rth = df['in_rth'].values if 'in_rth' in df.columns else np.ones(len(df), dtype=bool)
-        mask_maint = (~df['in_maintenance'].values) if 'in_maintenance' in df.columns else np.ones(len(df), dtype=bool)
+        # --- 3. Final Signal Calculation ---
+        long_sig = (long_breakout & 
+                    masks['ADX'] & masks['ATR'] & masks['SMA_Long'] & 
+                    masks['VOL'] & masks['RSI_Long'] & masks['VWAP_Long'] & 
+                    masks['RTH'] & masks['MAINT'] & masks['ENABLE_L'])
+        
+        short_sig = (short_breakout & 
+                     masks['ADX'] & masks['ATR'] & masks['SMA_Short'] & 
+                     masks['VOL'] & masks['RSI_Short'] & masks['VWAP_Short'] & 
+                     masks['RTH'] & masks['MAINT'] & masks['ENABLE_S'])
+        
+        # --- 4. Action Log (Diagnostics) ---
+        if verbose:
+            try:
+                action_log = []
+                # Check rejections for LONG candidates
+                long_cands_idx = np.where(long_breakout)[0]
+                for loc in long_cands_idx:
+                    row = df.iloc[loc]
+                    idx = row.name
+                    reasons = []
+                    if not masks['ENABLE_L'][loc]: reasons.append("Long Disabled")
+                    if not masks['RTH'][loc]: reasons.append("RTH Filter")
+                    if not masks['MAINT'][loc]: reasons.append("Maintenance Filter")
+                    if not masks['ADX'][loc]: 
+                        if 'adx' in row: reasons.append(f"ADX ({row['adx']:.1f} < {self.min_adx})")
+                    if not masks['ATR'][loc]: 
+                        if 'atr_filter' in row: reasons.append(f"ATR ({row['atr_filter']:.2f} < {self.min_atr_points})")
+                    if not masks['SMA_Long'][loc]: reasons.append("SMA Filter")
+                    if not masks['VOL'][loc]: reasons.append("Volume Filter")
+                    if not masks['RSI_Long'][loc]: 
+                        if 'rsi' in row: reasons.append(f"RSI ({row['rsi']:.1f} > {self.rsi_max_buy})")
+                    if not masks['VWAP_Long'][loc]: reasons.append("VWAP Filter")
+                    
+                    if reasons:
+                        action_log.append({
+                            'timestamp': idx,
+                            'direction': 'LONG',
+                            'type': 'Breakout Rejected',
+                            'reasons': reasons
+                        })
+                    else:
+                        action_log.append({
+                            'timestamp': idx,
+                            'direction': 'LONG',
+                            'type': 'Signal Triggered',
+                            'reasons': []
+                        })
 
-        long_sig = long_sig & mask_adx & mask_atr & mask_sma_long & mask_vol & mask_rsi_long & mask_vwap_long & mask_rth & mask_maint
-        short_sig = short_sig & mask_adx & mask_atr & mask_sma_short & mask_vol & mask_rsi_short & mask_vwap_short & mask_rth & mask_maint
-        
-        if not self.enable_long: long_sig[:] = False
-        if not self.enable_short: short_sig[:] = False
-        
+                # Check rejections for SHORT candidates
+                short_cands_idx = np.where(short_breakout)[0]
+                for loc in short_cands_idx:
+                    row = df.iloc[loc]
+                    idx = row.name
+                    reasons = []
+                    if not masks['ENABLE_S'][loc]: reasons.append("Short Disabled")
+                    if not masks['RTH'][loc]: reasons.append("RTH Filter")
+                    if not masks['MAINT'][loc]: reasons.append("Maintenance Filter")
+                    if not masks['ADX'][loc]: 
+                        if 'adx' in row: reasons.append(f"ADX ({row['adx']:.1f} < {self.min_adx})")
+                    if not masks['ATR'][loc]: 
+                        if 'atr_filter' in row: reasons.append(f"ATR ({row['atr_filter']:.2f} < {self.min_atr_points})")
+                    if not masks['SMA_Short'][loc]: reasons.append("SMA Filter")
+                    if not masks['VOL'][loc]: reasons.append("Volume Filter")
+                    if not masks['RSI_Short'][loc]: 
+                        if 'rsi' in row: reasons.append(f"RSI ({row['rsi']:.1f} < {self.rsi_min_sell})")
+                    if not masks['VWAP_Short'][loc]: reasons.append("VWAP Filter")
+                    
+                    if reasons:
+                        action_log.append({
+                            'timestamp': idx,
+                            'direction': 'SHORT',
+                            'type': 'Breakout Rejected',
+                            'reasons': reasons
+                        })
+                    else:
+                        action_log.append({
+                            'timestamp': idx,
+                            'direction': 'SHORT',
+                            'type': 'Signal Triggered',
+                            'reasons': []
+                        })
+
+                return long_sig, short_sig, action_log
+            except Exception as e:
+                import logging
+                logging.error(f"Action Log generation failed: {e}")
+                raise e
+            
         return long_sig, short_sig
 
     def setup_position(self, entry_price, direction, row, df=None):

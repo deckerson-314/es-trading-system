@@ -566,3 +566,60 @@ class TestBacktestParity:
 
         # Clean up
         os.remove(csv_path)
+# ═══════════════════════════════════════════════════════════════════════════
+# §6  Pillar B: Action Log (Diagnostics)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestActionLog:
+    """Verify that verbose=True returns detailed rejection reasons."""
+
+    def test_action_log_captures_rejection_reasons(self):
+        """Enable multiple filters and verify that the Action Log identifies the correct culprits."""
+        # Use a scenario where breakout happens but ADX and ATR block it
+        strategy = make_strategy(**{
+            'Buy Lookback': 5, 'Sell Lookback': 5,
+            'Enable ADX Filter': 1,
+            'ADX Period': 3,
+            'Min ADX Threshold': 99.0,  # Impossible ADX
+            'Min ATR (Points)': 9999.0, # Impossible ATR
+        })
+        df, breakout_idx = make_breakout_scenario(lookback=5, warmup_extra=30)
+        breakout_time = df.index[breakout_idx] # Capture BEFORE dropping rows
+        
+        df = strategy.calculate_indicators(df)
+        df = strategy.apply_filters(df)
+        
+        long_sig, short_sig, action_log = strategy.calculate_entry_signals(df, verbose=True)
+        
+        assert len(long_sig) == len(df)
+        assert long_sig.sum() == 0, "Signals should be blocked by filters"
+        
+        # Find the breakout bar in the action log
+        breakout_entry = next((e for e in action_log if e['timestamp'] == breakout_time), None)
+        
+        assert breakout_entry is not None, f"Breakout @ {breakout_time} should be recorded in Action Log"
+        assert breakout_entry['type'] == 'Breakout Rejected'
+        assert any("ADX" in r for r in breakout_entry['reasons']), f"Should list ADX as a reason: {breakout_entry['reasons']}"
+        assert any("ATR" in r for r in breakout_entry['reasons']), f"Should list ATR as a reason: {breakout_entry['reasons']}"
+
+    def test_action_log_records_signal_triggered(self):
+        """Verify that successful signals are also recorded in the Action Log."""
+        strategy = make_strategy(**{
+            'Buy Lookback': 5, 'Sell Lookback': 5,
+            'Min ATR (Points)': 0.0, # Pass
+        })
+        df, breakout_idx = make_breakout_scenario(lookback=5, warmup_extra=30)
+        breakout_time = df.index[breakout_idx] # Capture BEFORE dropping rows
+        
+        df = strategy.calculate_indicators(df)
+        df = strategy.apply_filters(df)
+        
+        long_sig, short_sig, action_log = strategy.calculate_entry_signals(df, verbose=True)
+        
+        assert long_sig.sum() >= 1
+        
+        breakout_entry = next((e for e in action_log if e['timestamp'] == breakout_time), None)
+        
+        assert breakout_entry is not None
+        assert breakout_entry['type'] == 'Signal Triggered'
+        assert len(breakout_entry['reasons']) == 0
