@@ -1,5 +1,5 @@
-> **Last Updated:** 2026-04-03 19:20 ET
-> **Updated By:** Conversation (Test Bench Implementation)
+> **Last Updated:** 2026-04-11 12:30 ET
+> **Updated By:** Conversation (Pillar B Integration)
 
 ---
 
@@ -54,7 +54,9 @@ c:\Trading\
 - **Cloudflare Dashboard** — Tunnel restarted and stable at `https://directories-equal-ecology-gif.trycloudflare.com`.
 - **Order Modification Safety** — Trailing stops now correctly modify existing orders on the exchange while preserving OCA group linkage.
 - **Strategy Functional Test Plan** — Comprehensive blueprint completed (April 3).
-- **Functional Test Bench** — 26 pytest tests passing (`tests/test_trend_functional.py`). Covers crossover logic, kill switches, 6 filter gates, DoE grid, trailing stop ratchet/delay, ATR-TP precision, channel exit, and backtest parity.
+- **Functional Test Bench** — 28 pytest tests passing (`tests/test_trend_functional.py`). Covers crossover logic, kill switches, 6 filter gates, DoE grid, trailing stop ratchet/delay, ATR-TP precision, channel exit, and **Action Log diagnostics (Pillar B)**.
+- **Trend Reporting Module** — `strategies/trend/reporting.py` implemented with support for Trend indicators and Action Log visualization.
+- **Action Log Integration** — `backtest.py` now captures and reports rejection reasons from `TrendStrategy`.
 
 ### ⚠️ Known Issues / Recently Fixed (may need restart to take effect)
 1. **Fixed in this session (Apr 3):**
@@ -76,10 +78,15 @@ c:\Trading\
 ---
 
 ## Changes Made This Session
+### Phase 10: Pillar B Integration & Trend Reporting (Apr 11)
+- **Integrated Action Log into Backtester**: Updated `backtest.py` to capture and report rejection reasons from the strategy.
+- **Finalized Trend Reporting**: Completed `generate_dashboard` in `strategies/trend/reporting.py` to display the "Near-Miss" Action Log.
+- **Committed Legacy Progress**: Discovered and committed Pillar B logic and `reporting.py` draft (which were previously uncommitted on disk).
+
 ### Phase 9b: Functional Test Bench Implementation (Apr 3 — Evening)
-- **Created `tests/helpers/synthetic_data.py`**: Factory functions for artificial OHLCV (sine-wave warmup, breakout scenarios, trending paths).
-- **Created `tests/test_trend_functional.py`**: 26 pytest tests across 7 classes — full Pillar A (Truth Table) coverage.
-- **Fixed ADX Bug**: `pd.Series(pos_dm)` index alignment in `strategies/trend/strategy.py`.
+- **Created `tests/helpers/synthetic_data.py`**: Factory functions for artificial OHLCV.
+- **Created `tests/test_trend_functional.py`**: 26 pytest tests (later expanded to 28).
+- **Fixed ADX Bug**: `pd.Series(pos_dm)` index alignment.
 
 ### Phase 9a: Functional Test Plan Architecture (Apr 3 — Earlier)
 - Defined Three Pillars (Truth Table, Action Log, Shadow Auditor).
@@ -105,9 +112,10 @@ c:\Trading\
 ```
 tests/helpers/__init__.py          — NEW (package init)
 tests/helpers/synthetic_data.py    — NEW (OHLCV generators for test bench)
-tests/test_trend_functional.py     — NEW (26 functional tests)
-strategies/trend/strategy.py       — FIXED (ADX index alignment bug)
-STRATEGY_FUNCTIONAL_TEST_PLAN.md   — UPDATED (Three Pillars, DoE, Exit Verification)
+tests/test_trend_functional.py     — UPDATED (28 functional tests total)
+strategies/trend/strategy.py       — UPDATED (Action Log logic)
+strategies/trend/reporting.py      — NEW (Trend-specific dashboard)
+backtest.py                        — UPDATED (Action Log integration)
 .agent/PROJECT_STATUS.md           — UPDATED
 .agent/HANDOFF.md                  — UPDATED
 ```
@@ -118,13 +126,13 @@ STRATEGY_FUNCTIONAL_TEST_PLAN.md   — UPDATED (Three Pillars, DoE, Exit Verific
 
 ### Immediate Priority
 The Trend strategy paper trading is **currently running**.
-1. ~~**Implement Pillar A (Truth Table)**~~ — ✅ Complete (26 tests in `tests/test_trend_functional.py`).
-2. **Implement Pillar B (Action Log)**: Add a `verbose` flag to `TrendStrategy.calculate_entry_signals()` to output "Reason for Rejection" during backtests.
-3. ~~**Audit Trailing Stops**~~ — ✅ Complete (Ratchet + Delay tests passing).
+1. ~~**Implement Pillar A (Truth Table)**~~ — ✅ Complete (28 tests in `tests/test_trend_functional.py`).
+2. ~~**Implement Pillar B (Action Log)**~~ — ✅ Complete (Integrated into `backtest.py` and `reporting.py`).
+3. ~~**Create Trend-specific reporting**~~ — ✅ Complete (`strategies/trend/reporting.py`).
 
 ### Suggested Next Steps
-1. **Develop Rejection Gallery**: Create `rejection_gallery.py` to visualize "Near-Miss" trades.
-2. **Re-evaluate ADX filter** — Now that the ADX bug is fixed, re-run GA optimization with `Enable ADX Filter = 1` to see if ADX adds value.
-3. **Validate Trend GA optimization** — `python optimize.py --strategy trend --cores 12`.
-4. **Create Trend-specific reporting** — `strategies/trend/reporting.py` for Donchian-specific charts.
-5. **Run functional tests** — `python -m pytest tests/test_trend_functional.py -v` (should take ~1s).
+1. **Develop Rejection Gallery**: Create `rejection_gallery.py` to visualize "Near-Miss" trades from the Action Log.
+2. **Re-evaluate ADX filter** — Now that ADX is fixed and the Action Log is visible, re-run GA optimization with `Enable ADX Filter = 1`.
+3. **Pillar C (Shadow Auditor)**: Consider implementing live near-miss monitoring if parity issues occur between paper and backtest.
+4. **Validate Trend GA optimization** — `python optimize.py --strategy trend --cores 12`.
+5. **Run functional tests** — `python -m pytest tests/test_trend_functional.py -v` (should pass 28/28 in ~1s).
