@@ -252,7 +252,7 @@ def generate_trade_plot(trade, df, output_dir, version, sol_name=None, parent_fi
         print(f"Error generating plot for trade: {e}")
         return None
 
-def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_browser=True, filename=None):
+def generate_dashboard(solutions_data, output_dir=None, version='4.1', open_browser=True, filename=None):
     """
     Generate Unified HTML Dashboard for Trend Strategy.
     """
@@ -267,11 +267,110 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
         if 'stats' not in sol or not sol['stats']:
             sol['stats'] = calculate_stats(sol['trades_df'], sol['equity_curve'])
 
-    # Dashboard logic remains very similar to Bollinger, but with Trend-themed colors
-    # I'll truncate the HTML generation here for brevity as it's nearly identical except for branding
-    # Instead of full re-implementation, I'll copy the core structure and update labels.
+    # 1. HTML Header
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Trend Strategy V{version} Dashboard</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin:0; background:#f4f4f9; color:#333; }}
+            .container {{ max-width: 1400px; margin: 20px auto; background:white; padding:30px; border-radius:12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }}
+            h1 {{ color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom:10px; }}
+            .metrics-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom: 25px; }}
+            .metric-box {{ background: #f8f9fa; padding:15px; border-radius:8px; text-align:center; border: 1px solid #e9ecef; }}
+            .metric-val {{ font-size: 24px; font-weight:bold; color:#2c3e50; }}
+            .metric-label {{ font-size: 12px; color:#6c757d; text-transform: uppercase; }}
+            table {{ width:100%; border-collapse:collapse; margin-top:15px; }}
+            th, td {{ padding:12px; text-align:left; border-bottom:1px solid #eee; }}
+            th {{ background:#f8f9fa; font-size:12px; }}
+            .positive {{ color: #27ae60; }}
+            .negative {{ color: #c0392b; }}
+            .chart-container {{ margin: 20px 0; border: 1px solid #eee; border-radius:8px; }}
+            .action-log-container {{ margin-top: 30px; background: #fff5f5; padding: 20px; border-radius: 8px; border: 1px solid #feb2b2; }}
+            .reason-tag {{ display: inline-block; background: #fed7d7; color: #9b2c2c; padding: 2px 6px; border-radius: 4px; margin: 2px; font-size: 11px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Trend Strategy V{version} Dashboard</h1>
+    """
+
+    # 2. Metrics Grid
+    html_content += '<div class="metrics-grid">'
+    for sol in solutions_data:
+        s = sol['stats']
+        html_content += f"""
+            <div class="metric-box">
+                <div class="metric-label">{sol['name']} PnL</div>
+                <div class="metric-val {'positive' if s['Total PnL']>0 else 'negative'}">${s['Total PnL']:,.0f}</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-label">Win Rate</div>
+                <div class="metric-val">{s['Win Rate']:.1f}%</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-label">Profit Factor</div>
+                <div class="metric-val">{s['Profit Factor']:.2f}</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-label">Max DD</div>
+                <div class="metric-val negative">${s['Max Drawdown']:,.0f}</div>
+            </div>
+        """
+    html_content += '</div>'
+
+    # 3. Equity Curve
+    fig = go.Figure()
+    for sol in solutions_data:
+        eq = sol['equity_curve']
+        if not eq.empty:
+            fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name=sol['name']))
+    fig.update_layout(title="Equity Curve", height=500, template='plotly_white')
+    html_content += f'<div class="chart-container">{fig.to_html(full_html=False, include_plotlyjs="cdn")}</div>'
+
+    # 4. Action Log (Pillar B)
+    if any(sol.get('action_log') for sol in solutions_data):
+        html_content += '<div class="action-log-container"><h2>Pillar B: Action Log (Rejection Diagnostics)</h2>'
+        for sol in solutions_data:
+            log = sol.get('action_log', [])
+            if log:
+                html_content += f"<h3>{sol['name']} Near-Misses</h3>"
+                html_content += "<table><tr><th>Timestamp</th><th>Direction</th><th>Rejection Reasons</th></tr>"
+                # Show last 20 rejections
+                for entry in log[-20:]:
+                    reasons_html = "".join(f'<span class="reason-tag">{r}</span>' for r in entry['reasons'])
+                    html_content += f"<tr><td>{entry['timestamp']}</td><td>{entry['direction']}</td><td>{reasons_html}</td></tr>"
+                html_content += "</table>"
+        html_content += '</div>'
+
+    # 5. Trades List
+    html_content += "<h2>Recent Trades</h2><table><tr><th>Time</th><th>Price</th><th>Side</th><th>PnL</th><th>Reason</th><th>Chart</th></tr>"
+    for sol in solutions_data:
+        tdf = sol['trades_df']
+        for t in tdf.tail(20).itertuples():
+            plot_file = generate_trade_plot(t, sol.get('df'), output_dir, version, sol_name=sol['name'], parent_filename=filename)
+            chart_btn = f'<a href="{plot_file}" target="_blank">View</a>' if plot_file else ""
+            html_content += f"""
+                <tr>
+                    <td>{t.exit_time}</td>
+                    <td>{t.exit_price:.2f}</td>
+                    <td>{'LONG' if t.direction==1 else 'SHORT'}</td>
+                    <td class="{'positive' if t.pnl_currency>0 else 'negative'}">${t.pnl_currency:,.0f}</td>
+                    <td>{t.reason}</td>
+                    <td>{chart_btn}</td>
+                </tr>
+            """
+    html_content += "</table></div></body></html>"
+
+    if filename is None:
+        filename = f'trend_dashboard_v{version}.html'
+    path = os.path.join(output_dir, filename)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
     
-    # ... (HTML generation logic same as bollinger/reporting.py but with "Trend Strategy" labels)
-    # For now, let's just make sure the Trade Plotter is correct as that's the main visual difference.
-    
-    pass # To be completed by the system or kept same as Bollinger structure.
+    print(f"Dashboard saved to {path}")
+    if open_browser:
+        try: webbrowser.open(f'file://{os.path.abspath(path)}')
+        except: pass
+    return path

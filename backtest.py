@@ -101,7 +101,8 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
     
     result_package = {
         'total_pnl': 0.0, 'win_rate': 0.0, 'pf': 0.0, 'max_dd': 0.0, 'sortino': 0.0,
-        'trades_df': pd.DataFrame(), 'equity_curve': pd.Series(), 'df': None
+        'trades_df': pd.DataFrame(), 'equity_curve': pd.Series(), 'df': None,
+        'action_log': []
     }
     
     with open(log_file_path, 'w') as log_file:
@@ -172,7 +173,18 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
 
         # 4. Signals
         if not suppress_log: log("Generating signals...", log_file)
-        long_sigs, short_sigs = strategy.calculate_entry_signals(df)
+        
+        # Pillar B: Action Log Support
+        verbose = params_dict.get('verbose', False)
+        signals = strategy.calculate_entry_signals(df, verbose=verbose)
+        
+        if len(signals) == 3:
+            long_sigs, short_sigs, action_log = signals
+            result_package['action_log'] = action_log
+        else:
+            long_sigs, short_sigs = signals
+            result_package['action_log'] = []
+            
         df['entry_long_signal'] = long_sigs
         df['entry_short_signal'] = short_sigs
         
