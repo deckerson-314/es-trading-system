@@ -286,13 +286,14 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
                      pass
 
                  if has_reporting_module:
-                     solutions_data = [{
+                    solutions_data = [{
                          'name': strategy_name.capitalize(),
                          'stats': calculate_stats(result_package['trades_df'], result_package.get('equity_curve')),
                          'params': params_dict,
                          'trades_df': result_package['trades_df'],
                          'equity_curve': result_package.get('equity_curve', pd.Series(dtype=float)),
-                         'df': result_package.get('df')
+                         'df': result_package.get('df'),
+                         'action_log': result_package.get('action_log', [])
                      }]
                      generate_dashboard(solutions_data, output_dir=web_dir, version='5.0', 
                                        filename=dash_filename, open_browser=False)
@@ -395,7 +396,8 @@ def main():
                         'params': p,
                         'trades_df': res['trades_df'],
                         'equity_curve': res['equity_curve'],
-                        'df': res['df']
+                        'df': res['df'],
+                        'action_log': res.get('action_log', [])
                     })
                     
                     summary_results.append({
