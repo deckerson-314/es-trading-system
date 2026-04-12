@@ -130,8 +130,6 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
                 df.index = df.index.tz_convert('US/Eastern').tz_localize(None)
             else:
                 # Timestamps are already naive — assume they're Eastern.
-                # DO NOT force utc=True on naive timestamps, as this reinterprets them
-                # as UTC and shifts all data by 4-5 hours.
                 pass
 
             if start_date: df = df.loc[start_date:]
@@ -166,8 +164,6 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
         if not suppress_log: log("Calculating indicators...", log_file)
         df = strategy.calculate_indicators(df)
         
-        # Note: Strategy Base doesn't enforce apply_filters, but Bollinger has it.
-        # We can check if method exists or if it's integrated into entry_signals.
         if hasattr(strategy, 'apply_filters'):
              df = strategy.apply_filters(df)
 
@@ -199,10 +195,6 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
             transaction_cost = params_dict['Transaction Cost (Per Trade)']['value']
         else:
             transaction_cost = 15.0 # Standard default if missing from CSV
-        
-        # Optimized loop (similar to v5)
-        # Note: Ideally this simulation logic should be in core/engine.py or strategy.backtest()
-        # But keeping it here for continuity.
         
         pending_entry = None
         
@@ -269,23 +261,23 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
         
         # Generate Dashboard
         if not suppress_log:
-             try:
-                 web_dir = os.path.join(BASE_DIR, 'web')
-                 os.makedirs(web_dir, exist_ok=True)
-                 dash_filename = os.path.basename(dashboard_path) if dashboard_path else f"backtest_dashboard_{strategy_name}.html"
-                 
-                 # Dynamic import for reporting module
-                 has_reporting_module = False
-                 try:
-                     import importlib
-                     reporting_module = importlib.import_module(f"strategies.{strategy_name}.reporting")
-                     generate_dashboard = reporting_module.generate_dashboard
-                     calculate_stats = reporting_module.calculate_stats
-                     has_reporting_module = True
-                 except ImportError:
-                     pass
+            try:
+                web_dir = os.path.join(BASE_DIR, 'web')
+                os.makedirs(web_dir, exist_ok=True)
+                dash_filename = os.path.basename(dashboard_path) if dashboard_path else f"backtest_dashboard_{strategy_name}.html"
+                
+                # Dynamic import for reporting module
+                has_reporting_module = False
+                try:
+                    import importlib
+                    reporting_module = importlib.import_module(f"strategies.{strategy_name}.reporting")
+                    generate_dashboard = reporting_module.generate_dashboard
+                    calculate_stats = reporting_module.calculate_stats
+                    has_reporting_module = True
+                except ImportError:
+                    pass
 
-                 if has_reporting_module:
+                if has_reporting_module:
                     solutions_data = [{
                          'name': strategy_name.capitalize(),
                          'stats': calculate_stats(result_package['trades_df'], result_package.get('equity_curve')),
@@ -294,42 +286,42 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
                          'equity_curve': result_package.get('equity_curve', pd.Series(dtype=float)),
                          'df': result_package.get('df'),
                          'action_log': result_package.get('action_log', [])
-                     }]
-                     generate_dashboard(solutions_data, output_dir=web_dir, version='5.0', 
-                                       filename=dash_filename, open_browser=False)
-                     dash_path = os.path.join(web_dir, dash_filename)
-                     print(f"Backtest dashboard saved to {dash_path}")
-                 else:
-                     # Fallback: use live-style dashboard if reporting module unavailable
-                     state = DashboardState(
-                         mode="BACKTEST", port=0, contract_symbol=strategy_name,
-                         is_connected=False, params=params_dict,
-                         account_info={
-                             'NetLiquidation': 100000 + result_package['total_pnl'],
-                             'RealizedPNL': result_package['total_pnl'],
-                             'UnrealizedPNL': 0.0
-                         }
-                     )
-                     if not result_package['trades_df'].empty:
-                         for _, t in result_package['trades_df'].iterrows():
-                             exit_time_str = t['exit_time'].strftime('%Y-%m-%d %H:%M') if hasattr(t['exit_time'], 'strftime') else str(t['exit_time'])
-                             state.completed_trades.append({
-                                 'time': exit_time_str, 'side': 'LONG' if t['direction'] == 1 else 'SHORT',
-                                 'size': 1, 'price': t['exit_price'],
-                                 'commission': transaction_cost, 'realizedPNL': t['pnl_currency']
-                             })
-                     if 'df' in result_package and result_package['df'] is not None and not result_package['df'].empty:
-                         state.current_price = result_package['df'].iloc[-1]['close']
-                     state.live_tracker.append({'timestamp': datetime.now().strftime('%H:%M:%S'), 'type': 'INFO', 'message': 'Backtest Completed'})
-                     dash_path = dashboard_path if dashboard_path else os.path.join(web_dir, dash_filename)
-                     status_path = os.path.join(web_dir, f"backtest_status_{strategy_name}.json")
-                     update_dashboard(state, dash_path, status_path)
-                     print(f"Dashboard saved to {dash_path} (fallback mode)")
-             except Exception as e:
-                 print(f"Failed to generate dashboard: {e}")
-                 import traceback
-                 traceback.print_exc()
-             
+                    }]
+                    generate_dashboard(solutions_data, output_dir=web_dir, version='5.0', 
+                                      filename=dash_filename, open_browser=False)
+                    dash_path = os.path.join(web_dir, dash_filename)
+                    print(f"Backtest dashboard saved to {dash_path}")
+                else:
+                    # Fallback: use live-style dashboard if reporting module unavailable
+                    state = DashboardState(
+                        mode="BACKTEST", port=0, contract_symbol=strategy_name,
+                        is_connected=False, params=params_dict,
+                        account_info={
+                            'NetLiquidation': 100000 + result_package['total_pnl'],
+                            'RealizedPNL': result_package['total_pnl'],
+                            'UnrealizedPNL': 0.0
+                        }
+                    )
+                    if not result_package['trades_df'].empty:
+                        for _, t in result_package['trades_df'].iterrows():
+                            exit_time_str = t['exit_time'].strftime('%Y-%m-%d %H:%M') if hasattr(t['exit_time'], 'strftime') else str(t['exit_time'])
+                            state.completed_trades.append({
+                                'time': exit_time_str, 'side': 'LONG' if t['direction'] == 1 else 'SHORT',
+                                'size': 1, 'price': t['exit_price'],
+                                'commission': transaction_cost, 'realizedPNL': t['pnl_currency']
+                            })
+                    if 'df' in result_package and result_package['df'] is not None and not result_package['df'].empty:
+                        state.current_price = result_package['df'].iloc[-1]['close']
+                    state.live_tracker.append({'timestamp': datetime.now().strftime('%H:%M:%S'), 'type': 'INFO', 'message': 'Backtest Completed'})
+                    dash_path = dashboard_path if dashboard_path else os.path.join(web_dir, dash_filename)
+                    status_path = os.path.join(web_dir, f"backtest_status_{strategy_name}.json")
+                    update_dashboard(state, dash_path, status_path)
+                    print(f"Dashboard saved to {dash_path} (fallback mode)")
+            except Exception as e:
+                print(f"Failed to generate dashboard: {e}")
+                import traceback
+                traceback.print_exc()
+              
     return result_package
 
 def main():
@@ -349,11 +341,7 @@ def main():
     # 1. Parameter Loading Logic
     params_dict = {}
     
-    # 1. Parameter Loading Logic
-    params_dict = {}
-    
     # 1a. Handle GA File (Explicit or implicit via --params + --solutions)
-    # If --solutions is present, we assume --params points to a GA file if --ga-file is not set
     ga_file = args.ga_file
     if not ga_file and args.solutions and args.params:
         ga_file = args.params
@@ -384,7 +372,6 @@ def main():
             for idx in sol_list:
                 try:
                     p, name = load_ga_params(ga_file, idx)
-                    # DEBUG: Print a few key params to verify loading
                     print(f"  > Processing Sol {idx} with {len(p)} params... ", end='', flush=True)
                     
                     if args.verbose:
@@ -427,7 +414,6 @@ def main():
                 print(f"\n=== Summary Report: {summary_path} ===")
                 print(summary_df.to_string())
                 
-                # Restore Multi-Solution Dashboard Generation
                 print("\nGenerating Multi-Solution HTML Dashboard...")
                 try:
                      import importlib
@@ -466,15 +452,13 @@ def main():
     elif args.params:
         print(f"Loading parameters from {args.params}...")
         params_dict = load_params(args.params)
-        # Check if loaded anything
         if not params_dict:
              print("Warning: Loaded empty parameters. Is the CSV format correct? (Name, Value, Type)")
         else:
              print(f"Loaded {len(params_dict)} parameters.")
              
     else:
-        # Default fallback: strategies/<strategy_name>/parameters/backtest_params.csv
-        # This makes the default dynamic based on the strategy argument
+        # Default fallback
         default_params = os.path.join('strategies', args.strategy, 'parameters', 'backtest_params.csv')
         if os.path.exists(default_params):
              print(f"Using default parameters: {default_params}")
