@@ -357,11 +357,17 @@ class TrendStrategy(Strategy):
                         if 'adx' in row: reasons.append(f"ADX ({row['adx']:.1f} < {self.min_adx})")
                     if not masks['ATR'][loc]: 
                         if 'atr_filter' in row: reasons.append(f"ATR ({row['atr_filter']:.2f} < {self.min_atr_points})")
-                    if not masks['SMA_Long'][loc]: reasons.append("SMA Filter")
-                    if not masks['VOL'][loc]: reasons.append("Volume Filter")
+                    if not masks['SMA_Long'][loc]: 
+                        if 'sma_regime' in row: reasons.append(f"SMA ({row['close']:.1f} < {row['sma_regime']:.1f})")
+                        else: reasons.append("SMA Filter")
+                    if not masks['VOL'][loc]: 
+                        if 'vol_ma' in row: reasons.append(f"Vol ({row['volume']:.0f} < {row['vol_ma']*self.min_vol_mult:.0f})")
+                        else: reasons.append("Volume Filter")
                     if not masks['RSI_Long'][loc]: 
                         if 'rsi' in row: reasons.append(f"RSI ({row['rsi']:.1f} > {self.rsi_max_buy})")
-                    if not masks['VWAP_Long'][loc]: reasons.append("VWAP Filter")
+                    if not masks['VWAP_Long'][loc]: 
+                        if 'vwap' in row: reasons.append(f"VWAP ({row['close']:.1f} < {row['vwap']:.1f})")
+                        else: reasons.append("VWAP Filter")
                     
                     if reasons:
                         action_log.append({
@@ -391,11 +397,17 @@ class TrendStrategy(Strategy):
                         if 'adx' in row: reasons.append(f"ADX ({row['adx']:.1f} < {self.min_adx})")
                     if not masks['ATR'][loc]: 
                         if 'atr_filter' in row: reasons.append(f"ATR ({row['atr_filter']:.2f} < {self.min_atr_points})")
-                    if not masks['SMA_Short'][loc]: reasons.append("SMA Filter")
-                    if not masks['VOL'][loc]: reasons.append("Volume Filter")
+                    if not masks['SMA_Short'][loc]: 
+                        if 'sma_regime' in row: reasons.append(f"SMA ({row['close']:.1f} > {row['sma_regime']:.1f})")
+                        else: reasons.append("SMA Filter")
+                    if not masks['VOL'][loc]: 
+                        if 'vol_ma' in row: reasons.append(f"Vol ({row['volume']:.0f} < {row['vol_ma']*self.min_vol_mult:.0f})")
+                        else: reasons.append("Volume Filter")
                     if not masks['RSI_Short'][loc]: 
                         if 'rsi' in row: reasons.append(f"RSI ({row['rsi']:.1f} < {self.rsi_min_sell})")
-                    if not masks['VWAP_Short'][loc]: reasons.append("VWAP Filter")
+                    if not masks['VWAP_Short'][loc]: 
+                        if 'vwap' in row: reasons.append(f"VWAP ({row['close']:.1f} > {row['vwap']:.1f})")
+                        else: reasons.append("VWAP Filter")
                     
                     if reasons:
                         action_log.append({

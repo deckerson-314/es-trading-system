@@ -252,6 +252,92 @@ def generate_trade_plot(trade, df, output_dir, version, sol_name=None, parent_fi
         print(f"Error generating plot for trade: {e}")
         return None
 
+def generate_near_miss_plot(near_miss_idx, df, output_dir, version, sol_name=None, parent_filename=None):
+    """
+    Generate a plot for a rejected breakout (Near-Miss).
+    """
+    try:
+        if df is None or df.empty: return None
+        
+        # Ensure timestamp
+        target_time = pd.to_datetime(near_miss_idx)
+        
+        # Center the plot around the rejection
+        loc = df.index.get_indexer([target_time], method='nearest')[0]
+        start_idx = max(0, loc - 30)
+        end_idx = min(len(df), loc + 20)
+        segment = df.iloc[start_idx:end_idx].copy()
+        
+        # Filename
+        time_slug = target_time.strftime('%Y%m%d_%H%M%S')
+        filename = f"near_miss_{time_slug}_{sol_name}.html"
+        filepath = os.path.join(output_dir, filename)
+        
+        if os.path.exists(filepath): return filename
+        
+        # Create plot
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                             vertical_spacing=0.05, row_heights=[0.6, 0.2, 0.2])
+        
+        # Candlestick
+        fig.add_trace(go.Candlestick(
+            x=segment.index, open=segment['open'], high=segment['high'], 
+            low=segment['low'], close=segment['close'], name='Price'
+        ), row=1, col=1)
+        
+        # Technicals
+        if 'donchian_high' in segment.columns:
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_high'], line=dict(color='blue', dash='dash'), name='D-High'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_low'], line=dict(color='blue', dash='dash'), name='D-Low'), row=1, col=1)
+        
+        if 'sma_regime' in segment.columns:
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['sma_regime'], line=dict(color='orange'), name='SMA'), row=1, col=1)
+            
+        # Rejection Marker
+        fig.add_vline(x=target_time, line_dash="dash", line_color="red", annotation_text="Breakout Rejected", row=1, col=1)
+        
+        # Indicators
+        if 'rsi' in segment.columns:
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['rsi'], name='RSI', line=dict(color='purple')), row=2, col=1)
+            fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
+            
+        if 'adx' in segment.columns:
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['adx'], name='ADX', line=dict(color='brown')), row=3, col=1)
+            
+        # Layout
+        title = f"Near-Miss Audit: {target_time} ({sol_name})"
+        fig.update_layout(title=title, height=800, template='plotly_white', hovermode='x unified')
+        
+        plotly_div = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        back_link = parent_filename if parent_filename else "trend_dashboard_v4.1.html"
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>{title}</title>
+            <style>
+                body {{ font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; margin:0; background:#f8fafc; padding:20px; }}
+                .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+                .back-home {{ display: inline-block; margin-bottom: 20px; padding: 8px 16px; background: #34495e; color: white; text-decoration: none; border-radius: 6px; font-size:14px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <a href="{back_link}" class="back-home">&larr; Back to Dashboard</a>
+                {plotly_div}
+            </div>
+        </body>
+        </html>
+        """
+        with open(filepath, "w", encoding='utf-8') as f:
+            f.write(html)
+        return filename
+    except Exception as e:
+        print(f"Error generating near-miss plot: {e}")
+        return None
+
 def generate_dashboard(solutions_data, output_dir=None, version='4.1', open_browser=True, filename=None):
     """
     Generate Unified HTML Dashboard for Trend Strategy.
@@ -335,16 +421,47 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.1', open_brow
         for sol in solutions_data:
             log = sol.get('action_log', [])
             if log:
-                html_content += f"<h3>{sol['name']} Near-Misses</h3>"
-                html_content += "<table><tr><th>Timestamp</th><th>Direction</th><th>Rejection Reasons</th></tr>"
-                # Show last 20 rejections
+                html_content += f"<h3>{sol['name']} Recent Actions/Rejections</h3>"
+                html_content += "<table><tr><th>Timestamp</th><th>Direction</th><th>Rejection Reasons</th><th>Audit</th></tr>"
+                # Show last 20 actions
                 for entry in log[-20:]:
                     reasons_html = "".join(f'<span class="reason-tag">{r}</span>' for r in entry['reasons'])
-                    html_content += f"<tr><td>{entry['timestamp']}</td><td>{entry['direction']}</td><td>{reasons_html}</td></tr>"
+                    
+                    # Generate plot link if it's a rejection
+                    audit_link = ""
+                    if entry.get('type') == 'Breakout Rejected':
+                        plot_file = generate_near_miss_plot(entry['timestamp'], sol.get('df'), output_dir, version, sol_name=sol['name'], parent_filename=filename)
+                        if plot_file:
+                             audit_link = f'<a href="{plot_file}" target="_blank">View Chart</a>'
+                    
+                    html_content += f"<tr><td>{entry['timestamp']}</td><td>{entry['direction']}</td><td>{reasons_html}</td><td>{audit_link}</td></tr>"
                 html_content += "</table>"
         html_content += '</div>'
 
-    # 5. Trades List
+    # 5. Rejection Gallery (Pillar B Phase 2)
+    html_content += "<h2>Rejection Gallery (Featured Near-Misses)</h2><div class='trade-list'>"
+    for sol in solutions_data:
+        log = sol.get('action_log', [])
+        # Find just rejections
+        rejections = [e for e in log if e.get('type') == 'Breakout Rejected']
+        # Take last 10, but spread them out if possible? No, last 10 is fine for audit.
+        sample = rejections[-10:]
+        
+        for e in sample:
+            plot_file = generate_near_miss_plot(e['timestamp'], sol.get('df'), output_dir, version, sol_name=sol['name'], parent_filename=filename)
+            reasons_fmt = ", ".join(e['reasons'])
+            html_content += f"""
+            <div class="trade-card" style="border-left: 5px solid #e53e3e">
+                <span class="sol-tag">{sol['name']}</span>
+                <h3 style="color:#e53e3e">Near Miss</h3>
+                <p style="margin: 5px 0; color: #666; font-size: 13px;">{e['timestamp']}</p>
+                <p style="margin: 5px 0; font-size: 13px;"><strong>Reasons:</strong> {reasons_fmt}</p>
+                <a href="{plot_file}" target="_blank" class="btn" style="background:#e53e3e">Audit Chart</a>
+            </div>
+            """
+    html_content += "</div>"
+
+    # 6. Trades List (Shifted to 6)
     html_content += "<h2>Recent Trades</h2><table><tr><th>Time</th><th>Price</th><th>Side</th><th>PnL</th><th>Reason</th><th>Chart</th></tr>"
     for sol in solutions_data:
         tdf = sol['trades_df']
