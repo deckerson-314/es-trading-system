@@ -516,10 +516,53 @@ class TrendStrategy(Strategy):
         if position['direction'] == 1:
             # Ratchet logic
             new_stop = high - (atr * self.atr_mult_ts) # Standard Chandelier Exit uses High
-            # Or use close? High is safer for profit locking.
             if new_stop > position['stop']:
                 position['stop'] = new_stop
         else:
              new_stop = low + (atr * self.atr_mult_ts)
              if new_stop < position['stop']:
                  position['stop'] = new_stop
+
+    def get_indicator_status(self, row: pd.Series) -> dict:
+        """
+        Return a dictionary of the current indicator values vs thresholds for the live dashboard.
+        """
+        status = {}
+        
+        # Trend / Filter Indicators
+        if 'adx' in row:
+            status['ADX'] = {'value': float(row['adx']), 'threshold': float(self.min_adx), 'pass': bool(row['adx'] >= self.min_adx)}
+        
+        if 'rsi' in row:
+            status['RSI'] = {
+                'value': float(row['rsi']), 
+                'buy_threshold': float(self.rsi_max_buy),
+                'sell_threshold': float(self.rsi_min_sell),
+                'pass_long': bool(row['rsi'] <= self.rsi_max_buy),
+                'pass_short': bool(row['rsi'] >= self.rsi_min_sell)
+            }
+            
+        if 'volume' in row and 'vol_ma' in row:
+            vol_target = float(row['vol_ma'] * self.min_vol_mult)
+            status['Volume'] = {'value': float(row['volume']), 'threshold': vol_target, 'pass': bool(row['volume'] >= vol_target)}
+            
+        if 'close' in row and 'sma_regime' in row:
+            status['SMA'] = {
+                'price': float(row['close']), 
+                'sma': float(row['sma_regime']), 
+                'pass_long': bool(row['close'] >= row['sma_regime']),
+                'pass_short': bool(row['close'] <= row['sma_regime'])
+            }
+            
+        if 'close' in row and 'vwap' in row:
+            status['VWAP'] = {
+                'price': float(row['close']), 
+                'vwap': float(row['vwap']), 
+                'pass_long': bool(row['close'] >= row['vwap']),
+                'pass_short': bool(row['close'] <= row['vwap'])
+            }
+            
+        if 'atr_filter' in row:
+            status['ATR'] = {'value': float(row['atr_filter']), 'threshold': float(self.min_atr_points), 'pass': bool(row['atr_filter'] >= self.min_atr_points)}
+            
+        return status

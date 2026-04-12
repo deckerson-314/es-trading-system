@@ -91,8 +91,49 @@ def save_live_data_row(output_dir, timestamp, row, full_df):
     except Exception as e:
         logging.error(f"Failed to save live data row: {e}")
 
+def save_shadow_audit(output_dir, timestamp, action_log):
+    """Save rejection events to daily shadow_audit_YYYYMMDD.json."""
+    if not action_log:
+        return
+        
+    try:
+        # Only log 'Breakout Rejected' types for the auditor
+        rejections = [entry for entry in action_log if entry.get('type') == 'Breakout Rejected']
+        if not rejections:
+            return
+            
+        date_str = timestamp.strftime('%Y%m%d') if hasattr(timestamp, 'strftime') else datetime.now().strftime('%Y%m%d')
+        audit_path = os.path.join(output_dir, f'shadow_audit_{date_str}.json')
+        
+        # Load existing audit log
+        audit_data = []
+        if os.path.exists(audit_path):
+            try:
+                with open(audit_path, 'r') as f:
+                    audit_data = json.load(f)
+            except:
+                pass
+        
+        # Add new rejections (avoiding duplicates if possible)
+        for rej in rejections:
+            # Convert timestamp to string if needed
+            if hasattr(rej['timestamp'], 'strftime'):
+                rej['timestamp'] = rej['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Simple deduplication: don't add if timestamp+direction already exists
+            exists = any(item['timestamp'] == rej['timestamp'] and item['direction'] == rej['direction'] for item in audit_data)
+            if not exists:
+                audit_data.append(rej)
+        
+        # Save back
+        with open(audit_path, 'w') as f:
+            json.dump(audit_data, f, indent=2)
+            
+    except Exception as e:
+        logging.error(f"Failed to save shadow audit: {e}")
 
-def log_entry_criteria_status(strategy, positions, resampled_row, data_with_filters):
+
+def log_entry_criteria_status(strategy, positions, resampled_row, data_with_filters, output_dir=None):
     """Log entry criteria status with emoji indicators for each filter.
     Strategy-agnostic: uses strategy.check_entry() if available, otherwise basic filter checks.
     """
@@ -108,62 +149,127 @@ def log_entry_criteria_status(strategy, positions, resampled_row, data_with_filt
 
         enter_long = enter_short = False
         long_reason = short_reason = ""
+        action_log = None
 
-        if max_ok and in_rth and atr_filter and vol_filter and not in_maint:
-            # Use strategy's check_entry if available (Bollinger), otherwise check_entry_signals
+        # 1. Strategy-Agnostic Global Filters (Positions, Maintenance, RTH)
+        if not max_ok:
+            long_reason = short_reason = f"Max trades ({len(positions)}/{strategy.max_open_trades})"
+        elif in_maint:
+            long_reason = short_reason = "Maintenance Filter"
+        elif not in_rth:
+            long_reason = short_reason = "Outside RTH"
+        else:
+            # 2. Strategy Signal and Filter Check
             if hasattr(strategy, 'check_entry'):
                 triggered, direction, _ = strategy.check_entry(resampled_row, data_with_filters)
                 enter_long = triggered and direction == 'Long'
                 enter_short = triggered and direction == 'Short'
+                long_reason = "Signal triggered" if enter_long else "No entry"
+                short_reason = "Signal triggered" if enter_short else "No entry"
+                
             elif hasattr(strategy, 'calculate_entry_signals') and data_with_filters is not None:
                 try:
-                    long_sig, short_sig = strategy.calculate_entry_signals(data_with_filters)
+                    # Request Action Log (verbose=True)
+                    sigs = strategy.calculate_entry_signals(data_with_filters, verbose=True)
+                    
+                    if len(sigs) == 3:
+                        long_sig, short_sig, action_log = sigs
+                    else:
+                        long_sig, short_sig = sigs
+                    
                     idx = resampled_row.name if hasattr(resampled_row, 'name') else None
                     if idx is not None and idx in data_with_filters.index:
                         loc = data_with_filters.index.get_loc(idx)
                         enter_long = bool(long_sig.iloc[loc]) if loc < len(long_sig) else False
                         enter_short = bool(short_sig.iloc[loc]) if loc < len(short_sig) else False
-                except Exception:
-                    pass
+                        
+                        # Extract rejection reasons from Action Log for this specific bar
+                        if action_log:
+                            bar_logs = [entry for entry in action_log if entry['timestamp'] == idx]
+                            long_info = next((l for l in bar_logs if l['direction'] == 'LONG'), None)
+                            short_info = next((l for l in bar_logs if l['direction'] == 'SHORT'), None)
+                            
+                            if long_info:
+                                long_reason = " | ".join(long_info['reasons']) if long_info['reasons'] else "Signal triggered"
+                            else:
+                                long_reason = "No breakout"
+                                
+                            if short_info:
+                                short_reason = " | ".join(short_info['reasons']) if short_info['reasons'] else "Signal triggered"
+                            else:
+                                short_reason = "No breakout"
+                        else:
+                            long_reason = "Signal triggered" if enter_long else "No entry"
+                            short_reason = "Signal triggered" if enter_short else "No entry"
+                            
+                except Exception as e:
+                    logging.debug(f"Error checking strategy signals: {e}")
+                    long_reason = short_reason = "Error"
 
-            if getattr(strategy, 'enable_long', True):
-                long_reason = "Signal triggered" if enter_long else "No entry"
-            else:
-                long_reason = "Disabled"
-            if getattr(strategy, 'enable_short', True):
-                short_reason = "Signal triggered" if enter_short else "No entry"
-            else:
-                short_reason = "Disabled"
+            # Check ATR and Volume failure if not already covered by strategy core
+            if not enter_long and long_reason == "Signal triggered": # Logic error safety
+                long_reason = "No signal"
+            if not enter_short and short_reason == "Signal triggered":
+                short_reason = "No signal"
+                
+            # If strategy didn't report ATR/Vol failure but they failed globally:
+            if not (long_reason or short_reason):
+                if not atr_filter: long_reason = short_reason = "ATR filter failed"
+                elif not vol_filter: long_reason = short_reason = f"Vol filter (vol={volume:,.0f})"
+
+        # 3. Build detailed parts using numerical values if available
+        parts = []
+        
+        # Get numerical status from strategy if supports it
+        num_status = {}
+        if hasattr(strategy, 'get_indicator_status'):
+            num_status = strategy.get_indicator_status(resampled_row)
+            
+        # Global Filters
+        parts.append(f"MaxTr: {'✅' if max_ok else '❌'}")
+        parts.append(f"RTH: {'✅' if in_rth else '❌'}")
+        parts.append(f"Maint: {'✅' if not in_maint else '❌'}")
+        
+        # Numerical Filter Details
+        if num_status:
+            # Target columns for display
+            if 'ADX' in num_status:
+                s = num_status['ADX']
+                parts.append(f"ADX: {'✅' if s['pass'] else '❌'} ({s['value']:.1f}/{s['threshold']:.1f})")
+            
+            if 'Volume' in num_status:
+                s = num_status['Volume']
+                # Compact volume display (k)
+                parts.append(f"Vol: {'✅' if s['pass'] else '❌'} ({s['value']/1000:.1f}k/{s['threshold']/1000:.1f}k)")
+                
+            if 'RSI' in num_status:
+                s = num_status['RSI']
+                val = s['value']
+                target = s['buy_threshold'] if not enter_short else s['sell_threshold']
+                icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
+                parts.append(f"RSI: {icon} ({val:.1f})")
+
+            if 'VWAP' in num_status:
+                s = num_status['VWAP']
+                icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
+                parts.append(f"VWAP: {icon}")
+
         else:
-            if not max_ok: long_reason = short_reason = f"Max trades ({len(positions)}/{strategy.max_open_trades})"
-            elif not in_rth: long_reason = short_reason = "Outside RTH"
-            elif not atr_filter: long_reason = short_reason = "ATR filter failed"
-            elif not vol_filter: long_reason = short_reason = f"Vol filter (vol={volume:,.0f})"
-            elif in_maint: long_reason = short_reason = "Maintenance"
+            # Fallback to simple emojis if no numerical status available
+            parts.append(f"ATR: {'✅' if atr_filter else '❌'}")
+            parts.append(f"Vol: {'✅' if vol_filter else '❌'}")
 
-        parts = [
-            f"MaxTr: {'✅' if max_ok else '❌'}",
-            f"RTH: {'✅' if in_rth else '❌'}",
-            f"ATR: {'✅' if atr_filter else '❌'}",
-            f"Vol: {'✅' if vol_filter else '❌'}",
-            f"Maint: {'✅' if not in_maint else '❌'}",
-            f"Long: {'✅' if enter_long else '❌'} ({long_reason})",
-            f"Short: {'✅' if enter_short else '❌'} ({short_reason})"
-        ]
-
-        # Strategy-specific price info
-        upper_bb = resampled_row.get('upper', 0)
-        lower_bb = resampled_row.get('lower', 0)
-        if upper_bb > 0 and lower_bb > 0:
-            parts.append(f"BB: L={lower_bb:.2f} | P={price:.2f} | U={upper_bb:.2f}")
-
-        donchian_h = resampled_row.get('donchian_high', 0)
-        donchian_l = resampled_row.get('donchian_low', 0)
-        if donchian_h > 0 and donchian_l > 0:
-            parts.append(f"DC: L={donchian_l:.2f} | P={price:.2f} | H={donchian_h:.2f}")
+        # Final Signal Status
+        parts.append(f"Long: {'✅' if enter_long else '❌'} ({long_reason})")
+        parts.append(f"Short: {'✅' if enter_short else '❌'} ({short_reason})")
 
         criteria_str = ' | '.join(parts)
         logging.info(f"  Entry Criteria: {criteria_str}")
+        
+        # 4. Save to Shadow Auditor if breakouts were rejected
+        if action_log and output_dir:
+            save_shadow_audit(output_dir, resampled_row.name, action_log)
+
         return criteria_str
     except Exception as e:
         logging.debug(f"Error logging entry criteria: {e}")
@@ -264,7 +370,7 @@ def on_bar_update_handler(bars, hasNewBar, *, strategy, ib, contract, data_ref,
                 # Entry criteria logging and signal checks (strategy-agnostic)
                 entry_criteria = ""
                 if _indicators_ready(data):
-                    entry_criteria = log_entry_criteria_status(strategy, positions, filt_row, data_filt)
+                    entry_criteria = log_entry_criteria_status(strategy, positions, filt_row, data_filt, output_dir=output_dir)
                     save_live_data_row(output_dir, completed_idx, filt_row, data_filt)
                     check_entries(strategy, ib, contract, data, positions, {},
                                  live_tracker, dashboard_state, send_email_fn, completed_idx, filt_row)
