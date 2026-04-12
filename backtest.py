@@ -341,6 +341,7 @@ def main():
     parser.add_argument('--start', type=str)
     parser.add_argument('--end', type=str)
     parser.add_argument('--dashboard', type=str, help='Path for output dashboard HTML')
+    parser.add_argument('--verbose', action='store_true', help='Enable Pillar B diagnostics (Action Log)')
     
     args = parser.parse_args()
     
@@ -385,6 +386,9 @@ def main():
                     # DEBUG: Print a few key params to verify loading
                     print(f"  > Processing Sol {idx} with {len(p)} params... ", end='', flush=True)
                     
+                    if args.verbose:
+                        p['verbose'] = True
+                        
                     res = run_backtest(args.strategy, args.data, p, suppress_log=True, start_date=args.start, end_date=args.end)
                     solutions_data.append({
                         'name': f"Sol {idx}",
@@ -477,6 +481,9 @@ def main():
              print(f"Warning: No parameters provided and default not found at {default_params}. Using internal strategy defaults.")
     
     # 2. Run Single Backtest
+    if args.verbose:
+        params_dict['verbose'] = True
+        
     run_backtest(args.strategy, args.data, params_dict, start_date=args.start, end_date=args.end, dashboard_path=args.dashboard)
 
 if __name__ == '__main__':
