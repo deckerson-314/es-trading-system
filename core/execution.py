@@ -108,7 +108,9 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
 
         # Create bracket order
         oca_group = f"bracket_{datetime.now().strftime('%M%S%f')}"
-        entry_order = MarketOrder(action=action, totalQuantity=qty, transmit=False)
+        
+        # Explicitly set TIF to GTC to avoid 10349 rejection from IBKR presets
+        entry_order = MarketOrder(action=action, totalQuantity=qty, transmit=False, tif='GTC')
         
         # Place entry order
         trade = ib.placeOrder(contract, entry_order)
@@ -372,7 +374,8 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
         if not position_still_open:
             _record_trade_close(ib, bracket_contract, bracket, entry_trade, stop_order, tp_order,
                                stop_trade, tp_trade, dir_, latest_row, positions,
-                               completed_trades, live_tracker, send_email_fn, data)
+                               completed_trades, live_tracker, send_email_fn, data,
+                               strategy=strategy)
             if bracket in positions:
                 positions.remove(bracket)
             continue
@@ -390,18 +393,40 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 logging.warning(f"CRITICAL: Stop {stop_price:.2f} breached, order PreSubmitted. Manual close.")
                 _force_close_position(ib, bracket_contract, bracket, positions, completed_trades,
                                       live_tracker, send_email_fn, entry_trade, current_price,
-                                      "Manual Close (PreSubmitted Stop)", data=data)
+                                      "Manual Close (PreSubmitted Stop)", data=data, strategy=strategy)
                 continue
 
         # --- Strategy-Specific Signal Exit (The "Soft Exit") ---
         if allow_strategy_exit:
             try:
-                exit_triggered, exit_reason, exit_price_hint = strategy.check_exit(bracket, latest_row, data)
+                # FIX: Pass the strategy-specific position_dict, not the full bracket
+                strat_pos = bracket.get('position_dict', bracket)
+                
+                # --- SAFETY: Don't use bar ranges (High/Low) from BEFORE the trade started ---
+                # A bar with index 10:35 completes at 10:36. If we enter at 10:36:05,
+                # the 10:35 bar's range is historical.
+                entry_time = bracket.get('entry_time')
+                bar_time = latest_row.name if hasattr(latest_row, 'name') else None
+                
+                eval_row = latest_row
+                if entry_time and bar_time:
+                    # If this is the signal bar (precedes) or the first bar (overlaps):
+                    # Clamp High/Low to Close to only check for breaches occurring NOW or forward.
+                    # replace(second=0) to align with bar indices
+                    if bar_time <= entry_time.replace(second=0, microsecond=0):
+                        if isinstance(latest_row, pd.Series):
+                            eval_row = latest_row.copy()
+                            eval_row['high'] = eval_row['low'] = eval_row['close']
+                        elif isinstance(latest_row, dict):
+                            eval_row = latest_row.copy()
+                            eval_row['high'] = eval_row['low'] = eval_row['close']
+
+                exit_triggered, exit_reason, exit_price_hint = strategy.check_exit(strat_pos, eval_row, data)
                 if exit_triggered:
                     logging.info(f"STRATEGY SIGNAL EXIT: {exit_reason} triggered @ {latest_row['close']:.2f}")
                     _force_close_position(ib, bracket_contract, bracket, positions, completed_trades,
                                           live_tracker, send_email_fn, entry_trade, latest_row['close'],
-                                          f"Strategy Exit ({exit_reason})", data=data)
+                                          f"Strategy Exit ({exit_reason})", data=data, strategy=strategy)
                     continue
             except Exception as e:
                 logging.error(f"Error checking strategy signal exit: {e}")
@@ -418,7 +443,9 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 }
                 bracket['position_dict'] = position_dict
 
-            stop_updated = strategy.update_trailing_stop(position_dict, latest_row, data)
+            # FIX: Use strat_pos which was already extracted or get it again
+            strat_pos = bracket.get('position_dict', position_dict)
+            stop_updated = strategy.update_trailing_stop(strat_pos, latest_row, data)
 
             # Check if stop order is active
             stop_active = False
@@ -446,7 +473,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
 
 
 def _force_close_position(ib, contract, bracket, positions, completed_trades,
-                          live_tracker, send_email_fn, entry_trade, current_price, reason, data=None):
+                          live_tracker, send_email_fn, entry_trade, current_price, reason, data=None, strategy=None):
     """Force close a position with market order (PreSubmitted stop handler)."""
     try:
         # Cancel existing orders
@@ -496,9 +523,30 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
             duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
             
             # Use unified reporting helper
+            report_url = ""
+            if strategy:
+                try:
+                    # Save to web/trades/
+                    trades_dir = os.path.join(os.getcwd(), 'web', 'trades')
+                    os.makedirs(trades_dir, exist_ok=True)
+                    report_path = strategy.generate_trade_report(
+                        {
+                            'entry_time': entry_time, 'exit_time': exit_time,
+                            'direction': dir_, 'entry_price': entry_price,
+                            'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
+                            'reason': reason
+                        },
+                        data, trades_dir
+                    )
+                    if report_path:
+                        report_url = f"trades/{os.path.basename(report_path)}"
+                except Exception as e:
+                    logging.error(f"Failed to generate HTML report: {e}")
+
             _send_trade_close_notification(
                 ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
-                duration_str, exit_time, data, send_email_fn, live_tracker
+                duration_str, exit_time, data, send_email_fn, live_tracker,
+                report_url=report_url
             )
             
             # Record in completed trades for dashboard
@@ -506,7 +554,8 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                 'exit_time': exit_time, 'entry_time': entry_time,
                 'direction': 'LONG' if dir_ == 1 else 'SHORT',
                 'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
-                'pnl': pnl, 'reason': reason, 'duration': duration_str
+                'pnl': pnl, 'reason': reason, 'duration': duration_str,
+                'report_url': report_url
             })
             if len(completed_trades) > 50:
                 del completed_trades[:-50]
@@ -559,16 +608,8 @@ def _update_opposite_bb_tp(ib, contract, data, bracket, tp_order, dir_, live_tra
             logging.error(f"Failed to modify TP order: {e}")
 
 
-def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
-                                   duration_str, exit_time, data, send_email_fn, live_tracker):
-    """Unified helper for detailed trade closure reporting with analytics and charting."""
-    entry_time = bracket.get('entry_time')
-    stop_order = bracket.get('stopLoss')
-    tp_order = bracket.get('takeProfit')
-    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
-    tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
-
-    # MFE / MAE Calculation
+def _calculate_trade_metrics(entry_time, exit_time, dir_, entry_price, exit_price, pnl, qty, data, curr_stop, tp_price):
+    """Calculate MFE, MAE, Risk, Reward, and R-Multiple for a trade."""
     mfe_pts = 0
     mae_pts = 0
     if entry_time and data is not None and not data.empty:
@@ -597,39 +638,46 @@ def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, p
         except Exception as e:
             logging.warning(f"Failed to calculate MAE/MFE: {e}")
 
-    # Risk metrics
     contract_multiplier = 50
     risk_dollars = abs(entry_price - curr_stop) * contract_multiplier * qty if curr_stop else 0
     reward_dollars = abs(entry_price - tp_price) * contract_multiplier * qty if tp_price else None
     rr_ratio = reward_dollars / risk_dollars if (reward_dollars and risk_dollars > 0) else None
     r_multiple = pnl / risk_dollars if risk_dollars > 0 else 0
     
-    mfe_dollars = mfe_pts * contract_multiplier * qty
-    mae_dollars = mae_pts * contract_multiplier * qty
+    return {
+        'mfe_pts': mfe_pts,
+        'mae_pts': mae_pts,
+        'mfe_dollars': mfe_pts * contract_multiplier * qty,
+        'mae_dollars': mae_pts * contract_multiplier * qty,
+        'risk_dollars': risk_dollars,
+        'reward_dollars': reward_dollars,
+        'rr_ratio': rr_ratio,
+        'r_multiple': r_multiple
+    }
 
-    # Email Body Content
-    account = get_account_summary(ib, data, bracket.get('contract'))
+def _build_trade_report_lines(metrics, account, status_label, dir_, qty, entry_price, exit_price, duration_str, exit_time, entry_time):
+    """Build the list of message lines for the email report."""
     msg_lines = [
-        f"TRADE CLOSE - {reason.upper()}",
+        f"TRADE {status_label.upper()}",
         f"{'='*60}",
         f"Signal:      {'LONG' if dir_==1 else 'SHORT'}",
         f"Volume:      {qty} contract(s)",
         f"Entry:       ${entry_price:.2f} ({entry_time.strftime('%H:%M:%S') if entry_time else 'N/A'})",
-        f"Exit:        ${exit_price:.2f} ({exit_time.strftime('%H:%M:%S')})",
+        f"Current/Exit: ${exit_price:.2f} ({exit_time.strftime('%H:%M:%S')})",
         f"Duration:    {duration_str}",
-        f"Reason:      {reason}",
+        f"Status:      {status_label}",
         f"",
         f"EXCURSION STATS",
         f"{'-'*30}",
-        f"MFE (Max Fav): +${mfe_dollars:,.2f} (+{mfe_pts:.2f} pts)",
-        f"MAE (Max Adv): ${mae_dollars:,.2f} ({mae_pts:.2f} pts)",
+        f"MFE (Max Fav): +${metrics['mfe_dollars']:,.2f} (+{metrics['mfe_pts']:.2f} pts)",
+        f"MAE (Max Adv): ${metrics['mae_dollars']:,.2f} ({metrics['mae_pts']:.2f} pts)",
         f"",
         f"FINANCIAL PERFORMANCE",
         f"{'-'*30}",
-        f"Net PnL:     ${pnl:,.2f}",
-        f"R-Multiple:  {r_multiple:.2f}R",
-        f"Initial Risk: ${risk_dollars:,.2f}",
-        f"Risk/Reward: {rr_ratio:.2f}:1" if rr_ratio else "Risk/Reward: N/A",
+        f"PnL:         ${metrics.get('pnl', 0):,.2f}",
+        f"R-Multiple:  {metrics['r_multiple']:.2f}R",
+        f"Initial Risk: ${metrics['risk_dollars']:,.2f}",
+        f"Risk/Reward: {metrics['rr_ratio']:.2f}:1" if metrics['rr_ratio'] else "Risk/Reward: N/A",
         f"",
         f"ACCOUNT CONTEXT",
         f"{'-'*30}",
@@ -638,12 +686,31 @@ def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, p
         f"Equity Value:  ${account.get('EquityWithLoanValue', 0):,.2f}",
         f"Timestamp:     {exit_time.strftime('%Y-%m-%d %H:%M:%S')}"
     ]
+    return msg_lines
+
+def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
+                                   duration_str, exit_time, data, send_email_fn, live_tracker,
+                                   report_url=None):
+    """Unified helper for detailed trade closure reporting with analytics and charting."""
+    entry_time = bracket.get('entry_time')
+    stop_order = bracket.get('stopLoss')
+    tp_order = bracket.get('takeProfit')
+    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+    tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+
+    # Calculate metrics
+    metrics = _calculate_trade_metrics(entry_time, exit_time, dir_, entry_price, exit_price, pnl, qty, data, curr_stop, tp_price)
+    metrics['pnl'] = pnl
+
+    # Build report
+    account = get_account_summary(ib, data, bracket.get('contract'))
+    msg_lines = _build_trade_report_lines(metrics, account, reason, dir_, qty, entry_price, exit_price, duration_str, exit_time, entry_time)
     
     dir_code = "L" if dir_ == 1 else "S"
-    # Subject [TR-P] etc is handled by main.py wrapper
     subj = f"C: {dir_code} {qty}@{exit_price:.2f} ({'+' if pnl>0 else ''}${pnl:.0f})"
     
     # Charting
+    os.makedirs('temp', exist_ok=True)
     chart_path = os.path.join(os.getcwd(), 'temp', f'trade_chart_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
     chart_attached = False
     if data is not None and not data.empty:
@@ -652,25 +719,97 @@ def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, p
                 data, entry_time, exit_time, dir_code, chart_path,
                 sl_price=curr_stop, tp_price=tp_price, entry_price=entry_price
             )
-            if not chart_attached:
-                logging.warning("create_trade_chart returned False")
         except Exception as e:
             logging.error(f"Chart generation failed: {e}")
             
     # Dispatch Email
     try:
+        report_msg = f"\n\nInteractive Report: http://127.0.0.1:8000/{report_url}" if report_url else ""
+        full_body = "\n".join(msg_lines) + report_msg
+        
         if chart_attached:
-            send_email_fn(subj, "\n".join(msg_lines), attachment_path=chart_path)
+            send_email_fn(subj, full_body, attachment_path=chart_path)
+            # We don't delete immediately here as multiple calls might happen, 
+            # but usually it's fine. We'll let OS cleanup or handle in main.
         else:
-            send_email_fn(subj, "\n".join(msg_lines))
+            send_email_fn(subj, full_body)
     except Exception as e:
         logging.error(f"Failed to dispatch close email: {e}")
+
+def send_composite_status_notification(ib, positions, data, account_info, send_email_fn):
+    """Send a single status email with reports and charts for all active positions."""
+    if not positions:
+        return
+
+    now = datetime.now()
+    all_reports = []
+    chart_paths = []
+
+    os.makedirs('temp', exist_ok=True)
+
+    for i, bracket in enumerate(positions):
+        try:
+            dir_ = bracket.get('direction', 0)
+            entry_price = bracket.get('entry_price', 0)
+            entry_time = bracket.get('entry_time')
+            qty = 1 # Default
+            
+            # Try to get qty from order
+            stop_order = bracket.get('stopLoss')
+            if stop_order and hasattr(stop_order, 'totalQuantity'):
+                qty = stop_order.totalQuantity
+            
+            current_price = data['close'].iloc[-1] if not data.empty else entry_price
+            pnl = (current_price - entry_price) * dir_ * 50 * qty
+            
+            duration_str = format_duration((now - entry_time).total_seconds()) if entry_time else "N/A"
+            
+            tp_order = bracket.get('takeProfit')
+            curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+            tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+
+            metrics = _calculate_trade_metrics(entry_time, now, dir_, entry_price, current_price, pnl, qty, data, curr_stop, tp_price)
+            metrics['pnl'] = pnl
+            
+            report_lines = _build_trade_report_lines(metrics, account_info, "OPEN STATUS", dir_, qty, entry_price, current_price, duration_str, now, entry_time)
+            all_reports.append("\n".join(report_lines))
+
+            # Generate chart
+            dir_code = "L" if dir_ == 1 else "S"
+            chart_filename = f'status_chart_{i}_{now.strftime("%H%M%S")}.png'
+            chart_path = os.path.join(os.getcwd(), 'temp', chart_filename)
+            
+            if create_trade_chart(data, entry_time, now, dir_code, chart_path, sl_price=curr_stop, tp_price=tp_price, entry_price=entry_price):
+                chart_paths.append(chart_path)
+                
+        except Exception as e:
+            logging.error(f"Failed to generate status for position {i}: {e}")
+
+    if all_reports:
+        # Subject summary
+        total_pnl = sum((data['close'].iloc[-1] - b.get('entry_price', 0)) * b.get('direction', 0) * 50 for b in positions if not data.empty)
+        pos_summary = "/".join(["L" if b.get('direction') == 1 else "S" for b in positions])
+        subj = f"STAT: {pos_summary} PNL:${total_pnl:,.0f}"
+        
+        body = "\n\n" + ("\n" + "="*60 + "\n").join(all_reports)
+        
+        try:
+            send_email_fn(subj, body, attachment_paths=chart_paths)
+            logging.info("Composite status email sent.")
+        except Exception as e:
+            logging.error(f"Failed to send composite status email: {e}")
+        
+        # Cleanup charts
+        for cp in chart_paths:
+            try: os.remove(cp)
+            except: pass
+
 
 
 def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order,
                         stop_trade, tp_trade, dir_, latest_row, positions,
                         completed_trades, live_tracker, send_email_fn, data, 
-                        reason='Unknown'):
+                        reason='Unknown', strategy=None):
     """Record a completed trade and clean up. Improved reason discovery."""
     # Determine exit reason from orders if not explicitly provided or marked as Manual
     exit_trade = None
@@ -693,12 +832,23 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
                     elif stop_order and p_id != 0 and p_id == getattr(stop_order, 'permId', -1):
                         reason = 'Stop Loss'; break
         
+        # 3. Check for specific IB errors or rejections (Ghost-Bracket Sync)
+        if reason in ['Unknown', 'Manual / External']:
+            # Search recent log entries for rejects or cancels related to this bracket's fills
+            for trade in ib.trades():
+                 if trade.contract.conId == contract.conId and (trade.orderStatus.status == 'Rejected' or 'discarded' in trade.orderStatus.statusReason.lower()):
+                     reason = f'Rejected: {trade.orderStatus.statusReason[:30]}'
+                     break
+
         # Final fallback: if position is closed but no fill found, it's external
         if reason in ['Unknown', 'Manual / External']:
             reason = 'Manual / External'
 
     entry_price = bracket.get('entry_price', 0)
     entry_time = bracket.get('entry_time')
+    # Determine if we should work with aware or naive based on entry_time
+    is_aware = entry_time and entry_time.tzinfo is not None
+
     if not entry_price and entry_trade and entry_trade.fills:
         entry_price = entry_trade.fills[0].execution.price
 
@@ -717,8 +867,22 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         # Fallback 1: Scan recent fills for this contract to find the actual manual/untracked execution
         fallback_fill = None
         expected_side = 'SLD' if dir_ == 1 else 'BOT'
+        
+        # Ensure entry_time is comparable (aware vs naive)
+        ref_time = entry_time
+
         for f in reversed(ib.fills()):
             if f.contract.conId == contract.conId and hasattr(f, 'execution') and f.execution.side == expected_side:
+                f_time = f.execution.time
+                if is_aware and f_time.tzinfo is None:
+                    f_time = pytz.utc.localize(f_time)
+                elif not is_aware and f_time.tzinfo is not None:
+                    f_time = f_time.replace(tzinfo=None)
+                
+                # Only consider fills that happened AFTER this trade was initiated
+                if ref_time and f_time < (ref_time - pd.Timedelta(seconds=5)):
+                    continue
+
                 if abs(f.execution.shares) >= qty:
                     fallback_fill = f; break
                 
@@ -734,11 +898,36 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
 
     # Duration and Notification
     exit_time = datetime.now()
+    if is_aware:
+        exit_time = exit_time.astimezone(pytz.utc)
+    
     duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
+
+    # Generate HTML report if possible
+    report_url = ""
+    if strategy:
+        try:
+            # Save to web/trades/
+            trades_dir = os.path.join(os.getcwd(), 'web', 'trades')
+            os.makedirs(trades_dir, exist_ok=True)
+            report_path = strategy.generate_trade_report(
+                {
+                    'entry_time': entry_time, 'exit_time': exit_time,
+                    'direction': dir_, 'entry_price': entry_price,
+                    'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
+                    'reason': reason
+                },
+                data, trades_dir
+            )
+            if report_path:
+                report_url = f"trades/{os.path.basename(report_path)}"
+        except Exception as e:
+            logging.error(f"Failed to generate HTML report: {e}")
 
     _send_trade_close_notification(
         ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
-        duration_str, exit_time, data, send_email_fn, live_tracker
+        duration_str, exit_time, data, send_email_fn, live_tracker,
+        report_url=report_url
     )
 
     logging.info(f"TRADE CLOSE: {reason} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
@@ -756,19 +945,26 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         'direction': 'LONG' if dir_ == 1 else 'SHORT',
         'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
         'pnl': pnl, 'r_multiple': r_multiple, 'reason': reason,
-        'duration': duration_str
+        'duration': duration_str,
+        'report_url': report_url
     })
     if len(completed_trades) > 50:
         del completed_trades[:-50]
 
-    # Cancel orphaned orders from this bracket
-    for order in [stop_order, tp_order]:
-        if order:
-            for trade in ib.trades():
-                if trade.order.permId == order.permId and trade.contract.conId == contract.conId and trade.isActive():
-                    try: ib.cancelOrder(order)
-                    except: pass
-                    break
+    # Cancel ALL orphaned orders for this contract from ANY bracket (Safety Catch)
+    # This prevents the 'stranded order' issue like the one at $7177.75
+    try:
+        active_for_contract = [t for t in ib.trades() if t.contract.conId == contract.conId and t.isActive()]
+        for trade in active_for_contract:
+            perm_id = trade.order.permId
+            # If this trade isn't the entry that just closed (it shouldn't be anyway as entry is done)
+            if entry_trade and perm_id == getattr(entry_trade.order, 'permId', 0):
+                continue
+                
+            logging.info(f"Cleanup: Cancelling active order {trade.order.orderType} {trade.order.action} (PermID: {perm_id}) for {contract.localSymbol}")
+            ib.cancelOrder(trade.order)
+    except Exception as e:
+        logging.error(f"Error during final orphan cleanup: {e}")
 
     if bracket in positions:
         positions.remove(bracket)

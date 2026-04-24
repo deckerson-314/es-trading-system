@@ -14,55 +14,50 @@ import pytz
 
 
 def cancel_all_pending(ib, contract, live_tracker=None):
-    """Cancel pending orders, preserving protective orders (SL/TP) for open positions."""
+    """Cancel pending orders surgically, preserving protective orders for specific contract."""
     try:
-        es_positions = []
-        if contract:
-            try:
-                # Check for ANY ES position, not just the currently resolved one
-                # This ensures we don't 'Global Cancel' during roll weeks
-                es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES']
-            except:
-                pass
-
+        # 1. Fetch fresh positions to avoid stale 'has_open' logic
+        # We look for ALL ES positions to be safe during roll weeks
+        es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES']
         has_open = any(abs(p.position) > 0 for p in es_positions)
 
-        if has_open:
-            logging.info("Open position detected - preserving protective orders (SL/TP)")
-            orders_to_cancel = []
-            protective_orders = []
+        # 2. Identify all active orders across the portfolio
+        active_trades = [t for t in ib.trades() if t.isActive() or (t.orderStatus and 
+                         t.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending'])]
 
-            try:
-                for trade in ib.trades():
-                    if contract and trade.contract.conId == contract.conId:
-                        if trade.isActive() or (trade.orderStatus and
-                            trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending']):
-                            order = trade.order
-                            is_stop = (isinstance(order, StopOrder) or
-                                      (getattr(order, 'auxPrice', 0) > 0 and getattr(order, 'lmtPrice', 0) == 0))
-                            is_limit = (isinstance(order, LimitOrder) or getattr(order, 'lmtPrice', 0) > 0)
+        if not active_trades:
+            return
 
-                            if is_stop or is_limit:
-                                protective_orders.append(trade)
-                            else:
-                                orders_to_cancel.append(trade)
-            except Exception as e:
-                logging.debug(f"Error checking orders: {e}")
-                ib.reqGlobalCancel()
-                return
+        # 3. Surgical Cancellation
+        # Rule: We ONLY 'Global Cancel' if literally no ES position exists anywhere
+        # This prevents the 'Safety Paradox' during roll-overs.
+        if not has_open:
+            # Check if there are any ES orders at all. If so, clear them.
+            es_orders = [t for t in active_trades if t.contract.symbol == 'ES']
+            if es_orders:
+                logging.warning(f"No ES positions found. Surgically cancelling {len(es_orders)} ES orders.")
+                for t in es_orders:
+                    ib.cancelOrder(t.order)
+                if live_tracker:
+                    add_to_live_tracker(live_tracker, 'warning', f"Safety: Cancelled {len(es_orders)} ES orders (No Pos)")
+            return
 
-            for trade in orders_to_cancel:
-                try: ib.cancelOrder(trade.order)
-                except: pass
+        # 4. If we DO have open positions, be extremely careful
+        # Only cancel orders for the specific contract if they are NOT protective
+        for trade in active_trades:
+            # We ONLY touch orders for the contract being targeted if it HAS a position
+            if contract and trade.contract.conId == contract.conId:
+                order = trade.order
+                is_protective = (isinstance(order, StopOrder) or isinstance(order, LimitOrder) or
+                                getattr(order, 'auxPrice', 0) > 0 or getattr(order, 'lmtPrice', 0) > 0)
+                
+                # If it's a market order or something without prices, it's likely a target for cleanup
+                if not is_protective:
+                    logging.info(f"Surgical Cleanup: Cancelling non-protective order {trade.order.orderType} for {contract.localSymbol}")
+                    ib.cancelOrder(trade.order)
 
-            if orders_to_cancel:
-                logging.info(f"Cancelled {len(orders_to_cancel)} non-protective, preserved {len(protective_orders)} protective")
-        else:
-            ib.reqGlobalCancel()
-            logging.info("Cancelled all pending orders (no open positions)")
     except Exception as e:
-        logging.warning(f"Error in cancel_all_pending: {e}, falling back to global cancel")
-        ib.reqGlobalCancel()
+        logging.error(f"Error in surgical cancel_all_pending: {e}")
 
 
 def cleanup_orphaned_orders(ib, contract, positions):
@@ -96,6 +91,16 @@ def cleanup_orphaned_orders(ib, contract, positions):
             if parent_id != 0 and parent_id in tracked_order_ids:
                 continue
             
+            # --- NEW: GRACE PERIOD FOR NEW ORDERS ---
+            # If an order was JUST placed, its ID might not be in the positions list 
+            # due to race conditions or IB delay. Skip if < 10s old.
+            if trade.log:
+                # First log entry is usually the creation time
+                creation_time = trade.log[0].time
+                if (datetime.now(pytz.utc) - creation_time).total_seconds() < 10:
+                    logging.debug(f"Skipping orphan check for new order {order_id} ({(datetime.now(pytz.utc) - creation_time).total_seconds():.1f}s old)")
+                    continue
+
             # If no tracking match found, it's an orphan
             orphaned.append(trade)
 
@@ -367,7 +372,7 @@ def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_t
 
 
 def reconcile_positions(ib, contract, positions, live_tracker=None, 
-                        completed_trades=None, send_email_fn=None, data=None):
+                        completed_trades=None, send_email_fn=None, data=None, strategy=None):
     """
     SELF-HEALING: Sync internal 'positions' list with actual IBKR positions.
     Purges 'Ghost Brackets' that exist in our tracking but not in TWS.
@@ -438,7 +443,7 @@ def reconcile_positions(ib, contract, positions, live_tracker=None,
                         bracket.get('entry'), bracket.get('stopLoss'), bracket.get('takeProfit'),
                         None, None, direction, latest_row, positions,
                         completed_trades, live_tracker, send_email_fn, data,
-                        reason='Unknown'
+                        reason='Unknown', strategy=strategy
                     )
                 except Exception as e:
                     logging.error(f"Failed to record ghost bracket closure: {e}")
@@ -479,7 +484,7 @@ async def periodic_protection_check(ib, contract, positions, strategy, data, liv
                     
                     # Also reconcile positions with TWS every minute
                     reconcile_positions(ib, contract, positions, live_tracker, 
-                                      completed_trades=completed_trades, send_email_fn=send_email_fn, data=data)
+                                      completed_trades=completed_trades, send_email_fn=send_email_fn, data=data, strategy=strategy)
                     if not filtered.empty:
                         row = filtered.iloc[0]
                         force_maint = row.get('force_exit', False)
@@ -511,7 +516,7 @@ def run_reconnection_safety_sequence(ib, contract, positions, strategy, data, li
     """Post-reconnection safety: reconcile -> cleanup -> close orphans -> protect -> recreate TP."""
     logging.info("Running post-reconnection safety sequence...")
     # 0. Sync internal state with reality (THE STABILITY FIX)
-    reconcile_positions(ib, contract, positions, live_tracker)
+    reconcile_positions(ib, contract, positions, live_tracker, strategy=strategy)
     
     # 1. Standard safety checks
     cleanup_orphaned_orders(ib, contract, positions)

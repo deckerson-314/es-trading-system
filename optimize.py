@@ -1573,14 +1573,16 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             # Fall back to normalized fitness values (from cached evaluation)
             avg_trades_day = fitness[3] if len(fitness) > 3 else 0.0
             total_profit = fitness[4] if len(fitness) > 4 else 0.0
+            avg_pt = fitness[5] if len(fitness) > 5 else 0.0
+            
             pareto_data.append({
                 'index': i,
                 'sortino': fitness[0],  # Normalized
                 'max_dd': fitness[1],  # Normalized
                 'profit_factor': fitness[2],  # Normalized
-                'avg_trades_day': avg_trades_day,  # Raw (not normalized)
+                'avg_trades_day': avg_trades_day,  # Raw/Normalized (as provided)
                 'total_profit': total_profit,  # Normalized
-                'avg_profit_trade': fitness[5] if len(fitness) > 5 else 0.0,  # Normalized
+                'avg_profit_trade': avg_pt,  # Raw/Normalized (as provided)
                 'params': clamped_params,
                 'is_selected': (ind == best),
                 'generation': generation_found,
@@ -1839,8 +1841,9 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             ppt_str = f"${ppt:,.2f}" if ppt is not None else "N/A"
             pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{generation}</td><td>{sortino_str}</td><td>{dd_str}</td><td>{pf_str}</td><td>{trades_str}</td><td>{pnl_str}</td><td>{ppt_str}</td><td>{mark}</td></tr>"
         else:
-            # Format normalized values
-            pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{generation}</td><td>{sol['sortino']:.4f}</td><td>{sol['max_dd']:.2f}</td><td>{sol['profit_factor']:.4f}</td><td>{avg_trades:.3f}</td><td>{total_profit:.4f}</td><td>{ppt:.4f}</td><td>{mark}</td></tr>"
+            # Format fitness values (Frequency and Profit/Trade are already raw units in the 6-tuple)
+            # Use raw format for Trades/Day and Profit/Trade even if others are normalized
+            pareto_table_html += f"<tr class='{'selected-row' if sol['is_selected'] else ''}'><td>{rank}</td><td>{generation}</td><td>{sol['sortino']:.4f}</td><td>{sol['max_dd']:.2f}</td><td>{sol['profit_factor']:.4f}</td><td>{avg_trades:.3f}</td><td>{total_profit:.4f}</td><td>${ppt:,.2f}</td><td>{mark}</td></tr>"
 
     pareto_table_html += "</tbody></table>"
     
@@ -1953,16 +1956,6 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     
     param_groups = group_parameters(param_keys, param_dict)
     
-    # Define GA Criteria parameters (these are NOT optimized, even if they have min/max)
-    ga_criteria_params = set(['POP_SIZE', 'NUM_GEN', 'CX_PB', 'MUT_PB', 'MUT_MU', 'MUT_SIGMA',
-                              'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
-                              'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
-                              'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE',
-                              'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
-                              'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
-                              'NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 
-                              'NORM_PNL_MAX', 'NORM_PROFIT_TRADE_MAX', 'MIN_WIN_RATE', 'SORTINO_CAP'])
-    
     # Determine which parameters are optimizable
     # Parameters in param_keys are optimizable (they were used to build PARAM_RANGES)
     # Also check for parameters that have min/max and are int/float, but exclude:
@@ -1971,8 +1964,6 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     optimizable_params = set(param_keys)  # Start with known optimizable params
     for pname, pdata in param_dict.items():
         if pname.startswith('===') or pname.startswith('__'):
-            continue
-        if pname in ga_criteria_params:
             continue
         
         # FIX: Ensure pdata is a dictionary
@@ -1994,11 +1985,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     best_params_html = gen_info_html
     for group_name, params_list in param_groups.items():
         if params_list:  # Only show group if it has parameters
-            # Add note for GA Criteria group
-            if group_name == 'GA Criteria':
-                best_params_html += f"<h3 style='margin-top: 20px; color: #555; border-bottom: 2px solid #ddd; padding-bottom: 5px;'>{group_name}<span class='tooltip-icon' style='margin-left: 10px;'>?</span><span class='tooltip'>These are GA configuration parameters that control how the optimization runs. They are NOT optimized by the GA - they are set manually in the parameter CSV file. The min/max values shown are just valid ranges for manual configuration.</span></h3>"
-            else:
-                best_params_html += f"<h3 style='margin-top: 20px; color: #555; border-bottom: 2px solid #ddd; padding-bottom: 5px;'>{group_name}</h3>"
+            best_params_html += f"<h3 style='margin-top: 20px; color: #555; border-bottom: 2px solid #ddd; padding-bottom: 5px;'>{group_name}</h3>"
             best_params_html += "<table class='params-table'><thead><tr><th>Parameter</th><th>Range</th><th>Optimized Value</th></tr></thead><tbody>"
             for pname in sorted(params_list):
                 if pname in param_dict:
@@ -2218,7 +2205,6 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     pareto3d_div, pareto3d_script = extract_chart_html(pareto3d_html)
     pareto2d_div, pareto2d_script = extract_chart_html(pareto2d_html)
     paretosize_div, paretosize_script = extract_chart_html(paretosize_html)
-    print("DEBUG: extract_chart_html END")
     
     # Progress information with time tracking
     progress_html = ""
@@ -2362,9 +2348,6 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     gen_found_text = f"Generation {best_gen_found}" if best_gen_found is not None else ""
     html_content += f"<div class='info-section'><strong>Generation:</strong> {gen_found_text} | <strong>Values:</strong> {'Actual Backtest' if is_final else 'Normalized Fitness (In-Sample)'}</div>\n"
     
-    # Combined Parameter & Analysis Table (Requested by User)
-    # REDUNDANT: Removed "Selected Parameters" section as it duplicates data in "Parameter Analysis & Convergence"
-    
     # Metrics Summary
     html_content += f"<div class='metric-box'>Sortino: {s_val:.4f}</div>\n"
     html_content += f"<div class='metric-box'>Max DD: {(d_val if d_val < 1000 else float(d_val)):.2f}</div>\n"
@@ -2457,8 +2440,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     html_content += ' <h2>In-Sample vs OOS Comparison<span class="tooltip-icon">?</span> <span class="tooltip">Comparison of strategy performance between in-sample (training) and out-of-sample (validation) data. This is critical for detecting overfitting. Good generalization: IS and OOS metrics are similar. Overfitting: IS is much better than OOS. Green differences indicate OOS is better (good sign), red indicates OOS is worse (potential overfitting).</span> </h2> <div class="info-section"> <strong>Overfitting Detection:</strong> If OOS performance is significantly worse than IS, the strategy may be overfitted to the training data. Look for: (1) Sortino dropping >50% in OOS, (2) Drawdown increasing >100% in OOS, (3) Trade frequency dropping dramatically. Small differences (<20%) are normal and acceptable. </div> '
     html_content += comparison_html
     html_content += summary_html
-    # All Solutions Table moved to bottom
-    pass
+    
     html_content += ' </div> <h2>Parameter Analysis & Convergence<span class="tooltip-icon">?</span> <span class="tooltip">Analysis of how strategy parameters affect performance metrics. Includes both Convergence Stability (consensus) and Correlation Analysis (impact).</span> </h2> <div class="info-section"> <strong>Understanding Parameter Analysis:</strong> <ul> <li><strong>Convergence Analysis:</strong> Shows which parameters the GA has "agreed" on (Low Variance) vs. which are still debated (High Variance). Converged parameters are likely critical "Structural Edges".</li> <li><strong>Correlation Heatmap:</strong> Shows how each parameter correlates with each metric. Positive (blue) = parameter increases with metric, Negative (red) = parameter decreases with metric.</li> <li><strong>Parameter Importance:</strong> Combines correlation, top-bottom difference, range utilization, and variability to identify the most important parameters.</li> <li><strong>Parameter Distributions (Top vs Bottom):</strong> Compares parameter values in top 25% vs bottom 25% solutions. Shows which parameters distinguish good from bad solutions.</li> <li><strong>Parameter Interactions:</strong> 2D scatter plots showing how top parameters interact. Color = Sortino (darker = better). Helps identify parameter combinations that work together.</li> <li><strong>Parameter Distribution Histograms:</strong> Shows distribution of all parameter values with valid ranges marked. <strong style="color: red;">Red bars = values OUTSIDE valid range</strong>, Blue bars = values within range. Green/Red dashed lines = min/max boundaries. Use this to detect parameter clamping issues!</li> <li><strong>Focus on High-Importance Parameters:</strong> These are the parameters that most distinguish good solutions from bad ones.</li> </ul> <strong>Note:</strong> GA meta-parameters (POP_SIZE, NUM_GEN, etc.) are excluded from this analysis as they control the optimization algorithm, not the trading strategy. </div> <div class="chart-container"> '
     if param_conv_html:
         html_content += f"<h3>Convergence Analysis</h3>{param_conv_html}<hr>"
@@ -3387,27 +3369,43 @@ def main():
                     
                     # Now run backtest with fully converted parameters (same logic as final backtest)
                     best_metrics = run_backtest(best_params_temp, in_sample, param_dict, suppress_output=True)
-                    record['avg_trades_day'] = best_metrics.get('avg_trades_day', 0.0)
-                    record['max_trades_day'] = best_metrics.get('avg_trades_day', 0.0)  # For best individual, same as avg
+                    
                     # Store ACTUAL metrics (in real units) for the best individual from current generation
-                    record['actual_dd_best'] = best_metrics.get('max_drawdown', 0.0)
+                    record['actual_trades_day_best'] = best_metrics.get('avg_trades_day', 0.0)
                     record['actual_sortino_best'] = best_metrics.get('sortino', 0.0)
+                    record['actual_dd_best'] = best_metrics.get('max_drawdown', 0.0)
                     record['actual_pf_best'] = best_metrics.get('profit_factor', 0.0)
                     record['actual_pnl_best'] = best_metrics.get('total_profit', 0.0)
+                    
+                    # Calculate actual profit per trade
+                    ppt_val = 0.0
+                    trades_df = best_metrics.get('trades_df')
+                    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+                        ppt_val = best_metrics.get('total_profit', 0.0) / len(trades_df)
+                    record['actual_ppt_best'] = ppt_val
+                    
+                    # Legacy mapping for backward compatibility with logbook header
+                    record['avg_trades_day'] = record['actual_trades_day_best']
+                    record['avg_profit_per_trade'] = record['actual_ppt_best']
+                    
                 except Exception as e:
-                    record['avg_trades_day'] = 0.0
-                    record['max_trades_day'] = 0.0
-                    record['actual_dd_best'] = 0.0
+                    record['actual_trades_day_best'] = 0.0
                     record['actual_sortino_best'] = 0.0
+                    record['actual_dd_best'] = 0.0
                     record['actual_pf_best'] = 0.0
                     record['actual_pnl_best'] = 0.0
+                    record['actual_ppt_best'] = 0.0
+                    record['avg_trades_day'] = 0.0
+                    record['avg_profit_per_trade'] = 0.0
             else:
-                record['avg_trades_day'] = 0.0
-                record['max_trades_day'] = 0.0
-                record['actual_dd_best'] = 0.0
+                record['actual_trades_day_best'] = 0.0
                 record['actual_sortino_best'] = 0.0
+                record['actual_dd_best'] = 0.0
                 record['actual_pf_best'] = 0.0
                 record['actual_pnl_best'] = 0.0
+                record['actual_ppt_best'] = 0.0
+                record['avg_trades_day'] = 0.0
+                record['avg_profit_per_trade'] = 0.0
             
             logbook.record(gen=gen, evals=len(pop), **record)
             
