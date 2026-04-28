@@ -129,35 +129,33 @@ def make_ohlcv(n, base_price=100.0, trend=0.0, volatility=1.0, volume=1000,
 
 
 def make_breakout_scenario(lookback=5, warmup_extra=30, breakout_magnitude=5.0,
-                           base_price=100.0, volatility=1.0, volume=1000):
+                           base_price=100.0, volatility=1.0, volume=1000, start=None):
     """
     Generate OHLCV data with a clean Donchian breakout.
-
-    Structure:
-      - (lookback + warmup_extra) flat bars at base_price  (warm-up / indicator seeding)
-      - 1 bar that breaks above the rolling high           (breakout bar)
-      - 3 additional bars that stay above the channel       (post-breakout)
-
-    warmup_extra should be >= max indicator period (e.g. ATR=14, ADX=14*2=28)
-    to ensure rows survive calculate_indicators() dropna().
-
-    Returns:
-        (df, breakout_idx): DataFrame and the integer index of the breakout bar.
     """
+    if start is None:
+        start = _BASE_START
+        
     n_flat = lookback + warmup_extra
     n_total = n_flat + 1 + 3  # flat + breakout + post
-
-    times = [_BASE_START + timedelta(minutes=i) for i in range(n_total)]
+    
+    times = [start + timedelta(minutes=i) for i in range(n_total)]
 
     opens, highs, lows, closes, volumes = [], [], [], [], []
 
-    # Warm-up bars: sine-wave oscillation around base_price.
-    # This creates consistent movement for ADX/RSI (unlike flat bars which produce ADX=0/NaN)
-    # but stays strictly bounded so no Donchian crossover signals fire during warm-up.
-    # Amplitude of 0.3 keeps prices within [base_price - 0.3, base_price + 0.3].
+    # Warm-up bars: 
+    # Phase 1: Oscillatory (to prime RSI/ADX)
+    # Phase 2: Strictly Flat (for clean crossover)
+    n_flat_baseline = 10
+    n_osc = max(0, n_flat - n_flat_baseline)
+    
     for i in range(n_flat):
-        osc = 0.3 * np.sin(2 * np.pi * i / 7)  # period=7 bars
-        c = base_price + osc
+        if i < n_osc:
+            osc = 0.3 * np.sin(2 * np.pi * i / 7)
+            c = base_price + osc
+        else:
+            # Strictly flat for the last N bars to prevent premature breakouts
+            c = base_price
         opens.append(c - 0.02)
         highs.append(c + volatility)
         lows.append(c - volatility)
@@ -226,11 +224,68 @@ def make_trending_scenario(entry_price=100.0, up_bars=8, dip_bars=4,
     for i in range(resume_bars):
         closes.append(dip_bottom + (i + 1) * up_step)
 
-    data = {
-        'open':   [c - 0.3 for c in closes],
+    df_data = {
+        'open':   [c - 0.1 for c in closes],
         'high':   [c + volatility for c in closes],
         'low':    [c - volatility for c in closes],
         'close':  closes,
-        'volume': [volume] * n_total,
+        'volume': [volume] * n_total
     }
-    return pd.DataFrame(data, index=pd.DatetimeIndex(times))
+    return pd.DataFrame(df_data, index=pd.DatetimeIndex(times))
+
+
+
+def make_gap_scenario(lookback=5, warmup_bars=30, gap_magnitude=20.0, base_price=100.0, volatility=1.0):
+    """
+    Generate a scenario where price 'gaps' over the Donchian High.
+    """
+    n_total = warmup_bars + 5
+    times = [_BASE_START + timedelta(minutes=i) for i in range(n_total)]
+    
+    highs, lows, closes = [], [], []
+    for i in range(warmup_bars):
+        c = base_price + np.random.uniform(-0.1, 0.1)
+        highs.append(c + volatility)
+        lows.append(c - volatility)
+        closes.append(c)
+        
+    donchian_high = max(highs[-lookback:])
+    
+    # Gap bar
+    gap_price = donchian_high + gap_magnitude
+    highs.append(gap_price + volatility)
+    lows.append(gap_price - volatility) # Gap means Low is also high
+    closes.append(gap_price)
+    
+    # Post-gap
+    for i in range(4):
+        c = gap_price + i
+        highs.append(c + volatility)
+        lows.append(c - volatility)
+        closes.append(c)
+        
+    return pd.DataFrame({
+        'open': [c - 0.1 for c in closes], 'high': highs, 'low': lows,
+        'close': closes, 'volume': [1000] * n_total
+    }, index=pd.DatetimeIndex(times)), warmup_bars
+
+
+def make_flash_crash_scenario(n=60, entry_price=100.0, tp_dist=10.0, sl_dist=5.0):
+    """
+    Scenario where a single bar has extreme range hitting both SL and TP.
+    Increased n=60 to ensure enough warmup for indicators.
+    """
+    times = [_BASE_START + timedelta(minutes=i) for i in range(n)]
+    closes = [entry_price] * n
+    highs = [entry_price + 0.5] * n
+    lows = [entry_price - 0.5] * n
+    
+    # The 'Crash' bar at index 40 (plenty of warmup)
+    crash_idx = 40
+    highs[crash_idx] = entry_price + tp_dist + 2.0  # Penetrates TP
+    lows[crash_idx] = entry_price - sl_dist - 2.0   # Penetrates SL
+    
+    return pd.DataFrame({
+        'open': [entry_price] * n, 'high': highs, 'low': lows,
+        'close': closes, 'volume': [1000] * n
+    }, index=pd.DatetimeIndex(times)), crash_idx

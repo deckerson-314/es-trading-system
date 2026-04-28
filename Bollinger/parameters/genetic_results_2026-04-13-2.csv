@@ -1,0 +1,142 @@
+Name,Value,Min,Max,Type,Description,Solution_0,Solution_1,Solution_2,Solution_3,Solution_4,Solution_5,Solution_6,Solution_7,Solution_8_SELECTED,Solution_9
+__indicatorName,BB Strategy,,,,Strategy identifier,,,,,,,,,,
+=== ENTRY CRITERIA ===,,,,,,,,,,,,,,,
+Enable Long Trades,true,false,true,bool,Allow long entries,,,,,,,,,,
+Enable Short Trades,true,false,true,bool,Allow short entries,,,,,,,,,,
+Bollinger Band Length,5,1,30,int,Lookback period for BB,15,26,25,13,15,27,5,19,15,16
+Bollinger Band StdDev,2,0.1,4,float,StdDev multiplier for BB width (Max capped at 3.0 to prevent overfitting),0.1935,3.0487,3.3078,2.7536,0.9386,2.0331,0.8483,2.205,1.0384,0.7334
+Long Entry on Wick Touch,0,0,1,int,"Enter if low touches lower band (0=false, 1=true) - OPTIMIZABLE",1,1,0,1,1,0,0,1,1,1
+Long Entry on Body in Zone,1,0,1,int,"Enter if close ≤ lower band (0=false, 1=true) - OPTIMIZABLE",0,0,0,0,1,0,1,1,0,0
+Long Trigger (% From Lower Band),0.5,0,2,float,% below lower band to trigger (min 0.5% to avoid band extremes),1.36,1.6915,0.816,1.8768,1.3117,1.6883,0.9425,1.7899,0.0,0.0959
+Short Entry on Wick Touch,0,0,1,int,"Enter if high touches upper band (0=false, 1=true) - OPTIMIZABLE",0,0,1,0,1,1,0,0,1,1
+Short Entry on Body in Zone,1,0,1,int,"Enter if close ≥ upper band (0=false, 1=true) - OPTIMIZABLE",0,0,1,1,1,1,0,1,1,0
+Short Trigger (% From Upper Band),0.5,0,2,float,% above upper band to trigger (min 0.5% to avoid band extremes),0.7516,0.4582,1.1461,0.0984,1.8906,1.4743,1.3713,1.2671,1.7837,0.0624
+ATR Length for Filter,26,5,20,int,ATR period for entry filter (separate from trailing stop ATR),11,13,9,10,18,7,20,7,8,8
+Max ATR Filter (Points),4,2,10,float,Maximum ATR value to allow entries for mean reversion (ATR <= max). Low ATR = exhausted move ready to reverse (good). High ATR = strong momentum (bad for mean reversion). Range 1.0-6.0 points,3.0449,2.6867,4.2451,7.6548,5.4141,5.1801,6.0935,7.937,10.0,8.9761
+Min ATR Filter (Points),0.5,0.1,6,float,Minimum ATR floor (optional) to ensure stops aren't too tight. Default 0.5 points. ATR must be >= this AND <= Max ATR Filter,0.5228,1.8175,0.827,2.5367,3.8878,0.4132,2.0808,1.0199,3.1829,2.624
+Enable Trend Filter,1,0,1,int,"Trade with trend only (Long > EMA, Short < EMA) - OPTIMIZABLE",1,1,0,0,1,0,1,1,1,0
+Trend EMA Length,200,10,400,int,EMA Length for trend filter,97,366,288,169,397,360,222,282,394,395
+Enable ADX Filter,1,0,1,int,Trade only when ADX < Threshold (Ranging Markets) - OPTIMIZABLE,0,0,1,0,0,0,0,1,0,0
+ADX Period,14,5,35,int,Lookback period for ADX calculation,21,10,17,33,11,33,24,24,6,29
+Max ADX Threshold,25,10,45,int,Maximum ADX allowed for entry. Lower = Only extremely choppy. Higher = Allow some trend.,12,25,38,35,10,42,31,43,22,23
+RTH Start (HH:MM),09:30,09:30,09:30,str,Regular trading hours start (Eastern Time),,,,,,,,,,
+RTH End (HH:MM),16:00,16:00,16:00,str,Regular trading hours end (Eastern Time),,,,,,,,,,
+Enable RTH Filter,1,0,1,int,"Restrict entries to RTH only (0=false, 1=true) - OPTIMIZABLE",1,0,0,1,0,0,1,1,0,1
+RTH Exit Buffer (minutes),0,0,60,int,Minutes before RTH end to start closing positions (0 = no auto-close),3,19,16,20,0,1,44,27,0,1
+Enable Maintenance Filter,true,false,true,bool,Exit positions before maintenance periods,,,,,,,,,,
+Daily Maintenance Start (HH:MM),17:00,17:00,17:00,str,Daily maintenance period start in Eastern Time (ES: 4:00 PM CT = 5:00 PM ET),,,,,,,,,,
+Daily Maintenance End (HH:MM),17:30,17:30,17:30,str,Daily maintenance period end in Eastern Time (ES: 4:30 PM CT = 5:30 PM ET),,,,,,,,,,
+Weekend Maintenance Start Day,4,4,4,int,"Weekend maintenance start day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 4 (Friday)",,,,,,,,,,
+Weekend Maintenance Start Time (HH:MM),17:00,17:00,17:00,str,Weekend maintenance start time in Eastern Time (ES: Fri 4:00 PM CT = 5:00 PM ET),,,,,,,,,,
+Weekend Maintenance End Day,6,6,6,int,"Weekend maintenance end day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 6 (Sunday)",,,,,,,,,,
+Weekend Maintenance End Time (HH:MM),18:00,18:00,18:00,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET),,,,,,,,,,
+Maintenance Buffer Minutes,5,1,30,int,Minutes before/after maintenance to exit/block trading,23,21,27,5,1,9,18,10,6,11
+Volume MA Length,50,10,200,int,Rolling window for average volume calculation (used by volume filter),167,133,181,184,75,18,102,104,86,35
+Max Volume Multiplier,1.2,0.1,5,float,"Volume filter for mean reversion - MAX volume allowed (volume <= avg * multiplier). Low volume = exhausted move ready to reverse. High volume = strong momentum (bad for mean reversion). Range 0.5-3.0 (1.0 = no filter, lower = more restrictive)",3.7439,0.8441,4.9712,3.9403,1.2366,3.7113,4.9275,2.5654,1.4265,4.1961
+Timeframe (minutes),15,1,5,int,Resample timeframe in minutes,2,5,3,3,4,2,4,3,4,4
+Max Open Trades,1,1,1,int,Maximum concurrent positions,,,,,,,,,,
+Transaction Cost (Per Trade),15,15,15,float,Estimated friction per trade (Slippage + Commissions) to realistic PnL. E.g. $4 comm + $12.50 slip = 16.5,,,,,,,,,,
+=== TAKE PROFIT CRITERIA ===,,,,,,,,,,,,,,,
+TP Method,0,0,2,int,"Take profit method (0=Fixed BB at Entry, 1=Fixed ATR, 2=Opposite BB) - OPTIMIZABLE",,,,,,,,,,
+Opposite Bollinger Band TP,false,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly),True,False,False,False,False,False,False,False,False,False
+Fixed ATR TP,false,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly),False,True,True,True,True,True,False,True,False,False
+Fixed BB at Entry TP,true,true,true,bool,FIXED: Controlled by TP Method (do not optimize directly),False,False,False,False,False,False,True,False,True,True
+ATR Length for TP,26,5,80,int,ATR period for fixed TP,79,64,28,46,31,6,64,37,48,55
+ATR Multiplier for TP,2,0,6,float,Fixed TP ATR multiplier - reduced max to prevent overfitting,2.6594,0.7939,2.1019,3.3937,4.4882,4.7376,4.3588,1.0419,3.223,2.5989
+=== STOP LOSS CRITERIA ===,,,,,,,,,,,,,,,
+Initial Stop Loss (%),1,0.1,2,float,Fixed stop loss % - min 1.0% to avoid tight stops that cause quick losses,0.1862,1.0433,0.1534,1.6661,1.918,1.9458,0.3029,0.9845,1.3108,0.9808
+Enable Trailing Stop,1,1,1,int,"Use ATR trailing stop (0=false, 1=true) - OPTIMIZABLE",,,,,,,,,,
+ATR Length for Trailing Stop,26,3,100,int,ATR period for trailing,40,36,92,11,73,20,88,57,31,44
+ATR Multiplier for Trailing Stop,2,0.1,4.5,float,Trailing stop ATR multiplier - reduced max to prevent overfitting,0.8411,0.2057,4.4373,2.9327,0.6938,3.999,0.4021,3.8727,0.1,3.5478
+Trailing Delay (bars),5,0,5,int,"Bars before trailing stop begins tightening (0 = immediate, max 7 to avoid delayed trailing)",5,4,2,1,3,4,1,4,5,5
+=== GA CRITERIA ===,,,,,,,,,,,,,,,
+POP_SIZE,100,100,150,int,Population size - reduced to prevent overfitting,,,,,,,,,,
+NUM_GEN,100,50,75,int,Number of generations - reduced to prevent overfitting,,,,,,,,,,
+CX_PB,0.7,0.5,0.9,float,Crossover probability,,,,,,,,,,
+MUT_PB,0.4,0.2,0.5,float,Mutation probability (increased from 0.35 for more exploration),,,,,,,,,,
+MUT_MU,0,-1,1,float,Mutation mean,,,,,,,,,,
+MUT_SIGMA,0.25,0.1,0.4,float,Mutation std dev,,,,,,,,,,
+TARGET_TRADES_DAY,5,1,4,int,Ideal trades/day - reduced to be more realistic for combined filters,,,,,,,,,,
+TRADES_PENALTY_WEIGHT,0.3,0.1,0.8,float,Penalty for excess trades - reduced to be less restrictive,,,,,,,,,,
+DD_WEIGHT,0.5,0.2,0.8,float,Drawdown penalty weight - increased to prioritize risk management,,,,,,,,,,
+DATA_SPLITS,0.65,0.6,0.7,float,In-sample fraction per period - 60-70% for better generalization (30-40% OOS),,,,,,,,,,
+DATA_SIZE,0,0,10000000,int,Rows to subsample (0 = full dataset),,,,,,,,,,
+=== RSI & VWAP FILTERS (V5) ===,,,,,,,,,,,,,,,
+Enable RSI Filter,0,1,1,int,Enable RSI Divergence/Extreme Filter,,,,,,,,,,
+RSI Period,14,5,30,int,RSI Lookback Period,7,25,18,30,25,7,11,7,22,21
+RSI Overbought,70,60,85,int,Threshold for Overbought (Short Entry Blocked if < this),79,60,79,74,73,84,72,67,76,82
+RSI Oversold,30,15,40,int,Threshold for Oversold (Long Entry Blocked if > this),23,36,32,16,22,16,31,40,20,35
+Enable VWAP Filter,0,1,1,int,Enable VWAP Trend Alignment Filter,,,,,,,,,,
+USE_INTERLEAVED_SPLIT,true,false,true,bool,Use interleaved IS/OOS periods instead of single split,,,,,,,,,,
+NUM_SPLIT_PERIODS,5,3,7,int,Number of alternating periods (IS-OOS-IS-OOS-IS) - odd number recommended,,,,,,,,,,
+MIN_TRADES_DAY,2,0.5,2,float,MUST have at least 0.1 trades/day (approx 1 per 2 weeks) - relaxed for combined logic,,,,,,,,,,
+MIN_TRADES_PEN_WEIGHT,-500,-200,-50,float,Scalar penalty — zero trades = -50 (Less harsh death penalty),,,,,,,,,,
+NORM_SORTINO_MAX,10,5,20,float,Normalization range for Sortino Ratio (used in fitness calculation),,,,,,,,,,
+NORM_DD_MAX,50000,50000,200000,float,Normalization range for Max Drawdown in dollars (used in fitness calculation),,,,,,,,,,
+NORM_PF_MAX,5,3,10,float,Normalization range for Profit Factor (used in fitness calculation),,,,,,,,,,
+NORM_TRADES_MAX,3,1,5,float,Normalization range for Avg Trades/Day (used in fitness calculation) - reduced to 3.0 for realistic expectations,,,,,,,,,,
+NORM_PNL_MAX,650000,100000,1000000,float,Normalization range for Total Profit in dollars (used in fitness calculation) - increased to prevent maxing out,,,,,,,,,,
+NORM_PROFIT_TRADE_MAX,60,100,500,float,Normalization range for Avg Profit Per Trade (used in fitness calculation),,,,,,,,,,
+MIN_WIN_RATE,0.4,0.3,0.5,float,Minimum win rate threshold (hard constraint - strategies below this are eliminated),,,,,,,,,,
+SORTINO_CAP,10,5,20,float,Maximum Sortino value before capping (prevents unrealistic values),,,,,,,,,,
+GA_START_DATE,2024-01-01,,,str,Start date for GA backtest,,,,,,,,,,
+GA_END_DATE,2024-12-31,,,str,End date for GA backtest,,,,,,,,,,
+WEIGHT_SORTINO,1.0,,,float,Fitness weight: Sortino Ratio,,,,,,,,,,
+WEIGHT_DRAWDOWN,-1.0,,,float,Fitness weight: Max Drawdown,,,,,,,,,,
+WEIGHT_PF,1.0,,,float,Fitness weight: Profit Factor,,,,,,,,,,
+WEIGHT_TRADES,3.0,,,float,Fitness weight: Avg Trades/Day,,,,,,,,,,
+WEIGHT_PNL,2.0,,,float,Fitness weight: Total Profit,,,,,,,,,,
+WEIGHT_PPT,2.0,,,float,Fitness weight: Avg Profit/Trade,,,,,,,,,,
+MIN_TRADE_DURATION,2.0,,,float,Hard Limit: Min avg minutes per trade,,,,,,,,,,
+MAX_WIN_RATE_CAP,0.95,,,float,Hard Limit: Max win rate before penalty,,,,,,,,,,
+LIMIT_MAX_LOSS,50000,,,float,Hard Limit: Severe loss penalty threshold,,,,,,,,,,
+LIMIT_MIN_SORTINO,1.0,,,float,Hard Limit: Severe Sortino penalty threshold,,,,,,,,,,
+=== SOLUTION STATISTICS ===,,,,,,,,,,,,,,,
+Sortino Ratio (IS),,,,statistic,Sortino Ratio (IS) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-2.5923,-3.9298
+Max Drawdown (IS) ($),,,,statistic,Max Drawdown (IS) ($) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$988.02,$861.28
+Profit Factor (IS),,,,statistic,Profit Factor (IS) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.7014,0.7682
+Avg Trades/Day (IS),,,,statistic,Avg Trades/Day (IS) for each solution,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.183,0.047
+Total Profit (IS) ($),,,,statistic,Total Profit (IS) ($) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-921.17,$-433.25
+Avg Profit/Trade (IS) ($),,,,statistic,Avg Profit/Trade (IS) ($) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-26.32,$-48.14
+---,,,,statistic,---,---,---,---,---,---,---,---,---,---,---
+Sortino Ratio (OOS),,,,statistic,Sortino Ratio (OOS) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-1.2619,0.0000
+Max Drawdown (OOS) ($),,,,statistic,Max Drawdown (OOS) ($) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,"$1,858.63",$0.00
+Profit Factor (OOS),,,,statistic,Profit Factor (OOS) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.9219,999.0000
+Avg Trades/Day (OOS),,,,statistic,Avg Trades/Day (OOS) for each solution,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.176,0.016
+Total Profit (OOS) ($),,,,statistic,Total Profit (OOS) ($) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-208.22,$515.50
+Avg Profit/Trade (OOS) ($),,,,statistic,Avg Profit/Trade (OOS) ($) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-9.46,$257.75
+---,,,,statistic,---,---,---,---,---,---,---,---,---,---,---
+--- PER-SPLIT DETAIL (In-Sample) ---,,,,statistic,--- PER-SPLIT DETAIL (In-Sample) --- for each solution,,,,,,,,,,
+  Sortino (P1),,,,statistic,  Sortino (P1) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-3.1241,-6.8914
+  Trades/D (P1),,,,statistic,  Trades/D (P1) for each solution,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.210,0.097
+  Profit Fac (P1),,,,statistic,  Profit Fac (P1) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.6696,0.5571
+  Max DD (P1),,,,statistic,  Max DD (P1) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$568.60,$861.28
+  Total PNL (P1),,,,statistic,  Total PNL (P1) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-397.59,$-569.78
+  Avg Profit/Tr (P1),,,,statistic,  Avg Profit/Tr (P1) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-30.58,$-94.96
+  Sortino (P3),,,,statistic,  Sortino (P3) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-4.3784,0.0000
+  Trades/D (P3),,,,statistic,  Trades/D (P3) for each solution,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.143,0.016
+  Profit Fac (P3),,,,statistic,  Profit Fac (P3) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.7355,999.0000
+  Max DD (P3),,,,statistic,  Max DD (P3) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$420.12,$0.00
+  Total PNL (P3),,,,statistic,  Total PNL (P3) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-135.99,$719.15
+  Avg Profit/Tr (P3),,,,statistic,  Avg Profit/Tr (P3) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-15.11,$719.15
+  Sortino (P5),,,,statistic,  Sortino (P5) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-2.1747,-21.9738
+  Trades/D (P5),,,,statistic,  Trades/D (P5) for each solution,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.203,0.031
+  Profit Fac (P5),,,,statistic,  Profit Fac (P5) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.7166,0.0000
+  Max DD (P5),,,,statistic,  Max DD (P5) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$941.90,$440.12
+  Total PNL (P5),,,,statistic,  Total PNL (P5) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-387.58,$-582.62
+  Avg Profit/Tr (P5),,,,statistic,  Avg Profit/Tr (P5) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-29.81,$-291.31
+---,,,,statistic,---,---,---,---,---,---,---,---,---,---,---
+--- PER-SPLIT DETAIL (Out-of-Sample) ---,,,,statistic,--- PER-SPLIT DETAIL (Out-of-Sample) --- for each solution,,,,,,,,,,
+  Sortino (P2),,,,statistic,  Sortino (P2) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,50.3166,0.0000
+  Trades/D (P2),,,,statistic,  Trades/D (P2) for each solution,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.127,0.016
+  Profit Fac (P2),,,,statistic,  Profit Fac (P2) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,4.0616,999.0000
+  Max DD (P2),,,,statistic,  Max DD (P2) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$191.30,$0.00
+  Total PNL (P2),,,,statistic,  Total PNL (P2) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,"$1,412.59",$195.50
+  Avg Profit/Tr (P2),,,,statistic,  Avg Profit/Tr (P2) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$176.57,$195.50
+  Sortino (P4),,,,statistic,  Sortino (P4) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,-13.9768,0.0000
+  Trades/D (P4),,,,statistic,  Trades/D (P4) for each solution,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.226,0.016
+  Profit Fac (P4),,,,statistic,  Profit Fac (P4) for each solution,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.2646,999.0000
+  Max DD (P4),,,,statistic,  Max DD (P4) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,"$1,858.63",$0.00
+  Total PNL (P4),,,,statistic,  Total PNL (P4) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,"$-1,620.81",$320.00
+  Avg Profit/Tr (P4),,,,statistic,  Avg Profit/Tr (P4) for each solution,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$0.00,$-115.77,$320.00
+Solution Rank,,,,statistic,Rank by Sortino (0 = highest),#0,#1,#2,#3,#4,#5,#6,#7,#8 (SELECTED),#9

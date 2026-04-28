@@ -422,7 +422,7 @@ def main():
                      
                      dash_filename = args.dashboard if args.dashboard else f"backtest_dashboard_{args.strategy}.html"
                      cmp_dash_path = os.path.join(BASE_DIR, 'web', dash_filename)
-                     generate_dashboard(solutions_data, output_dir=os.path.join(BASE_DIR, 'web'), version='4.0', filename=dash_filename)
+                     generate_dashboard(solutions_data, output_dir=os.path.join(BASE_DIR, 'web'), version='5.0', filename=dash_filename)
                      print(f"Comparison Dashboard generated: {cmp_dash_path}")
                 except Exception as e:
                      print(f"Failed to generate Comparison Dashboard: {e}")

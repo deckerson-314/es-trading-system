@@ -1,0 +1,53 @@
+# Technical Specification: GA Convergence Visuals (High-Density Bands)
+
+This document outlines the implementation specs for the multi-objective convergence charts used in the Trading GA Dashboard. These visuals provide a high-fidelity view of the population's evolution and search quality.
+
+## 1. Data Structure (The Logbook)
+The GA should maintain a `logbook` (DEAP style) containing the following raw statistics for each objective (Sortino, PnL, Trades, etc.) per generation:
+-   `min`: The absolute worst solution in the population.
+-   `max`: The absolute best solution in the population.
+-   `avg`: The arithmetic mean.
+-   `std`: The standard deviation (variance).
+-   `actual_best`: (Optional) The raw, un-normalized metric of the Hall of Fame leader.
+
+## 2. Visual Layer: The "Dual-Density" Band
+Each chart should consist of three distinct visual layers to represent the population density:
+
+### A. The "Best-Individual" Tracker (The Lead Signal)
+-   **Plot**: Line plot of `actual_best` (or `max`).
+-   **Style**: Solid, bold colored line (e.g., Bright Blue or Gold).
+-   **Purpose**: Shows the peak performance currently found. This is the value that is actually "hirable" for trading.
+
+### B. The "Inner Variance" Band (The Search Core)
+-   **Plot**: Shaded area representing `avg ± 0.5 * std`.
+-   **Style**: Darker shaded region (opacity ~0.3).
+-   **Logic**:
+    -   Top line: `avg + (std * 0.5)`
+    -   Bottom line: `avg - (std * 0.5)`
+-   **Purpose**: Shows where the "meat" of the population is. A narrow band indicates high convergence (stagnation); a wider band indicates healthy search diversity.
+
+### C. The "Outer Range" Band (The Search Frontier)
+-   **Plot**: Shaded area between `min` and `max`.
+-   **Style**: Lighter shaded region (opacity ~0.1) surrounding the inner band.
+-   **Purpose**: Shows the full range of exploration. Significant gaps between the "Best" and the "Max" line often indicate that the Hall of Fame leader is an outlier that the rest of the population hasn't caught yet.
+
+## 3. Implementation Logic (Python/Plotly)
+```python
+def add_convergence_trace(fig, gens, stats, row, col, color):
+    # 1. Outer Range (Min to Max) - Light
+    fig.add_trace(go.Scatter(x=gens, y=stats['max'], mode='lines', line=dict(width=0)), row=row, col=col)
+    fig.add_trace(go.Scatter(x=gens, y=stats['min'], fill='tonexty', fillcolor=color_light, ...), row=row, col=col)
+    
+    # 2. Inner Variance (Avg ± Std) - Darker
+    upper = [a + (s*0.5) for a, s in zip(stats['avg'], stats['std'])]
+    lower = [a - (s*0.5) for a, s in zip(stats['avg'], stats['std'])]
+    fig.add_trace(go.Scatter(x=gens, y=upper, mode='lines', line=dict(width=0.5)), row=row, col=col)
+    fig.add_trace(go.Scatter(x=gens, y=lower, fill='tonexty', fillcolor=color_dark, ...), row=row, col=col)
+    
+    # 3. Best Line - Solid
+    fig.add_trace(go.Scatter(x=gens, y=stats['actual_best'], line=dict(width=2, color=color_solid)), row=row, col=col)
+```
+
+## 4. Normalization vs. Absolute Units
+-   **Dashboard Display**: Charts MUST use **Absolute Units** (e.g., Profit Factor 1.5) for readability.
+-   **Calculations**: If the internal `logbook` stores normalized fitness, a de-normalization layer must be applied before plotting to ensure the scale makes sense to a human trader.

@@ -70,7 +70,7 @@ def request_historical_data_with_retry(ib, contract, max_retries=5):
             logging.info(f"Requesting historical data (attempt {attempt+1}/{max_retries})...")
             ib.reqMarketDataType(1)  # Live data
             bars = ib.reqHistoricalData(
-                contract, endDateTime='', durationStr='4 D',
+                contract, endDateTime='', durationStr='10 D',
                 barSizeSetting='1 min', whatToShow='TRADES',
                 useRTH=False, keepUpToDate=True
             )

@@ -56,7 +56,7 @@ def start_cloudflare_tunnel(port):
             
             # Start cloudflared in background (let output pass through to parent terminal)
             cloudflared_process = subprocess.Popen(
-                ['cloudflared', 'tunnel', '--url', f'http://127.0.0.1:{port}'],
+                ['cloudflared', 'tunnel', '--url', f'http://127.0.0.1:{port}', '--protocol', 'http2'],
                 text=True
             )
             
@@ -76,21 +76,28 @@ def start_cloudflare_tunnel(port):
                 print("="*60 + "\n")
                 return cloudflared_process, None
             except:
-                print("⚠️  Cloudflare Tunnel started but couldn't extract URL")
+                print("Warning: Cloudflare Tunnel started but couldn't extract URL")
                 print("   Check the output above for the public URL")
                 return cloudflared_process, None
     except FileNotFoundError:
-        print("\n⚠️  cloudflared not found.")
+        print("\nWarning: cloudflared not found.")
         print("   Install from: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/")
         print("   Or use localhost only (http://127.0.0.1:8000)\n")
         return None, None
     except Exception as e:
-        print(f"\n⚠️  Error starting Cloudflare Tunnel: {e}")
+        print(f"\nWarning: Error starting Cloudflare Tunnel: {e}")
         print("   Continuing with localhost only...\n")
         return None, None
 
 def main():
     """Start the web server"""
+    # Fix Windows console encoding issues for Unicode (emojis)
+    try:
+        if sys.platform == 'win32':
+            sys.stdout.reconfigure(encoding='utf-8')
+    except (AttributeError, ValueError):
+        pass
+
     # Ensure web directory exists
     WEB_DIR.mkdir(exist_ok=True)
     

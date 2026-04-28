@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 from datetime import time
 from strategies.base import Strategy
+from .reporting import generate_trade_plot
+from types import SimpleNamespace
 from .parameters import get_param_value
 from .indicators import (
     calculate_bollinger_bands, calculate_atr, calculate_ema, calculate_adx,
@@ -424,12 +426,25 @@ class BollingerStrategy(Strategy):
             
         return False, None, None
 
+    def generate_trade_report(self, trade: dict, df: pd.DataFrame, output_dir: str) -> str:
+        """Link to the bollinger reporting generate_trade_plot function."""
+        try:
+            # Convert dict to object that generate_trade_plot expects
+            t_obj = SimpleNamespace(**trade)
+            if not hasattr(t_obj, 'pnl_currency'):
+                t_obj.pnl_currency = trade.get('pnl', 0)
+            
+            return generate_trade_plot(t_obj, df, output_dir, version=self.params_dict.get('version', '4.0'))
+        except Exception as e:
+            import logging
+            logging.error(f"BollingerStrategy failed to generate report: {e}")
+            return ""
+
     def update_trailing_stop(self, position, row, df):
-        """Update trailing stop."""
+        """Update trailing stop based on ATR."""
         high = row['high'] if isinstance(row, pd.Series) else row.high
         low = row['low'] if isinstance(row, pd.Series) else row.low
         atr = row['atr_ts'] if isinstance(row, pd.Series) else row.atr_ts
-        idx = row.name if isinstance(row, pd.Series) else row.Index
         
         position['bars_held'] = position.get('bars_held', 0) + 1
         

@@ -174,12 +174,13 @@ def generate_overlay_chart(trade_row, ohlc_df, output_dir):
 
         # Live Trade
         if pd.notna(trade_row['Live Time']):
-            color = 'green' if trade_row['Live Dir'] == 1 else 'red'
+            live_is_long = trade_row.get('Live Dir') in [1, 'LONG', 'Long', 'long']
+            color = 'green' if live_is_long else 'red'
             # Entry
             fig.add_trace(go.Scatter(
                 x=[trade_row['Live Time']], y=[trade_row['Live Price']],
                 mode='markers',
-                marker=dict(symbol='triangle-up' if trade_row['Live Dir']==1 else 'triangle-down', size=15, color=color, line=dict(width=2, color='black')),
+                marker=dict(symbol='triangle-up' if live_is_long else 'triangle-down', size=15, color=color, line=dict(width=2, color='black')),
                 name='LIVE Entry'
             ))
             # Exit
@@ -201,7 +202,8 @@ def generate_overlay_chart(trade_row, ohlc_df, output_dir):
 
         # BT Trade
         if pd.notna(trade_row['BT Time']):
-            color = 'lime' if trade_row['BT Dir'] == 1 else 'magenta'
+            bt_is_long = trade_row.get('BT Dir') in [1, 'LONG', 'Long', 'long']
+            color = 'lime' if bt_is_long else 'magenta'
             # Entry
             fig.add_trace(go.Scatter(
                 x=[trade_row['BT Time']], y=[trade_row['BT Price']],
@@ -227,11 +229,122 @@ def generate_overlay_chart(trade_row, ohlc_df, output_dir):
                 ))
             
         title = f"Trade Comparison | Status: {trade_row['Status']} | Diff: {trade_row.get('Diff (s)', 'N/A')}s"
-        fig.update_layout(title=title, height=500, template='plotly_white')
+        fig.update_layout(
+            title=title, 
+            height=500, 
+            template='plotly_white',
+            yaxis=dict(fixedrange=False, autorange=True),
+            xaxis=dict(rangeslider=dict(visible=False))
+        )
         
         filename = f"overlay_{center_time.strftime('%Y%m%d_%H%M%S')}.html"
         filepath = os.path.join(output_dir, filename)
-        fig.write_html(filepath, include_plotlyjs='cdn')
+        
+        # Stats Preparation
+        def get_dir_str(d):
+            if pd.isna(d) or d == "": return "-"
+            if isinstance(d, str):
+                return d.upper()
+            return "LONG" if d == 1 else "SHORT"
+            
+        def get_dir_class(d):
+            if pd.isna(d) or d == "": return ""
+            d_str = str(d).upper()
+            if d_str == "LONG" or d == 1: return "long"
+            if d_str == "SHORT" or d == -1: return "short"
+            return ""
+
+        stats_html = f"""
+        <div class="stats-box">
+            <h3>Trade Comparison Details</h3>
+            <table>
+                <tr>
+                    <th>Metric</th>
+                    <th>Live / Paper</th>
+                    <th>Backtest (Model)</th>
+                </tr>
+                <tr>
+                    <td><b>Direction</b></td>
+                    <td class="{get_dir_class(trade_row.get('Live Dir'))}">{get_dir_str(trade_row.get('Live Dir'))}</td>
+                    <td class="{get_dir_class(trade_row.get('BT Dir'))}">{get_dir_str(trade_row.get('BT Dir'))}</td>
+                </tr>
+                <tr>
+                    <td><b>Entry Time</b></td>
+                    <td>{trade_row['Live Time'].strftime('%H:%M:%S') if pd.notna(trade_row.get('Live Time')) else '-'}</td>
+                    <td>{trade_row['BT Time'].strftime('%H:%M:%S') if pd.notna(trade_row.get('BT Time')) else '-'}</td>
+                </tr>
+                <tr>
+                    <td><b>Entry Price</b></td>
+                    <td>{f"{trade_row.get('Live Price', 0):.2f}" if pd.notna(trade_row.get('Live Price')) else '-'}</td>
+                    <td>{f"{trade_row.get('BT Price', 0):.2f}" if pd.notna(trade_row.get('BT Price')) else '-'}</td>
+                </tr>
+                <tr>
+                    <td><b>Exit Price</b></td>
+                    <td>{f"{trade_row.get('Live Exit Price', 0):.2f}" if pd.notna(trade_row.get('Live Exit Price')) else '-'}</td>
+                    <td>{f"{trade_row.get('BT Exit Price', 0):.2f}" if pd.notna(trade_row.get('BT Exit Price')) else '-'}</td>
+                </tr>
+                <tr>
+                    <td><b>PnL</b></td>
+                    <td class="{'pnl-pos' if trade_row.get('Live PnL', 0) > 0 else 'pnl-neg' if trade_row.get('Live PnL', 0) < 0 else ''}">${f"{trade_row.get('Live PnL', 0):.2f}" if pd.notna(trade_row.get('Live PnL')) else '-'}</td>
+                    <td class="{'pnl-pos' if trade_row.get('BT PnL', 0) > 0 else 'pnl-neg' if trade_row.get('BT PnL', 0) < 0 else ''}">${f"{trade_row.get('BT PnL', 0):.2f}" if pd.notna(trade_row.get('BT PnL')) else '-'}</td>
+                </tr>
+                <tr>
+                    <td><b>Duration</b></td>
+                    <td>{str(trade_row.get('Live Dur', '-')).split('.')[0]}</td>
+                    <td>{str(trade_row.get('BT Dur', '-')).split('.')[0]}</td>
+                </tr>
+                <tr>
+                    <td><b>Sync Lag</b></td>
+                    <td colspan="2" style="text-align:center; background:#f8f9fa;">{f"{trade_row.get('Diff (s)', 0):.1f}s" if pd.notna(trade_row.get('Diff (s)')) else 'N/A'}</td>
+                </tr>
+            </table>
+        </div>
+        """
+
+        # Wrapped in template for "Back to Gallery" button and Stats
+        plotly_div = fig.to_html(full_html=False, include_plotlyjs='cdn', config={'scrollZoom': True})
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>{title}</title>
+            <style>
+                body {{ font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; margin: 0; background: #f8fafc; padding: 20px; }}
+                .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+                .back-home {{ 
+                    display: inline-block; 
+                    margin-bottom: 20px; 
+                    padding: 8px 16px; 
+                    background: #34495e; 
+                    color: white; 
+                    text-decoration: none; 
+                    border-radius: 6px; 
+                    font-size: 14px;
+                    transition: background 0.2s;
+                }}
+                .back-home:hover {{ background: #2c3e50; }}
+                .stats-box {{ margin-bottom: 20px; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; background: #fff; }}
+                .stats-box h3 {{ margin-top: 0; color: #1e293b; font-size: 1.1rem; border-bottom: 2px solid #f1f5f9; padding-bottom: 10px; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+                th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #f1f5f9; }}
+                th {{ color: #64748b; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; }}
+                .long {{ color: #059669; font-weight: bold; }}
+                .short {{ color: #dc2626; font-weight: bold; }}
+                .pnl-pos {{ color: #059669; }}
+                .pnl-neg {{ color: #dc2626; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <a href="index.html" class="back-home">&larr; Back to Gallery</a>
+                {stats_html}
+                {plotly_div}
+            </div>
+        </body>
+        </html>
+        """
+        with open(filepath, "w", encoding='utf-8') as f:
+            f.write(html)
         return filename
         
     except Exception as e:
@@ -262,6 +375,19 @@ def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", out
     agg_filename = "aggregate_metrics.html"
     agg_fig.write_html(os.path.join(output_dir, agg_filename), include_plotlyjs='cdn')
 
+    # Helpers for table rendering
+    def get_dir_str(d):
+        if pd.isna(d) or d == "": return "-"
+        if isinstance(d, str): return d.upper()
+        return "LONG" if d == 1 else "SHORT"
+        
+    def get_dir_class(d):
+        if pd.isna(d) or d == "": return ""
+        d_str = str(d).upper()
+        if d_str == "LONG" or d == 1: return "long"
+        if d_str == "SHORT" or d == -1: return "short"
+        return ""
+
     # HTML Header
     html_content = """
     <!DOCTYPE html>
@@ -282,9 +408,24 @@ def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", out
             .btn { display: inline-block; padding: 5px 10px; background: #3498db; color: white; text-decoration: none; border-radius: 4px; margin-top: 10px; font-size: 0.8rem;}
             .btn:hover { background: #2980b9; }
             iframe { width: 100%; height: 600px; border: none; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); background: white; }
+            .back-home { 
+                display: inline-block; 
+                margin-bottom: 20px; 
+                padding: 8px 16px; 
+                background: #34495e; 
+                color: white; 
+                text-decoration: none; 
+                border-radius: 6px; 
+                font-size: 14px;
+                transition: background 0.2s;
+            }
+            .back-home:hover { background: #2c3e50; }
+            .long { color: #059669; font-weight: bold; }
+            .short { color: #dc2626; font-weight: bold; }
         </style>
     </head>
     <body>
+        <a href="../index.html" class="back-home">&larr; Back to Home</a>
         <h1>Live vs Backtest Comparison Analysis</h1>
         <p>Generated: """ + pd.Timestamp.now().strftime('%Y-%m-%d %H:%M') + """</p>
         
@@ -306,11 +447,16 @@ def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", out
         plot_link = ""
         overlay_file = generate_overlay_chart(row, ohlc_df, output_dir)
         if overlay_file:
-            plot_link = f'<a href="{overlay_file}" target="_blank" class="btn">View Chart Overlay</a>'
+            plot_link = f'<a href="{overlay_file}" class="btn">View Chart Overlay</a>'
 
         live_t_str = row['Live Time'].strftime('%H:%M:%S') if pd.notna(row['Live Time']) else '-'
         bt_t_str = row['BT Time'].strftime('%H:%M:%S') if pd.notna(row['BT Time']) else '-'
         diff_str = f"{row.get('Diff (s)', 0):.1f}s" if pd.notna(row.get('Diff (s)')) else '-'
+        
+        # Determine overall direction for the row (favor Live, fallback to BT)
+        dir_val = row.get('Live Dir') if pd.notna(row.get('Live Dir')) else row.get('BT Dir')
+        dir_label = get_dir_str(dir_val)
+        dir_class = get_dir_class(dir_val)
         
         html_content += f"""
         <div class="card {cls}">
@@ -318,6 +464,9 @@ def generate_comparison_charts(csv_path="comparison_metrics_sequential.csv", out
             <table>
                 <tr>
                     <th>Metric</th><th>Live</th><th>Backtest</th>
+                </tr>
+                <tr>
+                    <td>Direction</td><td class="{dir_class}">{dir_label}</td><td class="{get_dir_class(row.get('BT Dir'))}">{get_dir_str(row.get('BT Dir'))}</td>
                 </tr>
                 <tr>
                     <td>Time</td><td>{live_t_str}</td><td>{bt_t_str}</td>

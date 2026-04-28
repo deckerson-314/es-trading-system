@@ -37,15 +37,16 @@ class Strategy(ABC):
         pass
 
     @abstractmethod
-    def calculate_entry_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    def calculate_entry_signals(self, df: pd.DataFrame, **kwargs) -> tuple:
         """
         Generate entry signals based on indicators.
         
         Args:
             df: DataFrame with indicators.
+            **kwargs: Implementation-specific options (e.g., verbose=True for diagnostic logs).
             
         Returns:
-            tuple: (long_signal_series, short_signal_series) - boolean or integer series (1/0).
+            tuple: (long_signal_series, short_signal_series) or (long, short, action_log).
         """
         pass
     
@@ -82,15 +83,6 @@ class Strategy(ABC):
         """
         Create a new position dictionary object.
         Can be overridden by subclasses if extra state is needed.
-        
-        Args:
-            entry_price: Price the trade was entered at.
-            direction: 1 for Long, -1 for Short.
-            row: Current bar data.
-            df: Full DataFrame.
-            
-        Returns:
-            dict: Position object.
         """
         return {
             'entry_time': row.Index,
@@ -99,3 +91,10 @@ class Strategy(ABC):
             'sl_price': 0.0,
             'tp_price': 0.0
         }
+
+    def generate_trade_report(self, trade: dict, df: pd.DataFrame, output_dir: str) -> str:
+        """
+        Optional: Generate a detailed HTML report for a completed trade.
+        Returns the filename/relative path of the generated report.
+        """
+        return ""

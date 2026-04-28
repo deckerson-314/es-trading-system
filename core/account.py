@@ -4,6 +4,9 @@ Ported from ib_deployment_v4.py lines 649-820
 """
 import logging
 from datetime import datetime
+import pytz
+
+EASTERN = pytz.timezone('US/Eastern')
 
 
 def format_duration(seconds):
@@ -36,13 +39,26 @@ def get_account_summary(ib, data=None, contract=None, portfolio_realized_pnl=Non
                        'GROSSPOSITION', 'AVAILABLEFUNDS', 'REALIZEDPNL', 'UNREALIZEDPNL']):
                     try:
                         val = float(value) if value else 0.0
+                        
+                        # Store raw tag
                         summary[tag] = val
+                        
+                        # Normalize common tags to canonical names
+                        # RULE: Prefer exact tag match 'NetLiquidation' or non-zero value
                         if 'NETLIQUIDATION' in tag_upper:
-                            summary['NetLiquidation'] = val
+                            if tag == 'NetLiquidation' or summary.get('NetLiquidation', 0) == 0:
+                                summary['NetLiquidation'] = val
                         if 'CASH' in tag_upper and ('TOTAL' in tag_upper or 'BALANCE' in tag_upper):
-                            summary['TotalCashValue'] = val
+                            if summary.get('TotalCashValue', 0) == 0:
+                                summary['TotalCashValue'] = val
                         if 'BUYINGPOWER' in tag_upper:
                             summary['BuyingPower'] = val
+                        if 'REALIZEDPNL' in tag_upper:
+                            if val != 0 or summary.get('RealizedPNL', 0) == 0:
+                                summary['RealizedPNL'] = val
+                        if 'UNREALIZEDPNL' in tag_upper:
+                            if val != 0 or summary.get('UnrealizedPNL', 0) == 0:
+                                summary['UnrealizedPNL'] = val
                     except (ValueError, TypeError):
                         pass
 
@@ -74,15 +90,13 @@ def get_account_summary(ib, data=None, contract=None, portfolio_realized_pnl=Non
             total_realized_pnl += realized
 
         # Use portfolio callback PnL if available (most accurate)
+        # Use portfolio callback PnL if available (most accurate)
         if portfolio_realized_pnl is not None:
             summary['RealizedPNL'] = portfolio_realized_pnl
-        else:
+        elif summary.get('RealizedPNL', 0) == 0:
             summary['RealizedPNL'] = total_realized_pnl
 
-        account_unrealized = summary.get('UnrealizedPNL', 0)
-        if account_unrealized == 0 and total_unrealized_pnl != 0:
-            summary['UnrealizedPNL'] = total_unrealized_pnl
-        elif 'UnrealizedPNL' not in summary:
+        if summary.get('UnrealizedPNL', 0) == 0 and total_unrealized_pnl != 0:
             summary['UnrealizedPNL'] = total_unrealized_pnl
 
         summary['ES_Positions'] = len(es_positions)
@@ -94,7 +108,7 @@ def get_account_summary(ib, data=None, contract=None, portfolio_realized_pnl=Non
 
 def add_to_live_tracker(live_tracker, event_type, message, max_entries=200):
     """Add an event to the live tracker ring buffer."""
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = datetime.now(EASTERN).strftime('%Y-%m-%d %H:%M:%S')
     live_tracker.append({
         'timestamp': timestamp,
         'type': event_type,
@@ -106,7 +120,7 @@ def add_to_live_tracker(live_tracker, event_type, message, max_entries=200):
 
 def add_error(error_log, error_msg, max_entries=100):
     """Add an error to the error log ring buffer."""
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = datetime.now(EASTERN).strftime('%Y-%m-%d %H:%M:%S')
     error_log.append({
         'timestamp': timestamp,
         'error': error_msg

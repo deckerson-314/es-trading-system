@@ -22,14 +22,15 @@ def check_credentials():
         return False
     return True
 
-def send_email(subject: str, body: str, attachment_path: str = None) -> bool:
+def send_email(subject: str, body: str, attachment_path: str = None, attachment_paths: list[str] = None) -> bool:
     """
     Send an email notification using Gmail SMTP (SSL).
     
     Args:
         subject: The subject line of the email.
         body: The plain text body of the email.
-        attachment_path: Optional path to an image to attach.
+        attachment_path: Optional path to a single image to attach (backward compatibility).
+        attachment_paths: Optional list of paths to images to attach.
         
     Returns:
         bool: True if email was sent successfully, False otherwise.
@@ -48,11 +49,19 @@ def send_email(subject: str, body: str, attachment_path: str = None) -> bool:
         
         msg.attach(MIMEText(body, 'plain'))
         
-        if attachment_path and os.path.exists(attachment_path):
-            with open(attachment_path, 'rb') as f:
-                img_data = f.read()
-            image = MIMEImage(img_data, name=os.path.basename(attachment_path))
-            msg.attach(image)
+        # Handle attachments
+        final_attachments = []
+        if attachment_path:
+            final_attachments.append(attachment_path)
+        if attachment_paths:
+            final_attachments.extend(attachment_paths)
+            
+        for path in final_attachments:
+            if path and os.path.exists(path):
+                with open(path, 'rb') as f:
+                    img_data = f.read()
+                image = MIMEImage(img_data, name=os.path.basename(path))
+                msg.attach(image)
             
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(EMAIL_FROM, EMAIL_PWD)

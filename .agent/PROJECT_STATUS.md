@@ -55,8 +55,8 @@ c:\Trading\
 - **Order Modification Safety** — Trailing stops now correctly modify existing orders on the exchange while preserving OCA group linkage.
 - **Strategy Functional Test Plan** — Comprehensive blueprint completed (April 3).
 - **Functional Test Bench** — 28 pytest tests passing (`tests/test_trend_functional.py`). Covers crossover logic, kill switches, 6 filter gates, DoE grid, trailing stop ratchet/delay, ATR-TP precision, channel exit, and **Action Log diagnostics (Pillar B)**.
-- **Trend Reporting Module** — `strategies/trend/reporting.py` implemented with support for Trend indicators and Action Log visualization.
-- **Action Log Integration** — `backtest.py` now captures and reports rejection reasons from `TrendStrategy`.
+- **Trend Reporting Module** — `strategies/trend/reporting.py` enhanced with **Rejection Gallery**. Provides strip charts for near-miss trades to verify execution parity and filter sensitivity.
+- **Improved Diagnostics** — `TrendStrategy` now reports actual vs. threshold values for all filters (Volume, ADX, SMA, etc.).
 
 ### ⚠️ Known Issues / Recently Fixed (may need restart to take effect)
 1. **Fixed in this session (Apr 3):**
@@ -78,10 +78,12 @@ c:\Trading\
 ---
 
 ## Changes Made This Session
-### Phase 10: Pillar B Integration & Trend Reporting (Apr 11)
-- **Integrated Action Log into Backtester**: Updated `backtest.py` to capture and report rejection reasons from the strategy.
-- **Finalized Trend Reporting**: Completed `generate_dashboard` in `strategies/trend/reporting.py` to display the "Near-Miss" Action Log.
-- **Committed Legacy Progress**: Discovered and committed Pillar B logic and `reporting.py` draft (which were previously uncommitted on disk).
+### Phase 10b: Rejection Gallery Implementation (Apr 12)
+- **Implemented Strip Charts**: Created `generate_near_miss_plot` to visualize why trades were rejected.
+- **Unified Action Log & Gallery**: The dashboard now includes both a detailed log and a visual gallery of "Near-Misses".
+- **Enhanced Diagnostics**: Fixed missing Volume/SMA/VWAP data in rejection reasons.
+
+### Phase 10a: Pillar B Integration & Trend Reporting (Apr 11-12)
 
 ### Phase 9b: Functional Test Bench Implementation (Apr 3 — Evening)
 - **Created `tests/helpers/synthetic_data.py`**: Factory functions for artificial OHLCV.

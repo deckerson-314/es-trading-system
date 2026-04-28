@@ -362,13 +362,13 @@ def main():
     # Start HTTP server
     with socketserver.TCPServer(("", PORT), CustomHTTPRequestHandler) as httpd:
         print("="*60)
-        print("🚀 Trading Strategy Web Server")
+        print("Trading Strategy Web Server")
         print("="*60)
-        print(f"📁 Serving directory: {WEB_DIR.absolute()}")
-        print(f"🌐 Local URL: http://127.0.0.1:{PORT}")
-        print(f"🌐 Network URL: http://{get_local_ip()}:{PORT}")
+        print(f"Serving directory: {WEB_DIR.absolute()}")
+        print(f"Local URL: http://127.0.0.1:{PORT}")
+        print(f"Network URL: http://{get_local_ip()}:{PORT}")
         print("="*60)
-        print("\n💡 Tips:")
+        print("\nTips:")
         print("   - Access from this computer: http://127.0.0.1:8000")
         print("   - Access from network: http://<your-ip>:8000")
         print("   - Press Ctrl+C to stop the server")

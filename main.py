@@ -52,12 +52,14 @@ from tools.notifications.email_service import send_email
 # Core modules (ported from ib_deployment_v4.py)
 from core.connection import get_front_es_contract, connect_with_retry, request_historical_data_with_retry
 from core.account import get_account_summary, format_duration, add_to_live_tracker, add_error
-from core.execution import check_entries, check_exits, _close_all_positions
+from core.execution import check_entries, check_exits, _close_all_positions, send_composite_status_notification
 from core.protection import (cancel_all_pending, cleanup_orphaned_orders, close_orphaned_positions,
                               protect_existing_positions, check_and_recreate_tp_orders,
                               periodic_protection_check, run_reconnection_safety_sequence,
                               reconcile_positions)
 from core.monitoring import update_indicators, on_bar_update_handler
+
+EASTERN = pytz.timezone('US/Eastern')
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
@@ -313,9 +315,11 @@ async def update_ui_periodically():
             continue
         try:
             if dashboard_state:
-                dashboard_state.is_connected = ib.isConnected()
-                dashboard_state.total_uptime_seconds = total_uptime_seconds
-                dashboard_state.connection_start_time = connection_start_time
+                # Update account summary using robust utility
+                dashboard_state.account_info = get_account_summary(
+                    ib, data=data_ref['data'], contract=contract, 
+                    portfolio_realized_pnl=portfolio_realized_pnl
+                )
 
                 # Update positions
                 pos_data = []
@@ -325,8 +329,8 @@ async def update_ui_periodically():
                             'symbol': p.contract.symbol, 'position': p.position,
                             'avgCost': p.averageCost,
                             'marketValue': p.marketValue,
-                            'realizedPNL': p.realizedPNL,
-                            'unrealizedPNL': p.unrealizedPNL
+                            'realizedPNL': getattr(p, 'realizedPNL', getattr(p, 'realizedPnl', 0)) or 0,
+                            'unrealizedPNL': getattr(p, 'unrealizedPNL', getattr(p, 'unrealizedPnl', 0)) or 0
                         })
                 dashboard_state.positions = pos_data
 
@@ -340,36 +344,22 @@ async def update_ui_periodically():
                             'lmtPrice': t.order.lmtPrice, 'auxPrice': t.order.auxPrice,
                             'status': t.orderStatus.status
                         })
-                # Update positions only if connected or if we want to show last known
-                if ib.isConnected():
-                    pos_data = []
-                    for p in ib.portfolio():
-                        if not contract or p.contract.symbol == contract.symbol:
-                            pos_data.append({
-                                'symbol': p.contract.symbol, 'position': p.position,
-                                'avgCost': p.averageCost,
-                                'marketValue': p.marketValue,
-                                'realizedPNL': p.realizedPNL,
-                                'unrealizedPNL': p.unrealizedPNL
-                            })
-                    dashboard_state.positions = pos_data
+                dashboard_state.active_orders = orders_data
 
-                    # Update orders
-                    orders_data = []
-                    for t in ib.trades():
-                        if not t.isDone():
-                            orders_data.append({
-                                'orderId': t.order.orderId, 'orderType': t.order.orderType,
-                                'action': t.order.action, 'totalQuantity': t.order.totalQuantity,
-                                'lmtPrice': t.order.lmtPrice, 'auxPrice': t.order.auxPrice,
-                                'status': t.orderStatus.status
-                            })
-                    dashboard_state.active_orders = orders_data
+                # Update state common fields
+                dashboard_state.is_connected = ib.isConnected()
+                dashboard_state.total_uptime_seconds = total_uptime_seconds
+                dashboard_state.connection_start_time = connection_start_time
+                dashboard_state.last_data_receipt_time = last_data_receipt['time']
 
                 # Always update live tracker and completed trades on dashboard
                 dashboard_state.live_tracker = live_tracker[-200:]
                 dashboard_state.bar_log = bar_log[-20:]
                 dashboard_state.completed_trades = completed_trades[-50:]
+                
+                # Update current price in state for dashboard metrics
+                if data_ref['data'] is not None and not data_ref['data'].empty:
+                    dashboard_state.current_price = data_ref['data']['close'].iloc[-1]
 
                 dash_path = os.path.join(WEB_DIR, args.dashboard)
                 status_path = os.path.join(WEB_DIR, f"{args.mode.lower()}_status.js")
@@ -455,10 +445,10 @@ def make_custom_email_fn():
     mode_tag = "L" if args.mode.casefold() == 'live' else "P"
     prefix = f"[{strat_tag}-{mode_tag}]"
     
-    def custom_send_email(subj, body, attachment_path=None):
+    def custom_send_email(subj, body, attachment_path=None, attachment_paths=None):
         cleaned_subj = subj.replace("[BB] ", "").replace("[TR] ", "").replace("BB Strategy - ", "")
         final_subj = f"{prefix} {cleaned_subj}"
-        return send_email(final_subj, body, attachment_path)
+        return send_email(final_subj, body, attachment_path, attachment_paths)
     return custom_send_email
 
 custom_send_email = make_custom_email_fn()
@@ -499,7 +489,8 @@ async def main():
             mode=args.mode, port=args.port,
             contract_symbol=contract.localSymbol,
             connection_start_time=datetime.now(),
-            is_connected=True, params=params_dict
+            is_connected=True, params=params_dict,
+            last_data_receipt_time=last_data_receipt['time']
         )
 
         # Initialize Security Guard
@@ -588,7 +579,11 @@ async def main():
                 if not ib.isConnected():
                     # Track disconnect
                     if connection_start_time:
-                        total_uptime_seconds += (datetime.now() - connection_start_time).total_seconds()
+                        now_eastern = datetime.now(EASTERN)
+                        # Ensure connection_start_time is offset-aware
+                        if connection_start_time.tzinfo is None:
+                            connection_start_time = EASTERN.localize(connection_start_time)
+                        total_uptime_seconds += (now_eastern - connection_start_time).total_seconds()
                         connection_start_time = None
                     add_to_live_tracker(live_tracker, 'warning', 'Connection lost - reconnecting')
                     dashboard_stats['reconnections'] += 1
@@ -596,7 +591,7 @@ async def main():
                     logging.warning("Connection lost, reconnecting...")
                     await connect_with_retry(ib, '127.0.0.1', args.port, base_client_id=args.client_id)
 
-                    connection_start_time = datetime.now()
+                    connection_start_time = datetime.now(EASTERN)
                     add_to_live_tracker(live_tracker, 'info', 'Reconnected')
 
                     ensure_connected_and_subscribed()
@@ -611,23 +606,25 @@ async def main():
                         dashboard_state.is_connected = True
                         dashboard_state.connection_start_time = connection_start_time
                         dash_path = os.path.join(WEB_DIR, args.dashboard)
+                        dashboard_state.last_data_receipt_time = last_data_receipt['time']
+                        dash_path = os.path.join(WEB_DIR, args.dashboard)
                         status_path = os.path.join(WEB_DIR, f"{args.mode.lower()}_status.js")
                         update_dashboard(dashboard_state, dash_path, status_path)
                         add_to_live_tracker(live_tracker, 'info', 'Dashboard refreshed after reconnection')
 
-                # 30-Min Heartbeat Status
+                # 15-Min Heartbeat Status (Enhanced with Charts)
                 now = datetime.now()
-                if (now - last_heartbeat_time).total_seconds() >= 1800:
+                if (now - last_heartbeat_time).total_seconds() >= 900:
                     last_heartbeat_time = now
                     if positions:
-                        total_pos = sum(p.position for p in ib.positions() if p.contract.symbol == 'ES')
-                        pos_str = "L" if total_pos > 0 else "S"
-                        unpnl = dashboard_state.account_info.get('UnrealizedPNL', 0)
-                        subj = f"STAT: {pos_str} {abs(total_pos)} PNL:${unpnl:,.0f}"
-                        msg = (f"Status Update: {now.strftime('%H:%M')}\n"
-                               f"Positions: {total_pos}\nUnrealized: ${unpnl:,.2f}\n"
-                               f"NetLiq: ${dashboard_state.account_info.get('NetLiquidation', 0):,.2f}")
-                        custom_send_email(subj, msg)
+                        # Use the new detailed status reporting with charts
+                        send_composite_status_notification(
+                            ib, positions, data_ref['data'], 
+                            dashboard_state.account_info if dashboard_state else {}, 
+                            custom_send_email
+                        )
+                    # (Removed 'else' block to skip flat status emails)
+
 
                 # Data liveness check
                 time_since = (now - last_data_receipt['time']).total_seconds()

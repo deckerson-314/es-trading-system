@@ -1,1 +1,1 @@
-window.updateStatus('paper', {"mode": "PAPER", "port": 7497, "connected": true, "net_liquidation": 1006183.0, "pnl": 0.0, "position": 1.0, "last_update": "2026-04-01 09:20:32"});
+window.updateStatus('paper', {"mode": "PAPER", "port": 4002, "connected": true, "net_liquidation": 1011231.91, "pnl": 0.0, "position": 0.0, "last_update": "2026-04-27 20:29:59"});

@@ -14,6 +14,32 @@ from core.account import add_to_live_tracker
 from core.execution import check_entries, check_exits
 
 
+def resample_data(df, timeframe_mins):
+    """
+    Resample 1-minute OHLCV data into arbitrary minute timeframe.
+    Args:
+        df: 1-minute DataFrame with datetime index.
+        timeframe_mins: Target timeframe in minutes.
+    Returns:
+        DataFrame resampled and aggregated correctly.
+    """
+    if timeframe_mins <= 1:
+        return df.copy()
+
+    # Rule: Sum volume, first open, max high, min low, last close
+    logic = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
+
+    # Use closed='right', label='right' to match IB bar behavior (e.g. 10:00 bar contains 09:30-10:00)
+    resampled = df.resample(f'{timeframe_mins}min', closed='right', label='right').agg(logic)
+    return resampled.dropna()
+
+
 def _indicators_ready(data):
     """Check if indicators have been calculated (strategy-agnostic).
     Returns True if the data has any indicator columns beyond OHLCV.
@@ -26,42 +52,47 @@ def _indicators_ready(data):
 def update_indicators(strategy, data):
     """Update indicators and filters on the global data DataFrame.
     Handles resampling correctly — prevents stale force_exit values across day boundaries.
-    Strategy-agnostic: works with any strategy that implements calculate_indicators() and apply_filters().
+    Fixed: Now supports higher timeframes by resampling before calculation.
     """
+    timeframe = getattr(strategy, 'timeframe', 1)
     min_bars = strategy.min_bars_required
+    
     if len(data) < min_bars:
         return
 
-    data_with_indicators = strategy.calculate_indicators(data.copy())
+    # 1. Prepare Data for Calculation
+    if timeframe > 1:
+        # Resample for HTF calculation
+        data_to_calc = resample_data(data, timeframe)
+    else:
+        data_to_calc = data.copy()
 
-    # Copy ALL indicator columns back (strategy-agnostic)
-    base_cols = {'open', 'high', 'low', 'close', 'volume'}
-    indicator_cols = [col for col in data_with_indicators.columns if col not in base_cols]
-    for col in indicator_cols:
-        data[col] = data_with_indicators[col]
+    if len(data_to_calc) < 2: # Need at least some history
+        return
 
-    # Apply filters
+    # 2. Calculate Indicators on correct periodicity
+    data_with_indicators = strategy.calculate_indicators(data_to_calc)
+    
+    # 3. Apply filters
     data_with_filters = strategy.apply_filters(data_with_indicators)
 
-    # CRITICAL: force_exit/force_exit_rth must NOT be forward-filled (stale values across day boundaries)
-    for col in ['force_exit', 'force_exit_rth']:
-        if col in data_with_filters.columns:
-            data[col] = False  # Reset first
+    # 4. Map back to 1-minute bars
+    # Copy ALL indicator and filter columns back
+    base_cols = {'open', 'high', 'low', 'close', 'volume'}
+    new_cols = [col for col in data_with_filters.columns if col not in base_cols]
+    
+    for col in new_cols:
+        # For force_exit, we only want to map exactly OR ffill if logical
+        if col in ['force_exit', 'force_exit_rth']:
+            data[col] = False # Reset first
+            # Map exactly to the boundary rows
             matching = data.index.intersection(data_with_filters.index)
             if len(matching) > 0:
                 data.loc[matching, col] = data_with_filters.loc[matching, col]
-            # For latest row without match, use most recent resampled bar
-            if len(data) > 0 and data.index[-1] not in matching:
-                latest_time = data.index[-1]
-                earlier = data_with_filters[data_with_filters.index <= latest_time]
-                if len(earlier) > 0:
-                    data.loc[data.index[-1], col] = earlier[col].iloc[-1]
-
-    # Other filter columns: forward-fill is OK
-    for col in ['volume_filter', 'atr_filter', 'in_rth', 'in_maintenance']:
-        if col in data_with_filters.columns:
-            reindexed = data_with_filters[col].reindex(data.index, method='ffill')
-            data[col] = reindexed.fillna(False)
+        else:
+            # For most indicators (SMA, ATR, volume_filter), forward-fill is correct
+            # Reindex to 1-min index and ffill
+            data[col] = data_with_filters[col].reindex(data.index, method='ffill')
 
 
 def save_live_data_row(output_dir, timestamp, row, full_df):
@@ -332,59 +363,55 @@ def on_bar_update_handler(bars, hasNewBar, *, strategy, ib, contract, data_ref,
         min_bars = strategy.min_bars_required
 
         # Process completed bar
-        if should_check and len(data) >= max(2, min_bars):
-            data_ind = strategy.calculate_indicators(data.copy())
+        if should_check and len(data) >= 2:
+            # IMPORTANT: Re-calculate HTF indicators and filters to get the CORRECT aggregated OHLCV
+            # for the reporting and signal boundary
+            resampled_df = resample_data(data, strategy.timeframe)
+            if len(resampled_df) < 2:
+                return
+
+            # Apply strategy logic to resampled data
+            resampled_ind = strategy.calculate_indicators(resampled_df.copy())
             try:
-                data_filt = strategy.apply_filters(data_ind)
+                resampled_filt = strategy.apply_filters(resampled_ind)
             except Exception:
-                data_filt = data_ind
+                resampled_filt = resampled_ind
 
-            if len(data_ind) >= 2:
-                # Use COMPLETED bar (index -2) for signal checks
-                completed_idx = data_ind.index[-2]
-                completed_row = data_ind.iloc[-2]
+            # Use COMPLETED HTF bar (index -2) for signal checks and reporting
+            completed_idx = resampled_filt.index[-2]
+            completed_row = resampled_filt.iloc[-2]
 
-                # Try to get filtered row
-                if len(data_filt) > 0 and completed_idx in data_filt.index:
-                    completed_row = data_filt.loc[completed_idx]
-                else:
-                    # Emergency filter fallback
-                    logging.warning(f"Filter row missing for {completed_idx}. Using indicators with emergency defaults.")
-                    completed_row = data_ind.iloc[-2].copy()
-                    # Set safe defaults for missing filter columns
-                    for col, default in [('volume_filter', False), ('atr_filter', True),
-                                         ('in_rth', True), ('in_maintenance', False),
-                                         ('avg_volume', 0)]:
-                        if col not in completed_row:
-                            completed_row[col] = default
+            bar_info = (f"[{strategy.timeframe}-min] {completed_idx.strftime('%H:%M:%S')} | "
+                       f"O: {completed_row.get('open', 0):.2f} H: {completed_row.get('high', 0):.2f} "
+                       f"L: {completed_row.get('low', 0):.2f} C: {completed_row.get('close', 0):.2f} | "
+                       f"Vol: {completed_row.get('volume', 0):,.0f}")
+            logging.info(bar_info)
 
-                bar_info = (f"[{strategy.timeframe}-min] {completed_idx.strftime('%H:%M:%S')} | "
-                           f"O: {completed_row.get('open', 0):.2f} H: {completed_row.get('high', 0):.2f} "
-                           f"L: {completed_row.get('low', 0):.2f} C: {completed_row.get('close', 0):.2f} | "
-                           f"Vol: {completed_row.get('volume', 0):,.0f}")
-                logging.info(bar_info)
+            # Signal check on the proper HTF bar
+            entry_criteria = ""
+            if _indicators_ready(data): # Data already has indicators mapped back from update_indicators above
+                # Note: We pass the resampled_filt to signal checker to ensure it sees HTF context
+                entry_criteria = log_entry_criteria_status(strategy, positions, completed_row, resampled_filt, output_dir=output_dir)
+                
+                # Save data for audit (use the resampled row)
+                save_live_data_row(output_dir, completed_idx, completed_row, resampled_filt)
+                
+                # Check entries using HTF bar
+                check_entries(strategy, ib, contract, data, positions, {},
+                             live_tracker, dashboard_state, send_email_fn, completed_idx, completed_row)
+                
+                # Check exits using HTF bar (for boundary exit signals)
+                check_exits(strategy, ib, contract, data, positions, completed_trades,
+                           live_tracker, send_email_fn, completed_idx, completed_row, allow_strategy_exit=True)
 
-                # Filtered row for signal check
-                filt_row = data_filt.loc[completed_idx] if (len(data_filt) > 0 and completed_idx in data_filt.index) else completed_row
-
-                # Entry criteria logging and signal checks (strategy-agnostic)
-                entry_criteria = ""
-                if _indicators_ready(data):
-                    entry_criteria = log_entry_criteria_status(strategy, positions, filt_row, data_filt, output_dir=output_dir)
-                    save_live_data_row(output_dir, completed_idx, filt_row, data_filt)
-                    check_entries(strategy, ib, contract, data, positions, {},
-                                 live_tracker, dashboard_state, send_email_fn, completed_idx, filt_row)
-                    check_exits(strategy, ib, contract, data, positions, completed_trades,
-                               live_tracker, send_email_fn, completed_idx, filt_row, allow_strategy_exit=True)
-
-                # Bar log for dashboard
-                bar_log.append({
-                    'timestamp': completed_idx.strftime('%H:%M:%S'),
-                    'bar_info': bar_info,
-                    'entry_criteria': entry_criteria
-                })
-                if len(bar_log) > 20:
-                    del bar_log[:-20]
+            # Bar log for dashboard
+            bar_log.append({
+                'timestamp': completed_idx.strftime('%H:%M:%S'),
+                'bar_info': bar_info,
+                'entry_criteria': entry_criteria
+            })
+            if len(bar_log) > 20:
+                del bar_log[:-20]
 
         # Realtime safety exits (using latest bar, not resampled)
         if len(data) >= min_bars and _indicators_ready(data):

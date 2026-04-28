@@ -110,9 +110,15 @@ def calculate_stats(trades_df, equity_series=None):
         'Avg Duration (min)': avg_dur, 'Max Duration (min)': max_dur
     }
 
-def generate_trade_plot(trade, df, output_dir, version, sol_name=None):
+def generate_trade_plot(trade, df, output_dir, version, sol_name=None, parent_filename=None):
     """Generate detailed HTML plot for a single trade."""
     try:
+        # Generate filename
+        exit_dt = pd.to_datetime(trade.exit_time)
+        timestamp = exit_dt.strftime("%Y%m%d_%H%M%S")
+        filename = f"trade_report_{timestamp}.html"
+        filepath = os.path.join(output_dir, filename)
+        
         # Get data segment
         entry_time = pd.to_datetime(trade.entry_time)
         exit_time = pd.to_datetime(trade.exit_time)
@@ -222,13 +228,44 @@ def generate_trade_plot(trade, df, output_dir, version, sol_name=None):
         title = f"{sol_prefix}Trade {trade.Index if hasattr(trade, 'Index') else ''} | {res_str} ${abs(trade.pnl_currency):,.0f} | {trade.reason}"
         fig_trade.update_layout(title=title, height=800, hovermode='x unified', template='plotly_white')
         
-        # Filename
-        pnl_str = f"{abs(trade.pnl_currency):.0f}"
-        sol_suffix = f"_{sol_name.replace(' ', '_')}" if sol_name else ""
-        filename = f"trade_{entry_time.strftime('%Y%m%d_%H%M')}_{res_str}_{pnl_str}{sol_suffix}.html"
-        filepath = os.path.join(output_dir, filename)
+        # Wrapped in template for "Back to Dashboard" button
+        plotly_div = fig_trade.to_html(full_html=False, include_plotlyjs='cdn')
         
-        fig_trade.write_html(filepath, include_plotlyjs='cdn')
+        back_link = parent_filename if parent_filename else "../dashboard_paper.html"
+        back_label = "Back to Dashboard"
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>{title}</title>
+            <style>
+                body {{ font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; margin: 0; background: #f8fafc; padding: 20px; }}
+                .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+                .back-home {{ 
+                    display: inline-block; 
+                    margin-bottom: 20px; 
+                    padding: 8px 16px; 
+                    background: #34495e; 
+                    color: white; 
+                    text-decoration: none; 
+                    border-radius: 6px; 
+                    font-size: 14px;
+                    transition: background 0.2s;
+                }}
+                .back-home:hover {{ background: #2c3e50; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <a href="{back_link}" class="back-home">&larr; {back_label}</a>
+                {plotly_div}
+            </div>
+        </body>
+        </html>
+        """
+        with open(filepath, "w", encoding='utf-8') as f:
+            f.write(html)
         return filename
         
     except Exception as e:
@@ -293,11 +330,24 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
             .sol-tag {{ position: absolute; top: 10px; right: 10px; font-size: 10px; background: #eee; padding: 2px 6px; border-radius: 4px; color: #555; }}
             
             .chart-container {{ margin: 20px 0; border: 1px solid #eee; border-radius: 8px; overflow: hidden; }}
+            .back-home {{ 
+                display: inline-block; 
+                margin-bottom: 20px; 
+                padding: 10px 20px; 
+                background: #34495e; 
+                color: white; 
+                text-decoration: none; 
+                border-radius: 6px; 
+                font-weight: 600;
+                transition: background 0.2s;
+            }}
+            .back-home:hover {{ background: #2c3e50; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>BB Strategy V{version} Report</h1>
+            <a href="index.html" class="back-home">&larr; Back to Home</a>
+            <h1>BB Strategy V{{version}} Report</h1>
     """
 
     # === 2. Top-Level Metric Boxes (Summary) ===
@@ -750,7 +800,7 @@ def generate_dashboard(solutions_data, output_dir=None, version='4.0', open_brow
             chart_link = ""
             if hasattr(trade, 'df_ref') and trade.df_ref is not None:
                 # Generate plot
-                plot_filename = generate_trade_plot(trade, trade.df_ref, output_dir, version, sol_name=trade.sol_name)
+                plot_filename = generate_trade_plot(trade, trade.df_ref, output_dir, version, sol_name=trade.sol_name, parent_filename=filename)
                 if plot_filename:
                     chart_link = f'<a href="{plot_filename}" target="_blank" class="btn">View Chart</a>'
 

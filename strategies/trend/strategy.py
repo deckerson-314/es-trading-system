@@ -183,6 +183,12 @@ class TrendStrategy(Strategy):
         if 'RSI Period' in params: self.rsi_period = int(params['RSI Period'])
         if 'RSI Max Buy Threshold' in params: self.rsi_max_buy = float(params['RSI Max Buy Threshold'])
         if 'RSI Min Sell Threshold' in params: self.rsi_min_sell = float(params['RSI Min Sell Threshold'])
+        
+        # Timeframe (Critical Fix for GA Displacement Bug)
+        if 'Timeframe (minutes)' in params:
+            self.timeframe = int(round(params['Timeframe (minutes)']))
+        elif 'timeframe' in params:
+            self.timeframe = int(round(params['timeframe']))
 
     def calculate_indicators(self, df):
         """Calculate Donchian Channels, ATR, ADX."""
@@ -285,51 +291,55 @@ class TrendStrategy(Strategy):
         long_breakout = (df['high'] > df['donchian_high']) & (df['high'].shift(1) <= df['donchian_high'].shift(1))
         short_breakout = (df['low'] < df['donchian_low']) & (df['low'].shift(1) >= df['donchian_low'].shift(1))
         
-        # --- 2. Individual Filter Masks ---
+        # --- 2. Individual Filter Masks (Ensure Series alignment) ---
         masks = {}
         
         # ADX Filter
-        masks['ADX'] = (df['adx'] > self.min_adx).values if self.enable_adx_filter else np.ones(len(df), dtype=bool)
+        if self.enable_adx_filter:
+            masks['ADX'] = (df['adx'] > self.min_adx)
+        else:
+            masks['ADX'] = pd.Series(True, index=df.index)
         
-        # ATR Filter
-        masks['ATR'] = (df['atr_filter'] > self.min_atr_points).values
+        # ATR Filter (Always on)
+        masks['ATR'] = (df['atr_filter'] > self.min_atr_points)
         
         # SMA Filter (Regime)
         if self.enable_sma_filter:
-            masks['SMA_Long'] = (df['close'] > df['sma_regime']).values
-            masks['SMA_Short'] = (df['close'] < df['sma_regime']).values
+            masks['SMA_Long'] = (df['close'] > df['sma_regime'])
+            masks['SMA_Short'] = (df['close'] < df['sma_regime'])
         else:
-            masks['SMA_Long'] = masks['SMA_Short'] = np.ones(len(df), dtype=bool)
+            masks['SMA_Long'] = masks['SMA_Short'] = pd.Series(True, index=df.index)
             
         # Volume Filter
         if getattr(self, 'enable_vol_filter', False):
-            masks['VOL'] = (df['volume'] > (df['vol_ma'] * self.min_vol_mult)).values
+            masks['VOL'] = (df['volume'] > (df['vol_ma'] * self.min_vol_mult))
         else:
-            masks['VOL'] = np.ones(len(df), dtype=bool)
-
+            masks['VOL'] = pd.Series(True, index=df.index)
+ 
         # RSI Filter
         if getattr(self, 'enable_rsi_filter', False):
-            masks['RSI_Long'] = (df['rsi'] < self.rsi_max_buy).values
-            masks['RSI_Short'] = (df['rsi'] > self.rsi_min_sell).values
+            masks['RSI_Long'] = (df['rsi'] < self.rsi_max_buy)
+            masks['RSI_Short'] = (df['rsi'] > self.rsi_min_sell)
         else:
-            masks['RSI_Long'] = masks['RSI_Short'] = np.ones(len(df), dtype=bool)
-
+            masks['RSI_Long'] = masks['RSI_Short'] = pd.Series(True, index=df.index)
+ 
         # VWAP Filter
         if getattr(self, 'enable_vwap_filter', False):
-            masks['VWAP_Long'] = (df['close'] > df['vwap']).values
-            masks['VWAP_Short'] = (df['close'] < df['vwap']).values
+            masks['VWAP_Long'] = (df['close'] > df['vwap'])
+            masks['VWAP_Short'] = (df['close'] < df['vwap'])
         else:
-            masks['VWAP_Long'] = masks['VWAP_Short'] = np.ones(len(df), dtype=bool)
+            masks['VWAP_Long'] = masks['VWAP_Short'] = pd.Series(True, index=df.index)
         
         # Time Filters
-        masks['RTH'] = df['in_rth'].values if 'in_rth' in df.columns else np.ones(len(df), dtype=bool)
-        masks['MAINT'] = (~df['in_maintenance'].values) if 'in_maintenance' in df.columns else np.ones(len(df), dtype=bool)
+        masks['RTH'] = df['in_rth'] if 'in_rth' in df.columns else pd.Series(True, index=df.index)
+        masks['MAINT'] = (~df['in_maintenance']) if 'in_maintenance' in df.columns else pd.Series(True, index=df.index)
         
         # Side Enables
-        masks['ENABLE_L'] = np.full(len(df), self.enable_long)
-        masks['ENABLE_S'] = np.full(len(df), self.enable_short)
-
+        masks['ENABLE_L'] = pd.Series(self.enable_long, index=df.index)
+        masks['ENABLE_S'] = pd.Series(self.enable_short, index=df.index)
+ 
         # --- 3. Final Signal Calculation ---
+        # All inputs are now pandas Series, so alignment is guaranteed by index.
         long_sig = (long_breakout & 
                     masks['ADX'] & masks['ATR'] & masks['SMA_Long'] & 
                     masks['VOL'] & masks['RSI_Long'] & masks['VWAP_Long'] & 

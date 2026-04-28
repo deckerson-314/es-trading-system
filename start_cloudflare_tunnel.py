@@ -12,6 +12,14 @@ PORT = 8000
 
 def main():
     """Start Cloudflare Tunnel to local server"""
+    # Fix Windows console encoding issues for Unicode (emojis)
+    try:
+        import sys
+        if sys.platform == 'win32':
+            sys.stdout.reconfigure(encoding='utf-8')
+    except (AttributeError, ImportError):
+        pass
+
     print("="*60)
     print("🌐 Starting Cloudflare Tunnel")
     print("="*60)

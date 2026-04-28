@@ -4,7 +4,10 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import pytz
 from typing import List, Dict, Any, Optional
+
+EASTERN = pytz.timezone('US/Eastern')
 
 # Constants
 WEB_DIR = "web"
@@ -28,6 +31,7 @@ class DashboardState:
     completed_trades: List[Dict[str, Any]] = field(default_factory=list)
     
     current_price: float = 0.0
+    last_data_receipt_time: Optional[datetime] = None
     
     # Statistics
     dashboard_stats: Dict[str, Any] = field(default_factory=lambda: {
@@ -107,15 +111,35 @@ def generate_dashboard_html(state: DashboardState) -> str:
     
     # Calculate uptime
     current_uptime = 0
+    now_eastern = datetime.now(EASTERN)
     if state.connection_start_time and state.is_connected:
-        current_uptime = (datetime.now() - state.connection_start_time).total_seconds()
+        # Convert state.connection_start_time to offset-aware if it's naive
+        start_time = state.connection_start_time
+        if start_time.tzinfo is None:
+            start_time = EASTERN.localize(start_time)
+        current_uptime = (now_eastern - start_time).total_seconds()
     total_uptime = state.total_uptime_seconds + current_uptime
+    
+    # Status
+    # Ensure last_data_receipt_time is offset-aware for comparison
+    last_receipt = state.last_data_receipt_time
+    if last_receipt and last_receipt.tzinfo is None:
+        last_receipt = EASTERN.localize(last_receipt)
+        
+    time_since_data = (now_eastern - last_receipt).total_seconds() if last_receipt else 0
+    is_stale = time_since_data > 60
+    
+    status_class = "disconnected" if not state.is_connected else "stale" if is_stale else "online"
+    status_text = "CONNECTION: OFFLINE" if not state.is_connected else "DATA: STALE (60s+)" if is_stale else "CONNECTION: ONLINE"
+    
+    # Choose icon based on mode
+    icon_emoji = "📈" if state.mode.upper() == "LIVE" else "🧪"
     
     html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>IB Deployment Live Dashboard</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📈</text></svg>">
+    <title>IB {state.mode.capitalize()} Dashboard</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>{icon_emoji}</text></svg>">
     <meta charset="UTF-8">
     <meta http-equiv="refresh" content="5">
     <style>
@@ -126,8 +150,10 @@ def generate_dashboard_html(state: DashboardState) -> str:
         h3 {{ color: #7f8c8d; margin-top: 20px; font-size: 1.1em; }}
         
         /* Status Bar */
-        .status-bar {{ background: #2ecc71; color: white; padding: 15px 20px; border-radius: 8px; margin: 20px 0; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(46, 204, 113, 0.2); }}
-        .status-bar.disconnected {{ background: #e74c3c; box-shadow: 0 2px 4px rgba(231, 76, 60, 0.2); }}
+        .status-bar {{ color: white; padding: 15px 20px; border-radius: 8px; margin: 20px 0; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .status-bar.online {{ background: #2ecc71 !important; box-shadow: 0 2px 4px rgba(46, 204, 113, 0.2) !important; }}
+        .status-bar.disconnected {{ background: #e74c3c !important; box-shadow: 0 2px 4px rgba(231, 76, 60, 0.2) !important; }}
+        .status-bar.stale {{ background: #f39c12 !important; box-shadow: 0 2px 4px rgba(243, 156, 18, 0.4) !important; }}
         
         /* Metrics */
         .metric-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin: 25px 0; }}
@@ -160,6 +186,22 @@ def generate_dashboard_html(state: DashboardState) -> str:
         .log-type.ERROR {{ background: #ffebee; color: #c62828; }}
         .log-type.TRADE {{ background: #e8f5e9; color: #2e7d32; }}
         
+        .report-link {{
+            text-decoration: none;
+            background: #3498db;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            font-weight: 600;
+            display: inline-block;
+            transition: background 0.2s;
+        }}
+        .report-link:hover {{
+            background: #2980b9;
+            color: white;
+        }}
+        
         /* Parameters */
         .params-section {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }}
         .params-group {{ background: white; border: 1px solid #e1e8ed; border-radius: 8px; padding: 0; overflow: hidden; }}
@@ -171,20 +213,30 @@ def generate_dashboard_html(state: DashboardState) -> str:
         
         .return-button {{ display: inline-block; margin-bottom: 20px; padding: 8px 16px; background: #fff; color: #3498db; border: 1px solid #3498db; text-decoration: none; border-radius: 20px; font-weight: 600; font-size: 0.9em; transition: all 0.2s; }}
         .return-button:hover {{ background: #3498db; color: white; }}
+        
+        /* Stale Warning */
+        .stale-warning {{ display: none; background: #f1c40f; color: #000; text-align: center; padding: 10px; font-weight: bold; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .stale-data .stale-warning {{ display: block; }}
+        .stale-data .status-bar {{ background: #95a5a6 !important; opacity: 0.8; }}
     </style>
 </head>
 <body>
     <div class="container">
         <a href="index.html" class="return-button">← Back to Index</a>
         
-        <div class="status-bar {'disconnected' if not state.is_connected else ''}">
+        <div class="stale-warning">⚠️ WARNING: THIS DASHBOARD IS SHOWING STALE DATA (BOT MAY BE OFFLINE)</div>
+
+        <div class="status-bar {status_class}">
             <div>
-                <strong style="font-size: 1.2em;">SYSTEM STATUS: {'ONLINE' if state.is_connected else 'OFFLINE'}</strong>
+                <strong style="font-size: 1.2em;">{status_text}</strong>
                 <span style="opacity: 0.8; margin-left: 10px;">[{state.mode.upper()}]</span>
+                {f'<span style="margin-left: 20px; opacity: 0.9;">Last Data: {state.last_data_receipt_time.strftime("%H:%M:%S")} ({int(time_since_data)}s ago)</span>' if state.last_data_receipt_time else ""}
             </div>
             <div style="text-align: right; font-size: 0.9em;">
                 <div>Uptime: {format_duration(total_uptime)}</div>
-                <div>Last Update: {datetime.now().strftime('%H:%M:%S')}</div>
+                <div id="last-update" data-timestamp="{now_eastern.isoformat()}" style="display:none"></div>
+                <div id="last-data-receipt" data-timestamp="{last_receipt.isoformat() if last_receipt else ''}" style="display:none"></div>
+                <div>Last Update: {now_eastern.strftime('%Y-%m-%d %H:%M:%S')}</div>
             </div>
         </div>
 
@@ -193,18 +245,18 @@ def generate_dashboard_html(state: DashboardState) -> str:
         <div class="metric-grid">
             <div class="metric-box">
                 <div class="label">Net Liquidation</div>
-                <div class="value">${state.account_info.get('NetLiquidation', 0):,.2f}</div>
+                <div class="value">${state.account_info.get('NetLiquidation', 0) or 0:,.2f}</div>
             </div>
             <div class="metric-box">
                 <div class="label">Unrealized PNL</div>
-                <div class="value {'positive' if state.account_info.get('UnrealizedPNL', 0) >= 0 else 'negative'}">
-                    ${state.account_info.get('UnrealizedPNL', 0):,.2f}
+                <div class="value {'positive' if (state.account_info.get('UnrealizedPNL') or 0) >= 0 else 'negative'}">
+                    ${state.account_info.get('UnrealizedPNL') or 0:,.2f}
                 </div>
             </div>
             <div class="metric-box">
                 <div class="label">Realized PNL</div>
-                <div class="value {'positive' if state.account_info.get('RealizedPNL', 0) >= 0 else 'negative'}">
-                    ${state.account_info.get('RealizedPNL', 0):,.2f}
+                <div class="value {'positive' if (state.account_info.get('RealizedPNL') or 0) >= 0 else 'negative'}">
+                    ${state.account_info.get('RealizedPNL') or 0:,.2f}
                 </div>
             </div>
             <div class="metric-box">
@@ -324,6 +376,7 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     <th>R-Multiple</th>
                     <th>Duration</th>
                     <th>Reason</th>
+                    <th>Report</th>
                 </tr>
             </thead>
             <tbody>
@@ -350,6 +403,9 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     <td class="{r_class}" title="Risk: ${trade.get('initial_risk', 0):,.2f}">{r_mult:+.2f}R</td>
                     <td>{trade.get('duration', 'N/A')}</td>
                     <td><span class="log-type {'TRADE' if trade.get('reason') == 'TP' else 'WARNING' if trade.get('reason') == 'Stop' else 'INFO'}" style="width: auto; padding: 2px 8px;">{trade.get('reason', 'N/A')}</span></td>
+                    <td>
+                        {f'<a href="{trade.get("report_url")}" target="_blank" class="report-link">📊 View</a>' if trade.get('report_url') else '<span style="color:#bdc3c7">N/A</span>'}
+                    </td>
                 </tr>
 """
         html += """            </tbody>
@@ -425,6 +481,37 @@ def generate_dashboard_html(state: DashboardState) -> str:
 
     html += """        </div>
     </div>
+    
+    <script>
+        function checkStaleData() {
+            const lastUpdateElem = document.getElementById('last-update');
+            const lastDataElem = document.getElementById('last-data-receipt');
+            const warningElem = document.querySelector('.stale-warning');
+            if (!lastUpdateElem || !lastDataElem || !warningElem) return;
+            
+            const now = new Date();
+            const fileUpdateTs = new Date(lastUpdateElem.dataset.timestamp);
+            const fileDiff = (now - fileUpdateTs) / 1000;
+            
+            const dataTs = lastDataElem.dataset.timestamp ? new Date(lastDataElem.dataset.timestamp) : null;
+            const dataDiff = dataTs ? (now - dataTs) / 1000 : 0;
+            
+            if (fileDiff > 30) {
+                document.body.classList.add('stale-data');
+                warningElem.innerText = '⚠️ CRITICAL: BOT OFFLINE (No dashboard updates for ' + Math.round(fileDiff) + 's)';
+            } else if (dataDiff > 45) {
+                document.body.classList.add('stale-data');
+                warningElem.innerText = '⚠️ WARNING: DATA STALLED (No market bars for ' + Math.round(dataDiff) + 's)';
+            } else {
+                document.body.classList.remove('stale-data');
+                warningElem.innerText = ''; // Clear text
+            }
+        }
+        
+        // Check immediately and then every 2 seconds
+        checkStaleData();
+        setInterval(checkStaleData, 2000);
+    </script>
 </body>
 </html>
 """

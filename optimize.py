@@ -359,8 +359,12 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     tf_delta = pd.Timedelta(minutes=strategy.timeframe * 5) # 5x timeframe buffer for gaps
 
     for row in df.itertuples():
+        # Initialize last_time on the first iteration
+        if last_time is None:
+            last_time = row.Index
+            
         # Jump Detection: Close positions if we jumped over OOS periods
-        if mask is not None and last_time is not None:
+        if mask is not None:
             if (row.Index - last_time) > tf_delta:
                 for pos in positions[:]:
                     # Close at open of new period
@@ -390,7 +394,13 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
             should_exit, reason, price = strategy.check_exit(pos, row, df)
             
             if should_exit:
-                pnl = (price - pos['entry_price']) * pos['direction'] * 50 - transaction_cost
+                # Ensure transaction_cost is float
+                try:
+                    t_cost = float(transaction_cost)
+                except (ValueError, TypeError):
+                    t_cost = 0.0
+                    
+                pnl = (price - pos['entry_price']) * pos['direction'] * 50 - t_cost
                 # Use End of Bar for Exit Time to match BB_Strategy_v4.py logic
                 exit_time = row.Index + pd.Timedelta(seconds=59)
                 trades.append(pos | {
@@ -433,7 +443,8 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     
     total_profit = trades_df['pnl'].sum()
     
-    # Drawdown
+    if mask is not None and not suppress_output:
+        print(f"DEBUG_MASK: Trades={len(trades_df)}, TotalPNL={total_profit:.2f}")
     trades_df['cum_pnl'] = trades_df['pnl'].cumsum()
     trades_df['peak'] = trades_df['cum_pnl'].cummax()
     trades_df['drawdown'] = trades_df['peak'] - trades_df['cum_pnl']
@@ -443,13 +454,28 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     # Sortino
     risk_free_rate = 0
     downside_returns = trades_df[trades_df['pnl'] < 0]['pnl']
-    downside_std = downside_returns.std()
     
-    if downside_std == 0 or pd.isna(downside_std):
-        sortino = 0
+    # Robust calculation: If we have 0 or 1 losses, std() is NA/0.
+    # We use a floor to prevent Sortino from collapsing to 0 for highly profitable strategies.
+    if len(downside_returns) > 1:
+        downside_std = downside_returns.std()
+    elif len(downside_returns) == 1:
+        # Use absolute value of the single loss as a proxy for std
+        downside_std = abs(downside_returns.iloc[0])
     else:
-        avg_return = trades_df['pnl'].mean()
-        sortino = (avg_return - risk_free_rate) / downside_std * (252**0.5) 
+        # No losses! Use a tiny floor to represent "perfect" performance
+        downside_std = 0.001
+        
+    avg_return = trades_df['pnl'].mean()
+    if avg_return > 0:
+        # Penalize if downside_std is still effectively 0
+        sortino = (avg_return - risk_free_rate) / max(0.001, downside_std) * (252**0.5)
+    else:
+        # For negative returns, standard Sortino logic (negative/downside)
+        sortino = (avg_return - risk_free_rate) / max(0.1, downside_std) * (252**0.5)
+    
+    # Cap insane values from the floor
+    sortino = max(-500.0, min(sortino, 500.0))
         
     # Profit Factor
     gross_profit = trades_df[trades_df['pnl'] > 0]['pnl'].sum()
@@ -491,6 +517,7 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
         'avg_trades_day': avg_trades_day,
         'profit_factor': profit_factor,
         'total_profit': total_profit,
+        'avg_profit_per_trade': total_profit / len(trades) if len(trades) > 0 else 0.0,
         'trades_df': trades_df,
         'monthly_profit_stats': monthly_stats
     }
@@ -1426,6 +1453,73 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
     except Exception as e:
         print(f"Warning: Failed to generate convergence HTML: {e}")
         return f"<p class='text-danger'>Error generating table: {e}</p>"
+
+
+def get_robustness_metrics(is_res, oos_res, is_periods_res, oos_periods_res):
+    """
+    Calculate robustness evaluation metrics based on IS vs OOS performance.
+    """
+    is_sortino = is_res.get('sortino', 0)
+    oos_sortino = oos_res.get('sortino', 0)
+    
+    # 1. Sortino IS-to-OOS Degradation
+    degradation = (is_sortino - oos_sortino) / is_sortino if is_sortino > 0 else 0.0
+    
+    # 2. Positive OOS Splits
+    positive_oos = sum(1 for res in oos_periods_res if res.get('sortino', 0) > 0)
+    total_oos = len(oos_periods_res)
+    
+    # 3. Live-Ready Robustness Score (0-100)
+    # Heuristic: Combination of low degradation, positive OOS splits, and absolute OOS Sortino
+    oos_stability = positive_oos / total_oos if total_oos > 0 else 0.5
+    deg_penalty = max(0, min(1, degradation)) if degradation > 0 else 0
+    raw_score = (oos_stability * 40) + (max(0, min(oos_sortino / 5.0, 1.0)) * 40) + ((1.0 - deg_penalty) * 20)
+    robustness_score = round(raw_score, 1)
+    
+    return {
+        'degradation': degradation,
+        'positive_oos_splits': positive_oos,
+        'total_oos_splits': total_oos,
+        'robustness_score': robustness_score
+    }
+
+def calculate_split_detail(params, is_periods, oos_periods, param_dict, df_full=None):
+    """
+    Calculates primary performance metrics for each IS and OOS split individually.
+    If df_full is provided, it uses it for full history warm-up.
+    """
+    is_results = []
+    oos_results = []
+    
+    # Process In-Sample periods
+    for i, period_df in enumerate(is_periods):
+        p_name = f"P{i*2+1}" if len(is_periods) > 1 else "IS"
+        # If full history is available, use it for warm-up but restrict evaluation to the period's date range
+        if df_full is not None:
+            # Create a mask for just this period
+            mask = pd.Series(False, index=df_full.index)
+            mask.loc[period_df.index[0]:period_df.index[-1]] = True
+            res = run_backtest(params, df_full, param_dict, mask=mask)
+        else:
+            res = run_backtest(params, period_df, param_dict)
+            
+        res['period_name'] = p_name
+        is_results.append(res)
+        
+    # Process Out-of-Sample periods
+    for i, period_df in enumerate(oos_periods):
+        p_name = f"P{(i+1)*2}" if len(oos_periods) > 1 else "OOS"
+        if df_full is not None:
+            mask = pd.Series(False, index=df_full.index)
+            mask.loc[period_df.index[0]:period_df.index[-1]] = True
+            res = run_backtest(params, df_full, param_dict, mask=mask)
+        else:
+            res = run_backtest(params, period_df, param_dict)
+            
+        res['period_name'] = p_name
+        oos_results.append(res)
+        
+    return is_results, oos_results
 
 def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict,
                             logbook, is_res, oos_res, trades_is, trades_oos,
@@ -4058,13 +4152,25 @@ def main():
             print("Start time file cleaned up.")
         except:
             pass
+    # ------------------------------------------------------------------
+    # Write optimized CSV
+    # ------------------------------------------------------------------
+    save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_mask, is_periods, oos_periods, suffix, oos_mask=oos_mask if 'oos_mask' in locals() else None)
+
+def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_mask, is_periods, oos_periods, suffix, oos_mask=None):
+    """
+    Generate and save the optimized parameter CSV with robustness metrics and per-split details.
+    """
+    global param_keys, OUTPUT_CSV, CHECKPOINT_FILE, DIAG_DIR
+    
+    # (Removed redundant nested call)
     
     # ------------------------------------------------------------------
     # Write optimized CSV with ALL Pareto solutions as columns
     # ------------------------------------------------------------------
-    # Sort all solutions by Sortino (descending) for consistent ordering
     solutions_data = []
     for i, ind in enumerate(hof):
+        actual = getattr(ind, 'actual_metrics', {})
         raw_params = dict(zip(param_keys, ind))
         # Clamp parameters
         clamped_params = {}
@@ -4072,11 +4178,18 @@ def main():
             if n not in param_dict:
                 continue
             mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
-            v = max(mn, min(v, mx))
+            try:
+                # Only clamp if mn and mx are numeric
+                if isinstance(mn, (int, float)) and isinstance(mx, (int, float)) and isinstance(v, (int, float)):
+                    v = max(mn, min(v, mx))
+            except:
+                pass
             if typ == 'int':
-                clamped_params[n] = int(round(v))
-            else:
+                clamped_params[n] = int(round(float(v)))
+            elif typ == 'float':
                 clamped_params[n] = float(v)
+            else:
+                clamped_params[n] = v
         
         # Handle boolean and TP method conversions
         for n in list(clamped_params.keys()):
@@ -4113,7 +4226,7 @@ def main():
         if 'Trend EMA Length' in clamped_params:
             clamped_params['Trend EMA Length'] = max(1, int(round(clamped_params['Trend EMA Length'])))
         
-        # [NEW] V5 Clamping
+        # V5 Clamping
         if 'RSI Period' in clamped_params:
             clamped_params['RSI Period'] = max(2, int(round(clamped_params['RSI Period'])))
         if 'RSI Overbought' in clamped_params:
@@ -4125,15 +4238,30 @@ def main():
         if 'Use VWAP Filter' in clamped_params:
              clamped_params['Use VWAP Filter'] = int(round(clamped_params['Use VWAP Filter']))
         
+        # Calculate Splits and Robustness for Top Solutions
+        is_periods_res, oos_periods_res = calculate_split_detail(clamped_params, is_periods, oos_periods, param_dict)
+        
+        # Get aggregate results for this solution
+        sol_is_res = run_backtest(clamped_params, in_sample, param_dict, suppress_output=True, mask=is_mask)
+        sol_oos_res = run_backtest(clamped_params, oos, param_dict, suppress_output=True, mask=oos_mask)
+        
+        # Calculate Robustness Evaluation
+        robust = get_robustness_metrics(sol_is_res, sol_oos_res, is_periods_res, oos_periods_res)
+        
         fitness = ind.fitness.values
         solutions_data.append({
             'params': clamped_params,
-            'sortino': fitness[0],
-            'max_dd': fitness[1],
-            'profit_factor': fitness[2],
-            'avg_trades_day': fitness[3] if len(fitness) > 3 else 0.0,
-            'total_profit': fitness[4] if len(fitness) > 4 else 0.0,
-            'is_selected': (ind == best)
+            'sortino': actual.get('sortino', fitness[0]),
+            'max_dd': actual.get('max_drawdown', fitness[1]),
+            'profit_factor': actual.get('profit_factor', fitness[2]),
+            'avg_trades_day': actual.get('avg_trades_day', fitness[3] if len(fitness) > 3 else 0.0),
+            'total_profit': actual.get('total_profit', fitness[4] if len(fitness) > 4 else 0.0),
+            'is_selected': (ind == best),
+            'robustness': robust,
+            'is_periods': is_periods_res,
+            'oos_periods': oos_periods_res,
+            'is_aggregate': sol_is_res,
+            'oos_aggregate': sol_oos_res
         })
     
     # Sort by Sortino (descending)
@@ -4149,7 +4277,6 @@ def main():
         if sol_data['is_selected']:
             col_name += "_SELECTED"
         
-        # Initialize column with empty values
         output_df[col_name] = ""
         
         # Fill in parameter values
@@ -4159,7 +4286,6 @@ def main():
                 idx = matching_rows.index[0]
                 typ = param_dict[name]['type']
                 if typ == 'bool':
-                    # Convert boolean to string for CSV (True/False)
                     output_df.at[idx, col_name] = str(val)
                 elif typ == 'int':
                     output_df.at[idx, col_name] = int(val)
@@ -4168,79 +4294,119 @@ def main():
                 else:
                     output_df.at[idx, col_name] = val
     
-    # Add statistics rows at the end
+    # Add statistics rows
     stats_rows = []
+    stats_rows.append({'Name': '=== SOLUTION STATISTICS ===', 'Value': '', 'Description': ''})
     
-    # Add separator row
-    stats_rows.append({
-        'Name': '=== SOLUTION STATISTICS ===',
-        'Value': '', 'Min': '', 'Max': '', 'Type': '', 'Description': ''
-    })
-    for sol_idx in range(num_solutions):
-        col_name = f"Solution_{sol_idx}"
-        if solutions_data[sol_idx]['is_selected']:
-            col_name += "_SELECTED"
-        stats_rows[-1][col_name] = ''
-    
-    # Add metric rows
     metrics = [
         ('Sortino Ratio', 'sortino', '{:.4f}'),
         ('Max Drawdown ($)', 'max_dd', '${:,.2f}'),
         ('Profit Factor', 'profit_factor', '{:.4f}'),
         ('Avg Trades/Day', 'avg_trades_day', '{:.3f}'),
-        ('Total Profit (norm)', 'total_profit', '{:.4f}'),  # Normalized (0-1 range)
+        ('Total Profit (norm)', 'total_profit', '{:.4f}'),
     ]
     
     for metric_name, metric_key, format_str in metrics:
-        row = {
-            'Name': metric_name,
-            'Value': '', 'Min': '', 'Max': '', 'Type': 'statistic', 'Description': f'{metric_name} for each solution'
-        }
+        row = {'Name': metric_name, 'Type': 'statistic', 'Description': f'{metric_name} for each solution'}
         for sol_idx, sol_data in enumerate(solutions_data):
             col_name = f"Solution_{sol_idx}"
-            if sol_data['is_selected']:
-                col_name += "_SELECTED"
+            if sol_data['is_selected']: col_name += "_SELECTED"
             row[col_name] = format_str.format(sol_data[metric_key])
         stats_rows.append(row)
     
-    # Add solution ranking row
-    rank_row = {
-        'Name': 'Solution Rank',
-        'Value': '', 'Min': '', 'Max': '', 'Type': 'statistic', 'Description': 'Rank by Sortino (0 = highest)'
-    }
+    # Solution Rank
+    rank_row = {'Name': 'Solution Rank', 'Type': 'statistic', 'Description': 'Rank by Sortino (0 = highest)'}
     for sol_idx in range(num_solutions):
         col_name = f"Solution_{sol_idx}"
-        if solutions_data[sol_idx]['is_selected']:
-            col_name += "_SELECTED"
+        if solutions_data[sol_idx]['is_selected']: col_name += "_SELECTED"
         rank_row[col_name] = f"#{sol_idx}" + (" (SELECTED)" if solutions_data[sol_idx]['is_selected'] else "")
     stats_rows.append(rank_row)
     
-    # Append statistics rows to dataframe
-    stats_df = pd.DataFrame(stats_rows)
-    output_df = pd.concat([output_df, stats_df], ignore_index=True)
+    # Robustness Evaluation
+    stats_rows.append({'Name': '--- ROBUSTNESS EVALUATION ---', 'Type': ''})
+    metrics_robust = [
+        ('Aggregate IS Sortino', 'is_aggregate', '{:.4f}'),
+        ('Aggregate OOS Sortino', 'oos_aggregate', '{:.4f}'),
+        ('Sortino IS-to-OOS Degradation', 'degradation', '{:.2%}'),
+        ('Positive OOS Splits', 'positive_oos_splits', '{}/{}'),
+        ('Live-Ready Robustness Score', 'robustness_score', '{:.1f}')
+    ]
+    for metric_name, key, format_str in metrics_robust:
+        row = {'Name': metric_name, 'Type': 'robustness'}
+        for sol_idx, sol_data in enumerate(solutions_data):
+            col_name = f"Solution_{sol_idx}"
+            if sol_data['is_selected']: col_name += "_SELECTED"
+            
+            if key in ['is_aggregate', 'oos_aggregate']:
+                val = sol_data.get(key, {}).get('sortino', 0)
+            else:
+                val = sol_data['robustness'].get(key)
+                
+            if key == 'positive_oos_splits':
+                row[col_name] = format_str.format(val, sol_data['robustness'].get('total_oos_splits'))
+            else:
+                row[col_name] = format_str.format(val)
+        stats_rows.append(row)
+        
+    # Per-Split Detail (In-Sample)
+    stats_rows.append({'Name': '--- PER-SPLIT DETAIL (In-Sample) ---', 'Type': ''})
+    split_metrics = ['sortino', 'avg_trades_day', 'profit_factor', 'max_drawdown', 'total_profit', 'avg_profit_per_trade']
+    metric_labels = {'sortino': 'Sortino', 'avg_trades_day': 'Trades/D', 'profit_factor': 'Profit Fac', 
+                     'max_drawdown': 'Max DD', 'total_profit': 'Total PNL', 'avg_profit_per_trade': 'Avg Profit/Tr'}
+    
+    all_is_periods = sorted(list(set(p['period_name'] for sol in solutions_data for p in sol['is_periods'])), key=lambda x: int(x[1:]))
+    for p_name in all_is_periods:
+        for m_key in split_metrics:
+            label = f"  {metric_labels[m_key]} ({p_name})"
+            row = {'Name': label, 'Type': 'split_detail'}
+            for sol_idx, sol_data in enumerate(solutions_data):
+                col_name = f"Solution_{sol_idx}"
+                if sol_data['is_selected']: col_name += "_SELECTED"
+                p_res = next((p for p in sol_data['is_periods'] if p['period_name'] == p_name), None)
+                if p_res:
+                    val = p_res.get(m_key, 0)
+                    if m_key in ['max_drawdown', 'total_profit', 'avg_profit_per_trade']:
+                        row[col_name] = f"${val:,.2f}"
+                    else:
+                        row[col_name] = f"{val:.4f}" if m_key != 'avg_trades_day' else f"{val:.3f}"
+                else: row[col_name] = "N/A"
+            stats_rows.append(row)
+
+    # Per-Split Detail (Out-of-Sample)
+    stats_rows.append({'Name': '--- PER-SPLIT DETAIL (Out-of-Sample) ---', 'Type': ''})
+    all_oos_periods = sorted(list(set(p['period_name'] for sol in solutions_data for p in sol['oos_periods'])), key=lambda x: int(x[1:]))
+    for p_name in all_oos_periods:
+        for m_key in split_metrics:
+            label = f"  {metric_labels[m_key]} ({p_name})"
+            row = {'Name': label, 'Type': 'split_detail'}
+            for sol_idx, sol_data in enumerate(solutions_data):
+                col_name = f"Solution_{sol_idx}"
+                if sol_data['is_selected']: col_name += "_SELECTED"
+                p_res = next((p for p in sol_data['oos_periods'] if p['period_name'] == p_name), None)
+                if p_res:
+                    val = p_res.get(m_key, 0)
+                    if m_key in ['max_drawdown', 'total_profit', 'avg_profit_per_trade']:
+                        row[col_name] = f"${val:,.2f}"
+                    else:
+                        row[col_name] = f"{val:.4f}" if m_key != 'avg_trades_day' else f"{val:.3f}"
+                else: row[col_name] = "N/A"
+            stats_rows.append(row)
     
     # Save to CSV
+    stats_df = pd.DataFrame(stats_rows)
+    output_df = pd.concat([output_df, stats_df], ignore_index=True)
     output_df.to_csv(OUTPUT_CSV, index=False)
     print(f"Optimized CSV with {num_solutions} solutions  {OUTPUT_CSV}")
-    print(f"  Solution_0_SELECTED = Best solution (highest Sortino)")
-    print(f"  Solution_1, Solution_2, ... = Other Pareto-optimal solutions")
-    print(f"  Statistics rows added at bottom showing metrics for each solution")
     
-    # Archive checkpoint file by renaming it to match output suffix
-    # This prevents the next run from resuming (starting fresh) while preserving the data
+    # Archive checkpoint
     if os.path.exists(CHECKPOINT_FILE):
         archive_checkpoint = os.path.join(DIAG_DIR, f'ga_checkpoint_{suffix}.pkl')
         try:
-            # If an archive with this name already exists (unlikely given generated suffix), overwrite it
-            if os.path.exists(archive_checkpoint):
-                os.remove(archive_checkpoint)
-            
+            if os.path.exists(archive_checkpoint): os.remove(archive_checkpoint)
             os.rename(CHECKPOINT_FILE, archive_checkpoint)
             print(f"Run Complete: Checkpoint archived to {archive_checkpoint}")
             print("Next run will start fresh automatically.")
-        except Exception as e:
-            print(f"WARNING: Could not archive checkpoint: {e}")
-            print("You may need to delete 'ga_checkpoint_v3.pkl' manually to start fresh.")
+        except Exception as e: print(f"WARNING: Could not archive checkpoint: {e}")
 
 
 if __name__ == "__main__":

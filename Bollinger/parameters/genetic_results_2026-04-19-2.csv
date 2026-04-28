@@ -1,0 +1,101 @@
+Name,Value,Min,Max,Type,Description,Solution_0_SELECTED,Solution_1,Solution_2,Solution_3,Solution_4,Solution_5,Solution_6,Solution_7,Solution_8,Solution_9
+__indicatorName,BB Strategy,,,,Strategy identifier,,,,,,,,,,
+=== ENTRY CRITERIA ===,,,,,,,,,,,,,,,
+Enable Long Trades,true,false,true,bool,Allow long entries,,,,,,,,,,
+Enable Short Trades,true,false,true,bool,Allow short entries,,,,,,,,,,
+Bollinger Band Length,5,1,30,int,Lookback period for BB,20,20,20,27,19,28,20,21,21,23
+Bollinger Band StdDev,2,0.1,4,float,StdDev multiplier for BB width (Max capped at 3.0 to prevent overfitting),1.6771,1.1954,1.4905,1.2343,1.1877,1.1512,1.4625,1.4156,1.4773,1.4645
+Long Entry on Wick Touch,0,0,1,int,"Enter if low touches lower band (0=false, 1=true) - OPTIMIZABLE",1,1,0,1,1,1,1,1,1,1
+Long Entry on Body in Zone,1,0,1,int,"Enter if close ≤ lower band (0=false, 1=true) - OPTIMIZABLE",1,1,1,1,1,1,1,1,1,1
+Long Trigger (% From Lower Band),0.5,0,2,float,% below lower band to trigger (min 0.5% to avoid band extremes),0.0258,0.0027,0.0383,0.0,0.0,0.0,0.0,0.0156,0.0219,0.0
+Short Entry on Wick Touch,0,0,1,int,"Enter if high touches upper band (0=false, 1=true) - OPTIMIZABLE",1,0,0,0,0,0,0,0,0,1
+Short Entry on Body in Zone,1,0,1,int,"Enter if close ≥ upper band (0=false, 1=true) - OPTIMIZABLE",0,0,0,0,0,1,1,0,0,1
+Short Trigger (% From Upper Band),0.5,0,2,float,% above upper band to trigger (min 0.5% to avoid band extremes),0.0,0.0,0.0,0.0,1.121,0.0,0.2402,0.0,0.0,0.5647
+ATR Length for Filter,26,5,20,int,ATR period for entry filter (separate from trailing stop ATR),15,15,14,16,16,15,15,15,15,16
+Max ATR Filter (Points),4,2,10,float,Maximum ATR value to allow entries for mean reversion (ATR <= max). Low ATR = exhausted move ready to reverse (good). High ATR = strong momentum (bad for mean reversion). Range 1.0-6.0 points,6.529,6.5123,6.8828,7.7289,6.1506,7.3675,6.0178,6.8125,6.713,4.7466
+Min ATR Filter (Points),0.5,0.1,6,float,Minimum ATR floor (optional) to ensure stops aren't too tight. Default 0.5 points. ATR must be >= this AND <= Max ATR Filter,5.8197,5.5937,5.627,5.7146,5.2721,4.0423,2.9531,5.7418,4.7015,3.9997
+Enable Trend Filter,1,0,1,int,"Trade with trend only (Long > EMA, Short < EMA) - OPTIMIZABLE",1,1,0,1,1,1,0,1,0,0
+Trend EMA Length,200,10,400,int,EMA Length for trend filter,167,166,10,182,92,177,168,200,137,170
+Enable ADX Filter,1,0,1,int,Trade only when ADX < Threshold (Ranging Markets) - OPTIMIZABLE,0,0,0,0,0,0,0,0,0,0
+ADX Period,14,5,35,int,Lookback period for ADX calculation,5,5,5,5,5,5,24,5,5,19
+Max ADX Threshold,25,10,45,int,Maximum ADX allowed for entry. Lower = Only extremely choppy. Higher = Allow some trend.,26,26,36,25,28,25,26,23,29,25
+RTH Start (HH:MM),09:30,09:30,09:30,str,Regular trading hours start (Eastern Time),,,,,,,,,,
+RTH End (HH:MM),16:00,16:00,16:00,str,Regular trading hours end (Eastern Time),,,,,,,,,,
+Enable RTH Filter,1,0,1,int,"Restrict entries to RTH only (0=false, 1=true) - OPTIMIZABLE",1,0,0,0,0,0,0,0,0,0
+RTH Exit Buffer (minutes),0,0,60,int,Minutes before RTH end to start closing positions (0 = no auto-close),55,55,53,55,54,55,56,52,53,56
+Enable Maintenance Filter,true,false,true,bool,Exit positions before maintenance periods,,,,,,,,,,
+Daily Maintenance Start (HH:MM),17:00,17:00,17:00,str,Daily maintenance period start in Eastern Time (ES: 4:00 PM CT = 5:00 PM ET),,,,,,,,,,
+Daily Maintenance End (HH:MM),17:30,17:30,17:30,str,Daily maintenance period end in Eastern Time (ES: 4:30 PM CT = 5:30 PM ET),,,,,,,,,,
+Weekend Maintenance Start Day,4,4,4,int,"Weekend maintenance start day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 4 (Friday)",,,,,,,,,,
+Weekend Maintenance Start Time (HH:MM),17:00,17:00,17:00,str,Weekend maintenance start time in Eastern Time (ES: Fri 4:00 PM CT = 5:00 PM ET),,,,,,,,,,
+Weekend Maintenance End Day,6,6,6,int,"Weekend maintenance end day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 6 (Sunday)",,,,,,,,,,
+Weekend Maintenance End Time (HH:MM),18:00,18:00,18:00,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET),,,,,,,,,,
+Maintenance Buffer Minutes,5,1,30,int,Minutes before/after maintenance to exit/block trading,10,21,20,17,30,14,2,25,1,13
+Volume MA Length,50,10,200,int,Rolling window for average volume calculation (used by volume filter),45,40,28,103,44,109,33,94,56,195
+Max Volume Multiplier,1.2,0.1,5,float,"Volume filter for mean reversion - MAX volume allowed (volume <= avg * multiplier). Low volume = exhausted move ready to reverse. High volume = strong momentum (bad for mean reversion). Range 0.5-3.0 (1.0 = no filter, lower = more restrictive)",5.0,3.5032,3.3073,3.3201,4.8343,3.3413,4.2316,4.2236,4.2767,4.6447
+Timeframe (minutes),15,1,5,int,Resample timeframe in minutes,4,4,4,4,3,4,4,5,4,4
+Max Open Trades,1,1,1,int,Maximum concurrent positions,,,,,,,,,,
+Transaction Cost (Per Trade),15,15,15,float,Estimated friction per trade (Slippage + Commissions) to realistic PnL. E.g. $4 comm + $12.50 slip = 16.5,,,,,,,,,,
+=== TAKE PROFIT CRITERIA ===,,,,,,,,,,,,,,,
+TP Method,0,0,2,int,"Take profit method (0=Fixed BB at Entry, 1=Fixed ATR, 2=Opposite BB) - OPTIMIZABLE",,,,,,,,,,
+Opposite Bollinger Band TP,false,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly),False,False,False,False,False,False,True,False,False,False
+Fixed ATR TP,false,false,false,bool,FIXED: Controlled by TP Method (do not optimize directly),True,True,True,True,True,True,False,True,True,True
+Fixed BB at Entry TP,true,true,true,bool,FIXED: Controlled by TP Method (do not optimize directly),False,False,False,False,False,False,False,False,False,False
+ATR Length for TP,26,5,80,int,ATR period for fixed TP,25,26,41,41,28,32,26,64,72,20
+ATR Multiplier for TP,2,0,6,float,Fixed TP ATR multiplier - reduced max to prevent overfitting,0.0,0.5852,0.0,3.0292,1.1599,1.2456,0.7928,6.0,6.0,3.0746
+=== STOP LOSS CRITERIA ===,,,,,,,,,,,,,,,
+Initial Stop Loss (%),1,0.1,2,float,Fixed stop loss % - min 1.0% to avoid tight stops that cause quick losses,0.6176,0.4681,0.54,0.4714,0.3874,0.4601,0.4287,0.4485,0.4963,0.4323
+Enable Trailing Stop,1,1,1,int,"Use ATR trailing stop (0=false, 1=true) - OPTIMIZABLE",,,,,,,,,,
+ATR Length for Trailing Stop,26,3,100,int,ATR period for trailing,82,82,77,56,48,73,100,80,72,100
+ATR Multiplier for Trailing Stop,2,0.1,4.5,float,Trailing stop ATR multiplier - reduced max to prevent overfitting,1.3088,0.6648,0.7071,1.1668,0.7519,0.6307,0.1,0.6697,0.1,1.1899
+Trailing Delay (bars),5,0,5,int,"Bars before trailing stop begins tightening (0 = immediate, max 7 to avoid delayed trailing)",1,1,1,2,1,1,1,1,1,0
+=== GA CRITERIA ===,,,,,,,,,,,,,,,
+POP_SIZE,100,100,150,int,Population size - reduced to prevent overfitting,,,,,,,,,,
+NUM_GEN,100,50,75,int,Number of generations - reduced to prevent overfitting,,,,,,,,,,
+CX_PB,0.7,0.5,0.9,float,Crossover probability,,,,,,,,,,
+MUT_PB,0.4,0.2,0.5,float,Mutation probability (increased from 0.35 for more exploration),,,,,,,,,,
+MUT_MU,0,-1,1,float,Mutation mean,,,,,,,,,,
+MUT_SIGMA,0.25,0.1,0.4,float,Mutation std dev,,,,,,,,,,
+TARGET_TRADES_DAY,5,1,4,int,Ideal trades/day - reduced to be more realistic for combined filters,,,,,,,,,,
+TRADES_PENALTY_WEIGHT,0.3,0.1,0.8,float,Penalty for excess trades - reduced to be less restrictive,,,,,,,,,,
+DD_WEIGHT,0.5,0.2,0.8,float,Drawdown penalty weight - increased to prioritize risk management,,,,,,,,,,
+DATA_SPLITS,0.65,0.6,0.7,float,In-sample fraction per period - 60-70% for better generalization (30-40% OOS),,,,,,,,,,
+DATA_SIZE,0,0,10000000,int,Rows to subsample (0 = full dataset),,,,,,,,,,
+=== RSI & VWAP FILTERS (V5) ===,,,,,,,,,,,,,,,
+Enable RSI Filter,0,1,1,int,Enable RSI Divergence/Extreme Filter,,,,,,,,,,
+RSI Period,14,5,30,int,RSI Lookback Period,11,11,8,26,13,9,11,8,10,23
+RSI Overbought,70,60,85,int,Threshold for Overbought (Short Entry Blocked if < this),61,61,61,62,64,62,61,61,61,64
+RSI Oversold,30,15,40,int,Threshold for Oversold (Long Entry Blocked if > this),39,40,40,40,40,39,40,28,37,40
+Enable VWAP Filter,0,1,1,int,Enable VWAP Trend Alignment Filter,,,,,,,,,,
+USE_INTERLEAVED_SPLIT,true,false,true,bool,Use interleaved IS/OOS periods instead of single split,,,,,,,,,,
+NUM_SPLIT_PERIODS,5,3,7,int,Number of alternating periods (IS-OOS-IS-OOS-IS) - odd number recommended,,,,,,,,,,
+MIN_TRADES_DAY,2,0.5,2,float,MUST have at least 0.1 trades/day (approx 1 per 2 weeks) - relaxed for combined logic,,,,,,,,,,
+MIN_TRADES_PEN_WEIGHT,-500,-200,-50,float,Scalar penalty — zero trades = -50 (Less harsh death penalty),,,,,,,,,,
+NORM_SORTINO_MAX,10,5,20,float,Normalization range for Sortino Ratio (used in fitness calculation),,,,,,,,,,
+NORM_DD_MAX,50000,50000,200000,float,Normalization range for Max Drawdown in dollars (used in fitness calculation),,,,,,,,,,
+NORM_PF_MAX,5,3,10,float,Normalization range for Profit Factor (used in fitness calculation),,,,,,,,,,
+NORM_TRADES_MAX,3,1,5,float,Normalization range for Avg Trades/Day (used in fitness calculation) - reduced to 3.0 for realistic expectations,,,,,,,,,,
+NORM_PNL_MAX,650000,100000,1000000,float,Normalization range for Total Profit in dollars (used in fitness calculation) - increased to prevent maxing out,,,,,,,,,,
+NORM_PROFIT_TRADE_MAX,60,100,500,float,Normalization range for Avg Profit Per Trade (used in fitness calculation),,,,,,,,,,
+MIN_WIN_RATE,0.4,0.3,0.5,float,Minimum win rate threshold (hard constraint - strategies below this are eliminated),,,,,,,,,,
+SORTINO_CAP,10,5,20,float,Maximum Sortino value before capping (prevents unrealistic values),,,,,,,,,,
+GA_START_DATE,2024-01-01,,,str,Start date for GA backtest,,,,,,,,,,
+GA_END_DATE,2024-12-31,,,str,End date for GA backtest,,,,,,,,,,
+WEIGHT_SORTINO,1.0,,,float,Fitness weight: Sortino Ratio,,,,,,,,,,
+WEIGHT_DRAWDOWN,-1.0,,,float,Fitness weight: Max Drawdown,,,,,,,,,,
+WEIGHT_PF,1.0,,,float,Fitness weight: Profit Factor,,,,,,,,,,
+WEIGHT_TRADES,3.0,,,float,Fitness weight: Avg Trades/Day,,,,,,,,,,
+WEIGHT_PNL,2.0,,,float,Fitness weight: Total Profit,,,,,,,,,,
+WEIGHT_PPT,2.0,,,float,Fitness weight: Avg Profit/Trade,,,,,,,,,,
+MIN_TRADE_DURATION,2.0,,,float,Hard Limit: Min avg minutes per trade,,,,,,,,,,
+MAX_WIN_RATE_CAP,0.95,,,float,Hard Limit: Max win rate before penalty,,,,,,,,,,
+LIMIT_MAX_LOSS,50000,,,float,Hard Limit: Severe loss penalty threshold,,,,,,,,,,
+LIMIT_MIN_SORTINO,1.0,,,float,Hard Limit: Severe Sortino penalty threshold,,,,,,,,,,
+MIN_PROFIT_PER_TRADE,25.0,,,float,Hard Limit: Minimum accepted Profit Per Trade margin strictly enforced under slippage penalty,,,,,,,,,,
+=== SOLUTION STATISTICS ===,,,,,,,,,,,,,,,
+Sortino Ratio,,,,statistic,Sortino Ratio for each solution,0.1539,0.1508,0.1457,0.1281,0.1203,0.0827,0.0048,0.0002,0.0002,0.0000
+Max Drawdown ($),,,,statistic,Max Drawdown ($) for each solution,$0.00,$0.01,$0.00,$0.01,$0.01,$0.01,$0.01,$0.01,$0.00,$0.00
+Profit Factor,,,,statistic,Profit Factor for each solution,0.1171,0.1187,0.1111,0.1179,0.1099,0.0978,0.0675,0.0430,0.0318,56.8227
+Avg Trades/Day,,,,statistic,Avg Trades/Day for each solution,0.009,0.044,0.007,0.024,0.037,0.028,0.021,0.023,0.016,0.007
+Total Profit (norm),,,,statistic,Total Profit (norm) for each solution,0.0006,0.0011,0.0004,0.0010,0.0008,0.0004,0.0000,-0.0000,-0.0001,0.0013
+Solution Rank,,,,statistic,Rank by Sortino (0 = highest),#0 (SELECTED),#1,#2,#3,#4,#5,#6,#7,#8,#9

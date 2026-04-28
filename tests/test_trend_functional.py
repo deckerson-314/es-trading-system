@@ -123,7 +123,7 @@ class TestFilterGates:
         params = {'Buy Lookback': 5, 'Sell Lookback': 5}
         params.update(overrides)
         strategy = make_strategy(**params)
-        df, _ = make_breakout_scenario(lookback=5, warmup_extra=30, volume=2000)
+        df, _ = make_breakout_scenario(lookback=5, warmup_extra=100, volume=2000)
         df = strategy.calculate_indicators(df)
         df = strategy.apply_filters(df)
         long_sig, short_sig = strategy.calculate_entry_signals(df)
@@ -181,13 +181,28 @@ class TestFilterGates:
 
     def test_rsi_filter_passes_relaxed_threshold(self):
         """RSI < 99 is almost always true → trades should fire."""
-        long_sig, _ = self._run_with_overrides(**{
+        params = {
+            'Buy Lookback': 5, 'Sell Lookback': 5,
             'Enable RSI Filter': 1,
             'RSI Period': 3,
-            'RSI Max Buy Threshold': 99.0,
+            'RSI Max Buy Threshold': 100.1,
             'ATR Filter Period': 3,
-        })
-        assert long_sig.sum() >= 1, "RSI filter should allow trades at relaxed threshold"
+        }
+        strategy = make_strategy(**params)
+        df, breakout_idx = make_breakout_scenario(lookback=5, warmup_extra=100)
+        breakout_ts = df.index[breakout_idx]
+        
+        df = strategy.calculate_indicators(df)
+        df = strategy.apply_filters(df)
+        res = strategy.calculate_entry_signals(df, verbose=True)
+        long_sig, _, _ = res if len(res) == 3 else (res[0], res[1], [])
+        
+        if not bool(long_sig.loc[breakout_ts]):
+            rsi_val = df.loc[breakout_ts, 'rsi'] if 'rsi' in df.columns else "N/A"
+            lb = df.loc[breakout_ts, 'long_breakout'] if 'long_breakout' in df.columns else "N/A"
+            pytest.fail(f"RSI Relaxed Fail. RSI: {rsi_val}. LB: {lb}. TS: {breakout_ts}")
+            
+        assert long_sig.loc[breakout_ts] == True
 
     # --- SMA Filter ---
     def test_sma_filter_blocks_below_regime(self):
@@ -295,10 +310,11 @@ class TestDoEGrid:
             'ATR Filter Period': 3,
             'ATR Length for Trailing Stop': 3,
             'Enable ADX Filter': 1, 'ADX Period': 3, 'Min ADX Threshold': 0.0,
-            'Enable RSI Filter': 1, 'RSI Period': 3, 'RSI Max Buy Threshold': 99.0,
+            'Enable RSI Filter': 1, 'RSI Period': 3, 'RSI Max Buy Threshold': 100.1,
             'Enable Volume Filter': True, 'Volume MA Length': 3, 'Min Volume Multiplier': 0.01,
         })
-        df, _ = make_breakout_scenario(lookback=5, warmup_extra=50, volume=2000)
+        df, _ = make_breakout_scenario(lookback=5, warmup_extra=100, volume=2000)
+
         df = strategy.calculate_indicators(df)
         df = strategy.apply_filters(df)
         long_sig, _ = strategy.calculate_entry_signals(df)

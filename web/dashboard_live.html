@@ -1,102 +1,90 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>IB Deployment Live Dashboard</title>
+    <title>IB Live Dashboard</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📈</text></svg>">
     <meta charset="UTF-8">
     <meta http-equiv="refresh" content="5">
     <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 1600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
-        h2 { color: #555; margin-top: 30px; border-bottom: 2px solid #ddd; padding-bottom: 5px; }
-        h3 { color: #666; margin-top: 20px; }
-        .status-bar { background: #4CAF50; color: white; padding: 15px; border-radius: 5px; margin: 20px 0; }
-        .status-bar.disconnected { background: #f44336; }
-        .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
-        .metric-box { background: #e3f2fd; border-left: 4px solid #2196F3; padding: 15px; border-radius: 4px; }
-        .metric-box .label { font-size: 0.9em; color: #666; }
-        .metric-box .value { font-size: 1.5em; font-weight: bold; color: #2196F3; margin-top: 5px; }
-        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
-        th { background: #4CAF50; color: white; padding: 10px; text-align: left; }
-        td { padding: 8px; border: 1px solid #ddd; }
-        tr:nth-child(even) { background: #f9f9f9; }
-        .positive { color: green; font-weight: bold; }
-        .negative { color: red; font-weight: bold; }
-        .live-tracker { max-height: 400px; overflow-y: auto; background: #f9f9f9; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }
-        .live-tracker .entry { padding: 5px; margin: 2px 0; border-left: 3px solid #ddd; }
-        .live-tracker .entry.info { border-left-color: #2196F3; }
-        .live-tracker .entry.warning { border-left-color: #FF9800; }
-        .live-tracker .entry.error { border-left-color: #f44336; }
-        .live-tracker .entry.trade { border-left-color: #4CAF50; }
-        .live-tracker .entry.order { border-left-color: #9C27B0; }
-        .error-log { max-height: 300px; overflow-y: auto; background: #ffebee; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.85em; }
-        .error-entry { padding: 5px; margin: 2px 0; color: #c62828; }
-        .bar-log-container { margin: 20px 0; }
-        .bar-log-scroll { max-height: 500px; overflow-y: auto; background: #f5f5f5; padding: 10px; border-radius: 4px; border: 1px solid #ddd; font-family: monospace; font-size: 0.85em; }
-        .bar-log-entry { padding: 8px; margin: 5px 0; background: white; border-left: 3px solid #2196F3; border-radius: 3px; }
-        .bar-log-timestamp { font-weight: bold; color: #2196F3; margin-bottom: 3px; }
-        .bar-log-info { color: #333; margin-bottom: 3px; }
-        .bar-log-criteria { color: #666; font-size: 0.9em; padding-left: 10px; }
-        .params-section { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .params-group { background: #f9f9f9; padding: 15px; border-radius: 4px; }
-        .params-group h3 { margin-top: 0; color: #555; border-bottom: 1px solid #ddd; padding-bottom: 5px; }
-        .params-table { width: 100%; font-size: 0.9em; }
-        .params-table td { padding: 5px; }
-        .return-button { display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
-        .return-button:hover { background: #5568d3; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; background: #eaeff2; color: #333; }
+        .container { max-width: 1600px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 15px; margin-top: 0; font-weight: 600; }
+        h2 { color: #34495e; margin-top: 35px; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; font-weight: 500; }
+        h3 { color: #7f8c8d; margin-top: 20px; font-size: 1.1em; }
         
-        /* Tooltip Styles */
-        .tooltip { position: relative; border-bottom: 1px dotted #fff; cursor: help; }
-        .tooltip:hover::after {
-            content: attr(data-tooltip);
-            position: absolute;
-            bottom: 100%;
-            left: 50%;
-            transform: translateX(-50%);
-            background: #333;
-            color: #fff;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 0.85em;
-            white-space: pre-wrap;
-            width: 250px;
-            text-align: center;
-            z-index: 1000;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-        }
-        .tooltip:hover::before { /* Arrow */
-            content: '';
-            position: absolute;
-            top: -5px;
-            left: 50%;
-            margin-left: -5px;
-            border-width: 5px;
-            border-style: solid;
-            border-color: #333 transparent transparent transparent;
-        }
+        /* Status Bar */
+        .status-bar { background: #2ecc71; color: white; padding: 15px 20px; border-radius: 8px; margin: 20px 0; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(46, 204, 113, 0.2); }
+        .status-bar.disconnected { background: #e74c3c; box-shadow: 0 2px 4px rgba(231, 76, 60, 0.2); }
+        
+        /* Metrics */
+        .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin: 25px 0; }
+        .metric-box { background: #f8f9fa; border-left: 5px solid #3498db; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); transition: transform 0.2s; }
+        .metric-box:hover { transform: translateY(-2px); }
+        .metric-box .label { font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.5px; color: #7f8c8d; margin-bottom: 8px; font-weight: 600; }
+        .metric-box .value { font-size: 1.8em; font-weight: 700; color: #2c3e50; }
+        
+        /* Tables */
+        table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 20px 0; width: 100%; border: 1px solid #e1e8ed; border-radius: 8px; overflow: hidden; }
+        th { background: #f8f9fa; color: #555; padding: 12px 15px; text-align: left; font-weight: 600; border-bottom: 2px solid #e1e8ed; text-transform: uppercase; font-size: 0.85em; letter-spacing: 0.5px; }
+        td { padding: 12px 15px; border-bottom: 1px solid #eee; color: #444; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover { background-color: #f8f9fa; }
+        
+        /* Colors */
+        .positive { color: #27ae60; font-weight: 600; }
+        .negative { color: #c0392b; font-weight: 600; }
+        .neutral { color: #7f8c8d; }
+        
+        /* Logs */
+        .log-container { max-height: 400px; overflow-y: auto; background: #fff; padding: 0; border-radius: 8px; border: 1px solid #e1e8ed; font-family: 'Consolas', monospace; font-size: 0.9em; }
+        .log-entry { padding: 8px 15px; border-bottom: 1px solid #f0f0f0; display: flex; align-items: flex-start; }
+        .log-entry:last-child { border-bottom: none; }
+        .log-timestamp { color: #95a5a6; margin-right: 15px; white-space: nowrap; }
+        .log-type { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; margin-right: 10px; font-weight: bold; width: 60px; text-align: center; }
+        
+        .log-type.INFO { background: #e3f2fd; color: #1976d2; }
+        .log-type.WARNING { background: #fff3e0; color: #f57c00; }
+        .log-type.ERROR { background: #ffebee; color: #c62828; }
+        .log-type.TRADE { background: #e8f5e9; color: #2e7d32; }
+        
+        /* Parameters */
+        .params-section { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
+        .params-group { background: white; border: 1px solid #e1e8ed; border-radius: 8px; padding: 0; overflow: hidden; }
+        .params-group h3 { background: #f8f9fa; margin: 0; padding: 10px 15px; border-bottom: 1px solid #e1e8ed; font-size: 1em; color: #333; }
+        .params-table { margin: 0; border: none; }
+        .params-table td { padding: 8px 15px; border-bottom: 1px solid #f0f0f0; }
+        .params-table td:first-child { color: #666; font-weight: 500; width: 60%; }
+        .params-table td:last-child { font-family: 'Consolas', monospace; color: #333; }
+        
+        .return-button { display: inline-block; margin-bottom: 20px; padding: 8px 16px; background: #fff; color: #3498db; border: 1px solid #3498db; text-decoration: none; border-radius: 20px; font-weight: 600; font-size: 0.9em; transition: all 0.2s; }
+        .return-button:hover { background: #3498db; color: white; }
+        
+        /* Stale Warning */
+        .stale-warning { display: none; background: #f1c40f; color: #000; text-align: center; padding: 10px; font-weight: bold; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stale-data .stale-warning { display: block; }
+        .stale-data .status-bar { background: #95a5a6 !important; opacity: 0.8; }
     </style>
 </head>
 <body>
     <div class="container">
-        <a href="index.html" class="return-button">← Back to Main Dashboard</a>
-        <h1>IB Deployment Dashboard [LIVE] (Port: 7496) <span style="font-size: 0.8em; color: #aaa;">ESH6</span></h1>
-        <p><strong>Last Updated:</strong> 2025-12-31 16:13:11</p>
+        <a href="index.html" class="return-button">← Back to Index</a>
         
-        <div class="status-bar ">
-            <h2 style="margin: 0; color: white;">Connection Status: CONNECTED</h2>
-            <p style="margin: 5px 0 0 0;">
-                <strong>Total Uptime:</strong> 4h 51m | 
-                <strong>Current Session:</strong> 4h 51m |
-                <strong>Reconnections:</strong> 0
-            </p>
-        </div>
-        
-        <h2>Account & Market Summary</h2>
-        <div class="metric-grid">
-            <div class="metric-box">
-                <div class="label">Contract</div>
-                <div class="value">ESH6</div>
+        <div class="stale-warning">⚠️ WARNING: THIS DASHBOARD IS SHOWING STALE DATA (BOT MAY BE OFFLINE)</div>
+
+        <div class="status-bar disconnected">
+            <div>
+                <strong style="font-size: 1.2em;">SYSTEM STATUS: <span id="status-text">OFFLINE</span></strong>
+                <span style="opacity: 0.8; margin-left: 10px;">[LIVE]</span>
             </div>
+            <div style="text-align: right; font-size: 0.9em;">
+                <div>Uptime: 00:00:00</div>
+                <div id="last-update" data-timestamp="2026-04-02T08:21:04.935305">Last Update: 2026-04-02 08:21:04</div>
+            </div>
+        </div>
+
+        <h1>ES Trading Dashboard</h1>
+
+        <div class="metric-grid">
             <div class="metric-box">
                 <div class="label">Net Liquidation</div>
                 <div class="value">$0.00</div>
@@ -109,752 +97,56 @@
             </div>
             <div class="metric-box">
                 <div class="label">Realized PNL</div>
-                <div class="value negative">
-                    $-2,653.00
+                <div class="value positive">
+                    $0.00
                 </div>
             </div>
             <div class="metric-box">
                 <div class="label">Current Price</div>
-                <div class="value">$6896.50</div>
-            </div>
-             <div class="metric-box">
-                <div class="label">Bar Volume (2m)</div>
-                <div class="value">2,222</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Open ES Positions</div>
-                <div class="value">0</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Total Cash</div>
-                <div class="value">$11,300.84</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Buying Power</div>
-                <div class="value">$124,160.36</div>
+                <div class="value">$0.00</div>
             </div>
         </div>
         
         <h2>Active Positions</h2>
-        <p><em>No open positions</em></p>
-
+        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active positions</div>
         <h2>Active Orders</h2>
-        <p><em>No active orders</em></p>
-
-        <h2>Completed Trades (Session)</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th class="tooltip" data-tooltip="Trade Exit Time">Exit Time</th>
-                    <th class="tooltip" data-tooltip="Long or Short">Type</th>
-                    <th class="tooltip" data-tooltip="Quantity">Qty</th>
-                    <th class="tooltip" data-tooltip="Entry Price">Entry</th>
-                    <th class="tooltip" data-tooltip="Exit Price">Exit</th>
-                    <th class="tooltip" data-tooltip="Realized Profit/Loss">PnL ($)</th>
-                    <th class="tooltip" data-tooltip="Performance Efficiency&#10;PnL / Initial Risk">R-Multiple</th>
-                    <th class="tooltip" data-tooltip="Trade Duration">Duration</th>
-                    <th class="tooltip" data-tooltip="Reason for Exit">Reason</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td>15:29:03</td>
-                    <td>LONG</td>
-                    <td>1.0</td>
-                    <td>$6930.25</td>
-                    <td>$6897.50</td>
-                    <td class="negative">$-1,637.50</td>
-                    <td class=""><strong>N/A</strong></td>
-                    <td>1:12:56</td>
-                    <td>Stop Loss</td>
-                </tr>
-                <tr>
-                    <td>14:14:13</td>
-                    <td>SHORT</td>
-                    <td>1.0</td>
-                    <td>$6927.25</td>
-                    <td>$6931.75</td>
-                    <td class="negative">$-225.00</td>
-                    <td class=""><strong>N/A</strong></td>
-                    <td>0:36:06</td>
-                    <td>Take Profit</td>
-                </tr>
-                <tr>
-                    <td>13:08:04</td>
-                    <td>LONG</td>
-                    <td>1.0</td>
-                    <td>$6920.75</td>
-                    <td>$6922.50</td>
-                    <td class="positive">$87.50</td>
-                    <td class=""><strong>N/A</strong></td>
-                    <td>0:15:57</td>
-                    <td>Take Profit</td>
-                </tr>
-                <tr>
-                    <td>12:17:49</td>
-                    <td>LONG</td>
-                    <td>1.0</td>
-                    <td>$6920.25</td>
-                    <td>$6923.50</td>
-                    <td class="positive">$162.50</td>
-                    <td class=""><strong>N/A</strong></td>
-                    <td>0:09:43</td>
-                    <td>Take Profit</td>
-                </tr>
-                <tr>
-                    <td>12:07:20</td>
-                    <td>SHORT</td>
-                    <td>1.0</td>
-                    <td>$6923.00</td>
-                    <td>$6922.00</td>
-                    <td class="positive">$50.00</td>
-                    <td class=""><strong>N/A</strong></td>
-                    <td>0:27:14</td>
-                    <td>Take Profit</td>
-                </tr>
-            </tbody>
-        </table>
-
-        <h2>Statistics</h2>
-        <div class="metric-grid">
-            <div class="metric-box">
-                <div class="label">Trades Opened</div>
-                <div class="value">5</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Trades Closed</div>
-                <div class="value">4</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Orders Placed</div>
-                <div class="value">15</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Orders Filled</div>
-                <div class="value">4</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Orders Cancelled</div>
-                <div class="value">0</div>
-            </div>
+        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active orders</div>
+        <h2>Bar Log (Last 20 Aggregated Bars)</h2>
+        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No bar data yet</div>
+        <h2>Completed Trades</h2>
+        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No completed trades</div>
+        <h2>System Logs</h2>
+        <div class="log-container">
         </div>
-        
-        <h2>Recent Errors</h2>
-        <p><em>No errors recorded</em></p>
 
-        <h2>Bar Log & Entry Criteria</h2>
-        <div class="bar-log-container">
-            <div class="bar-log-scroll">
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">16:10:00</div>
-                    <div class="bar-log-info">[2-min bar] 16:10:00 | O: 6893.75 H: 6894.75 L: 6893.25 C: 6894.75 | Vol: 2,222</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6893.25 > trigger=6891.60)) | Short: ❌ (Wick not touched (high=6894.75 < trigger=6895.80)) | BB: Lower=6891.60 | Price=6894.75 | Upper=6895.80 | +0.0456% from lower, +0.0152% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">16:08:00</div>
-                    <div class="bar-log-info">[2-min bar] 16:08:00 | O: 6893.25 H: 6894.75 L: 6892.50 C: 6893.50 | Vol: 3,785</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6892.50 > trigger=6890.55)) | Short: ❌ (Wick not touched (high=6894.75 < trigger=6897.55)) | BB: Lower=6890.55 | Price=6893.50 | Upper=6897.55 | +0.0428% from lower, +0.0587% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">16:06:00</div>
-                    <div class="bar-log-info">[2-min bar] 16:06:00 | O: 6894.50 H: 6895.25 L: 6891.75 C: 6893.25 | Vol: 2,916</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (4.04) | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=4.04)) | Short: ❌ (ATR filter failed (ATR=4.04)) | BB: Lower=6890.72 | Price=6893.25 | Upper=6898.28 | +0.0367% from lower, +0.0729% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">16:04:00</div>
-                    <div class="bar-log-info">[2-min bar] 16:04:00 | O: 6892.50 H: 6895.00 L: 6892.25 C: 6894.50 | Vol: 3,662</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (4.14) | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=4.14)) | Short: ❌ (ATR filter failed (ATR=4.14)) | BB: Lower=6890.05 | Price=6894.50 | Upper=6901.35 | +0.0646% from lower, +0.0993% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">16:02:00</div>
-                    <div class="bar-log-info">[2-min bar] 16:02:00 | O: 6896.50 H: 6897.00 L: 6891.50 C: 6892.50 | Vol: 7,210</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ❌ (4.16) | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (ATR filter failed (ATR=4.16)) | Short: ❌ (ATR filter failed (ATR=4.16)) | BB: Lower=6890.55 | Price=6892.50 | Upper=6902.35 | +0.0284% from lower, +0.1428% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">16:00:00</div>
-                    <div class="bar-log-info">[2-min bar] 16:00:00 | O: 6895.50 H: 6897.25 L: 6890.25 C: 6896.50 | Vol: 103,612</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ❌ (Vol=103,612 > Max=10,897) | Maintenance: ✅ | Long: ❌ (Volume filter failed (vol=103,612 > threshold=10,897)) | Short: ❌ (Volume filter failed (vol=103,612 > threshold=10,897)) | BB: Lower=6894.29 | Price=6896.50 | Upper=6901.11 | +0.0320% from lower, +0.0668% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:58:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:58:00 | O: 6899.25 H: 6900.00 L: 6895.00 C: 6895.75 | Vol: 16,555</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ❌ (Vol=16,555 > Max=9,071) | Maintenance: ✅ | Long: ❌ (Volume filter failed (vol=16,555 > threshold=9,071)) | Short: ❌ (Volume filter failed (vol=16,555 > threshold=9,071)) | BB: Lower=6894.82 | Price=6895.75 | Upper=6901.88 | +0.0134% from lower, +0.0888% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:56:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:56:00 | O: 6898.25 H: 6903.50 L: 6896.50 C: 6899.25 | Vol: 16,708</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ❌ (Vol=16,708 > Max=8,820) | Maintenance: ✅ | Long: ❌ (Volume filter failed (vol=16,708 > threshold=8,820)) | Short: ❌ (Volume filter failed (vol=16,708 > threshold=8,820)) | BB: Lower=6896.31 | Price=6899.25 | Upper=6902.89 | +0.0427% from lower, +0.0528% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:54:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:54:00 | O: 6899.00 H: 6901.25 L: 6898.00 C: 6898.25 | Vol: 11,545</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ❌ (Vol=11,545 > Max=8,595) | Maintenance: ✅ | Long: ❌ (Volume filter failed (vol=11,545 > threshold=8,595)) | Short: ❌ (Volume filter failed (vol=11,545 > threshold=8,595)) | BB: Lower=6894.94 | Price=6898.25 | Upper=6906.26 | +0.0480% from lower, +0.1159% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:52:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:52:00 | O: 6900.00 H: 6900.50 L: 6897.75 C: 6898.75 | Vol: 7,428</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6897.75 > trigger=6894.89)) | Short: ❌ (Wick not touched (high=6900.50 < trigger=6909.71)) | BB: Lower=6894.89 | Price=6898.75 | Upper=6909.71 | +0.0560% from lower, +0.1586% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:50:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:50:00 | O: 6901.75 H: 6902.75 L: 6899.00 C: 6899.75 | Vol: 11,997</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ❌ (Vol=11,997 > Max=8,333) | Maintenance: ✅ | Long: ❌ (Volume filter failed (vol=11,997 > threshold=8,333)) | Short: ❌ (Volume filter failed (vol=11,997 > threshold=8,333)) | BB: Lower=6897.35 | Price=6899.75 | Upper=6909.85 | +0.0348% from lower, +0.1462% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:48:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:48:00 | O: 6904.00 H: 6904.50 L: 6901.50 C: 6902.00 | Vol: 4,807</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6901.50 > trigger=6900.17)) | Short: ❌ (Wick not touched (high=6904.50 < trigger=6908.43)) | BB: Lower=6900.17 | Price=6902.00 | Upper=6908.43 | +0.0265% from lower, +0.0931% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:46:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:46:00 | O: 6906.50 H: 6907.25 L: 6904.00 C: 6904.25 | Vol: 7,170</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6904.00 > trigger=6901.92)) | Short: ❌ (Wick not touched (high=6907.25 < trigger=6907.78)) | BB: Lower=6901.92 | Price=6904.25 | Upper=6907.78 | +0.0338% from lower, +0.0511% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:44:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:44:00 | O: 6905.50 H: 6907.00 L: 6904.50 C: 6906.75 | Vol: 3,610</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6904.50 > trigger=6901.70)) | Short: ❌ (Wick not touched (high=6907.00 < trigger=6909.30)) | BB: Lower=6901.70 | Price=6906.75 | Upper=6909.30 | +0.0731% from lower, +0.0369% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:42:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:42:00 | O: 6903.25 H: 6906.25 L: 6902.50 C: 6905.25 | Vol: 4,857</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6902.50 > trigger=6901.69)) | Short: ❌ (Wick not touched (high=6906.25 < trigger=6908.61)) | BB: Lower=6901.69 | Price=6905.25 | Upper=6908.61 | +0.0516% from lower, +0.0486% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:40:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:40:00 | O: 6904.75 H: 6906.00 L: 6902.50 C: 6903.25 | Vol: 5,325</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6902.50 > trigger=6901.72)) | Short: ❌ (Wick not touched (high=6906.00 < trigger=6908.68)) | BB: Lower=6901.72 | Price=6903.25 | Upper=6908.68 | +0.0221% from lower, +0.0786% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:38:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:38:00 | O: 6907.75 H: 6909.25 L: 6904.25 C: 6904.75 | Vol: 6,187</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6904.25 > trigger=6899.68)) | Short: ❌ (Wick not touched (high=6909.25 < trigger=6909.92)) | BB: Lower=6899.68 | Price=6904.75 | Upper=6909.92 | +0.0735% from lower, +0.0748% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:36:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:36:00 | O: 6905.25 H: 6907.75 L: 6904.75 C: 6907.50 | Vol: 3,969</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6904.75 > trigger=6895.36)) | Short: ❌ (Wick not touched (high=6907.75 < trigger=6911.74)) | BB: Lower=6895.36 | Price=6907.50 | Upper=6911.74 | +0.1761% from lower, +0.0613% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:34:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:34:00 | O: 6905.75 H: 6905.75 L: 6903.25 C: 6905.00 | Vol: 3,935</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ✅ | Maintenance: ✅ | Long: ❌ (Wick not touched (low=6903.25 > trigger=6895.86)) | Short: ❌ (Wick not touched (high=6905.75 < trigger=6908.94)) | BB: Lower=6895.86 | Price=6905.00 | Upper=6908.94 | +0.1325% from lower, +0.0570% from upper</div>
-                </div>
-                <div class="bar-log-entry">
-                    <div class="bar-log-timestamp">15:32:00</div>
-                    <div class="bar-log-info">[2-min bar] 15:32:00 | O: 6901.50 H: 6906.75 L: 6901.25 C: 6905.50 | Vol: 8,800</div>
-                    <div class="bar-log-criteria">Max Trades: ✅ | RTH: ✅ | ATR Filter: ✅ | Vol Filter: ❌ (Vol=8,800 > Max=7,871) | Maintenance: ✅ | Long: ❌ (Volume filter failed (vol=8,800 > threshold=7,871)) | Short: ❌ (Volume filter failed (vol=8,800 > threshold=7,871)) | BB: Lower=6895.98 | Price=6905.50 | Upper=6907.32 | +0.1381% from lower, +0.0264% from upper</div>
-                </div>
-            </div>
-        </div>
-        
         <h2>Strategy Parameters</h2>
         <div class="params-section">
-            <div class="params-group">
-                <h3>Entry Criteria</h3>
-                <table class="params-table">
-                    <tr>
-                        <td><strong>ATR Length for Filter</strong></td>
-                        <td>14</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Bollinger Band Length</strong></td>
-                        <td>5</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Bollinger Band StdDev</strong></td>
-                        <td>2.2650</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Enable Long Trades</strong></td>
-                        <td>True</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Enable RTH Filter</strong></td>
-                        <td>0</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Enable Short Trades</strong></td>
-                        <td>True</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Long Entry on Body in Zone</strong></td>
-                        <td>0</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Long Entry on Wick Touch</strong></td>
-                        <td>1</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Long Trigger (% From Lower Band)</strong></td>
-                        <td>0.0000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Max ATR Filter (Points)</strong></td>
-                        <td>4.0189</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Max Open Trades</strong></td>
-                        <td>1</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Max Volume Multiplier</strong></td>
-                        <td>2.8447</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Min ATR Filter (Points)</strong></td>
-                        <td>1.4812</td>
-                    </tr>
-                    <tr>
-                        <td><strong>RTH End (HH:MM)</strong></td>
-                        <td>16:00</td>
-                    </tr>
-                    <tr>
-                        <td><strong>RTH Start (HH:MM)</strong></td>
-                        <td>09:30</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Short Entry on Body in Zone</strong></td>
-                        <td>0</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Short Entry on Wick Touch</strong></td>
-                        <td>1</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Short Trigger (% From Upper Band)</strong></td>
-                        <td>0.0000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Timeframe (minutes)</strong></td>
-                        <td>2</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Volume MA Length</strong></td>
-                        <td>155</td>
-                    </tr>
-                </table>
-            </div>
-            <div class="params-group">
-                <h3>Take Profit Criteria</h3>
-                <table class="params-table">
-                    <tr>
-                        <td><strong>ATR Length for TP</strong></td>
-                        <td>18</td>
-                    </tr>
-                    <tr>
-                        <td><strong>ATR Multiplier for TP</strong></td>
-                        <td>2.3233</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Fixed ATR TP</strong></td>
-                        <td>False</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Fixed BB at Entry TP</strong></td>
-                        <td>False</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Opposite Bollinger Band TP</strong></td>
-                        <td>True</td>
-                    </tr>
-                </table>
-            </div>
-            <div class="params-group">
-                <h3>Stop Loss Criteria</h3>
-                <table class="params-table">
-                    <tr>
-                        <td><strong>ATR Length for Trailing Stop</strong></td>
-                        <td>56</td>
-                    </tr>
-                    <tr>
-                        <td><strong>ATR Multiplier for Trailing Stop</strong></td>
-                        <td>0.5114</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Enable Trailing Stop</strong></td>
-                        <td>0</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Initial Stop Loss (%)</strong></td>
-                        <td>0.5000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Trailing Delay (bars)</strong></td>
-                        <td>18</td>
-                    </tr>
-                </table>
-            </div>
-            <div class="params-group">
-                <h3>GA Criteria</h3>
-                <table class="params-table">
-                    <tr>
-                        <td><strong>CX_PB</strong></td>
-                        <td>0.7000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>DATA_SIZE</strong></td>
-                        <td>0</td>
-                    </tr>
-                    <tr>
-                        <td><strong>DATA_SPLITS</strong></td>
-                        <td>0.6500</td>
-                    </tr>
-                    <tr>
-                        <td><strong>DD_WEIGHT</strong></td>
-                        <td>0.5000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>MIN_TRADES_DAY</strong></td>
-                        <td>2.0000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>MIN_TRADES_PEN_WEIGHT</strong></td>
-                        <td>-500.0000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>MUT_MU</strong></td>
-                        <td>0.0000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>MUT_PB</strong></td>
-                        <td>0.4000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>MUT_SIGMA</strong></td>
-                        <td>0.2500</td>
-                    </tr>
-                    <tr>
-                        <td><strong>NUM_GEN</strong></td>
-                        <td>100</td>
-                    </tr>
-                    <tr>
-                        <td><strong>NUM_SPLIT_PERIODS</strong></td>
-                        <td>5</td>
-                    </tr>
-                    <tr>
-                        <td><strong>POP_SIZE</strong></td>
-                        <td>150</td>
-                    </tr>
-                    <tr>
-                        <td><strong>TARGET_TRADES_DAY</strong></td>
-                        <td>5</td>
-                    </tr>
-                    <tr>
-                        <td><strong>TRADES_PENALTY_WEIGHT</strong></td>
-                        <td>0.3000</td>
-                    </tr>
-                    <tr>
-                        <td><strong>USE_INTERLEAVED_SPLIT</strong></td>
-                        <td>True</td>
-                    </tr>
-                </table>
-            </div>
-        </div>
-        
-        <h2>Live Event Tracker</h2>
-        <div class="live-tracker">
-            <div class="entry order">
-                <strong>2025-12-31 14:56:25</strong> [ORDER] Opposite BB TP Modified: New Target $6917.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:56:30</strong> [ORDER] Opposite BB TP Modified: New Target $6917.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:56:45</strong> [ORDER] Opposite BB TP Modified: New Target $6917.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:56:50</strong> [ORDER] Opposite BB TP Modified: New Target $6917.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:57:00</strong> [ORDER] Opposite BB TP Modified: New Target $6917.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:58:05</strong> [ORDER] Opposite BB TP Modified: New Target $6915.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:58:30</strong> [ORDER] Opposite BB TP Modified: New Target $6915.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:58:35</strong> [ORDER] Opposite BB TP Modified: New Target $6915.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 14:58:50</strong> [ORDER] Opposite BB TP Modified: New Target $6915.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:05</strong> [ORDER] Opposite BB TP Modified: New Target $6915.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:10</strong> [ORDER] Opposite BB TP Modified: New Target $6915.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:15</strong> [ORDER] Opposite BB TP Modified: New Target $6916.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:20</strong> [ORDER] Opposite BB TP Modified: New Target $6916.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:25</strong> [ORDER] Opposite BB TP Modified: New Target $6916.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:30</strong> [ORDER] Opposite BB TP Modified: New Target $6916.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:35</strong> [ORDER] Opposite BB TP Modified: New Target $6917.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:50</strong> [ORDER] Opposite BB TP Modified: New Target $6917.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:00:55</strong> [ORDER] Opposite BB TP Modified: New Target $6918.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:02:05</strong> [ORDER] Opposite BB TP Modified: New Target $6918.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:02:10</strong> [ORDER] Opposite BB TP Modified: New Target $6919.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:02:15</strong> [ORDER] Opposite BB TP Modified: New Target $6919.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:02:25</strong> [ORDER] Opposite BB TP Modified: New Target $6919.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:02:30</strong> [ORDER] Opposite BB TP Modified: New Target $6919.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:02:40</strong> [ORDER] Opposite BB TP Modified: New Target $6918.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:02:55</strong> [ORDER] Opposite BB TP Modified: New Target $6919.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:04:05</strong> [ORDER] Opposite BB TP Modified: New Target $6918.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:04:45</strong> [ORDER] Opposite BB TP Modified: New Target $6918.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:04:50</strong> [ORDER] Opposite BB TP Modified: New Target $6918.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:06:05</strong> [ORDER] Opposite BB TP Modified: New Target $6916.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:06:30</strong> [ORDER] Opposite BB TP Modified: New Target $6916.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:05</strong> [ORDER] Opposite BB TP Modified: New Target $6910.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:10</strong> [ORDER] Opposite BB TP Modified: New Target $6910.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:20</strong> [ORDER] Opposite BB TP Modified: New Target $6910.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:25</strong> [ORDER] Opposite BB TP Modified: New Target $6910.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:30</strong> [ORDER] Opposite BB TP Modified: New Target $6910.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:35</strong> [ORDER] Opposite BB TP Modified: New Target $6911.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:45</strong> [ORDER] Opposite BB TP Modified: New Target $6910.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:08:50</strong> [ORDER] Opposite BB TP Modified: New Target $6911.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:05</strong> [ORDER] Opposite BB TP Modified: New Target $6910.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:19</strong> [ORDER] Opposite BB TP Modified: New Target $6910.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:25</strong> [ORDER] Opposite BB TP Modified: New Target $6911.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:30</strong> [ORDER] Opposite BB TP Modified: New Target $6911.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:35</strong> [ORDER] Opposite BB TP Modified: New Target $6911.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:40</strong> [ORDER] Opposite BB TP Modified: New Target $6911.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:45</strong> [ORDER] Opposite BB TP Modified: New Target $6911.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:50</strong> [ORDER] Opposite BB TP Modified: New Target $6911.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:10:55</strong> [ORDER] Opposite BB TP Modified: New Target $6911.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:12:05</strong> [ORDER] Opposite BB TP Modified: New Target $6910.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:12:15</strong> [ORDER] Opposite BB TP Modified: New Target $6910.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:12:35</strong> [ORDER] Opposite BB TP Modified: New Target $6910.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:13:00</strong> [ORDER] Opposite BB TP Modified: New Target $6910.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:14:05</strong> [ORDER] Opposite BB TP Modified: New Target $6908.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:14:15</strong> [ORDER] Opposite BB TP Modified: New Target $6908.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:14:20</strong> [ORDER] Opposite BB TP Modified: New Target $6908.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:14:25</strong> [ORDER] Opposite BB TP Modified: New Target $6908.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:14:30</strong> [ORDER] Opposite BB TP Modified: New Target $6908.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:05</strong> [ORDER] Opposite BB TP Modified: New Target $6907.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:15</strong> [ORDER] Opposite BB TP Modified: New Target $6907.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:20</strong> [ORDER] Opposite BB TP Modified: New Target $6908.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:25</strong> [ORDER] Opposite BB TP Modified: New Target $6908.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:30</strong> [ORDER] Opposite BB TP Modified: New Target $6908.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:40</strong> [ORDER] Opposite BB TP Modified: New Target $6908.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:45</strong> [ORDER] Opposite BB TP Modified: New Target $6907.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:50</strong> [ORDER] Opposite BB TP Modified: New Target $6907.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:16:55</strong> [ORDER] Opposite BB TP Modified: New Target $6907.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:17:00</strong> [ORDER] Opposite BB TP Modified: New Target $6907.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:18:05</strong> [ORDER] Opposite BB TP Modified: New Target $6908.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:18:15</strong> [ORDER] Opposite BB TP Modified: New Target $6908.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:18:25</strong> [ORDER] Opposite BB TP Modified: New Target $6908.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:18:40</strong> [ORDER] Opposite BB TP Modified: New Target $6908.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:18:45</strong> [ORDER] Opposite BB TP Modified: New Target $6908.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:18:50</strong> [ORDER] Opposite BB TP Modified: New Target $6908.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:19:00</strong> [ORDER] Opposite BB TP Modified: New Target $6908.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:20:05</strong> [ORDER] Opposite BB TP Modified: New Target $6908.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:20:45</strong> [ORDER] Opposite BB TP Modified: New Target $6908.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:22:05</strong> [ORDER] Opposite BB TP Modified: New Target $6909.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:22:25</strong> [ORDER] Opposite BB TP Modified: New Target $6909.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:22:30</strong> [ORDER] Opposite BB TP Modified: New Target $6909.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:22:35</strong> [ORDER] Opposite BB TP Modified: New Target $6909.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:22:40</strong> [ORDER] Opposite BB TP Modified: New Target $6909.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:22:50</strong> [ORDER] Opposite BB TP Modified: New Target $6909.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:22:55</strong> [ORDER] Opposite BB TP Modified: New Target $6909.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:24:05</strong> [ORDER] Opposite BB TP Modified: New Target $6909.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:24:15</strong> [ORDER] Opposite BB TP Modified: New Target $6909.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:24:20</strong> [ORDER] Opposite BB TP Modified: New Target $6909.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:24:25</strong> [ORDER] Opposite BB TP Modified: New Target $6909.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:24:35</strong> [ORDER] Opposite BB TP Modified: New Target $6909.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:24:45</strong> [ORDER] Opposite BB TP Modified: New Target $6909.25
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:25:00</strong> [ORDER] Opposite BB TP Modified: New Target $6909.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:26:05</strong> [ORDER] Opposite BB TP Modified: New Target $6907.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:26:10</strong> [ORDER] Opposite BB TP Modified: New Target $6907.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:26:15</strong> [ORDER] Opposite BB TP Modified: New Target $6907.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:28:05</strong> [ORDER] Opposite BB TP Modified: New Target $6904.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:28:10</strong> [ORDER] Opposite BB TP Modified: New Target $6903.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:28:20</strong> [ORDER] Opposite BB TP Modified: New Target $6903.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:28:25</strong> [ORDER] Opposite BB TP Modified: New Target $6903.75
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:28:45</strong> [ORDER] Opposite BB TP Modified: New Target $6903.50
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:28:50</strong> [ORDER] Opposite BB TP Modified: New Target $6904.00
-            </div>
-            <div class="entry order">
-                <strong>2025-12-31 15:29:00</strong> [ORDER] Opposite BB TP Modified: New Target $6904.50
-            </div>
-            <div class="entry trade">
-                <strong>2025-12-31 15:29:06</strong> [TRADE] TRADE CLOSE: LONG 1.0 @ $6897.50, PNL: $-1,642.00, Reason: Stop
-            </div>
         </div>
     </div>
+    
+    <script>
+        function checkStaleData() {
+            const lastUpdateElem = document.getElementById('last-update');
+            if (!lastUpdateElem) return;
+            
+            const lastUpdateTs = new Date(lastUpdateElem.dataset.timestamp);
+            const now = new Date();
+            const diffSeconds = (now - lastUpdateTs) / 1000;
+            
+            if (diffSeconds > 30) {
+                document.body.classList.add('stale-data');
+                const statusText = document.getElementById('status-text');
+                if (statusText && statusText.innerText === 'ONLINE') {
+                    statusText.innerText = 'OFFLINE (STALE)';
+                }
+            } else {
+                document.body.classList.remove('stale-data');
+            }
+        }
+        
+        // Check immediately and then every 2 seconds
+        checkStaleData();
+        setInterval(checkStaleData, 2000);
+    </script>
 </body>
 </html>
