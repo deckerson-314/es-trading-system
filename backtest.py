@@ -55,7 +55,12 @@ def find_latest_ga_file(search_dir='strategies/bollinger/parameters'):
     return max(candidates, key=os.path.getmtime)
 
 def load_ga_params(ga_file, solution_idx):
-    """Load CA params from CSV (Legacy format support)"""
+    """
+    Load strategy params from a genetic_results_*.csv column.
+
+    Hall-of-Fame exports often leave solution cells blank when the value matches the
+    template row's ``Value``; we fall back to ``Value`` so behavior matches the GA export.
+    """
     try:
         df = pd.read_csv(ga_file)
         col_name = f"Solution_{solution_idx}"
@@ -68,21 +73,33 @@ def load_ga_params(ga_file, solution_idx):
         params = {}
         for _, row in df.iterrows():
             name = row['Name']
-            if pd.isna(name) or str(name).startswith('==='): continue
+            if pd.isna(name) or str(name).startswith('===') or str(name).startswith('---'):
+                continue
+            if str(name).startswith('  '):
+                continue
             row_type = row.get('Type', '')
-            if row_type == 'statistic': continue
+            if row_type in ('statistic', 'robustness', 'split_detail'):
+                continue
             val = row[col_name]
-            if pd.isna(val) or val == '': continue
-            
+            if pd.isna(val) or str(val).strip() == '':
+                val = row.get('Value', '')
+                if pd.isna(val) or str(val).strip() == '':
+                    continue
+
             if row_type == 'int':
                 try: val = int(float(val))
-                except: pass
+                except Exception: continue
             elif row_type == 'float':
                 try: val = float(val)
-                except: pass
+                except Exception: continue
             elif row_type == 'bool':
                 if str(val).lower() == 'true': val = True
                 elif str(val).lower() == 'false': val = False
+                else:
+                    try:
+                        val = bool(int(float(val)))
+                    except Exception:
+                        continue
             
             params[name] = {'value': val, 'type': row_type}
             

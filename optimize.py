@@ -11,6 +11,7 @@ import signal
 import time
 import glob
 import array
+import tempfile
 from datetime import datetime, timedelta
 import traceback
 
@@ -143,7 +144,7 @@ parser.add_argument('--visualize-json', type=str, help='Generate dashboard for a
 parser.add_argument('--fresh', '-f', action='store_true', help='Force start fresh (ignore checkpoints)')
 parser.add_argument('--pop', type=int, help='Override Population Size', default=None)
 parser.add_argument('--gen', type=int, help='Override Number of Generations', default=None)
-args = parser.parse_args()
+args, _unknown_cli = parser.parse_known_args()
 
 import glob
 
@@ -1198,6 +1199,115 @@ def clamp_params(raw_params, param_dict_local):
         clamped['Max Open Trades'] = max(1, int(round(clamped['Max Open Trades'])))
     return clamped
 
+
+def finalize_ga_solution_params(raw_params, param_dict):
+    """
+    Clamp and cast one solution's parameters the same way as Hall-of-Fame export / evaluation.
+    Accepts a dict mapping param name -> value (from a DEAP individual or a genetic_results CSV column).
+    """
+    clamped_params = {}
+    for n, v in raw_params.items():
+        if n not in param_dict:
+            continue
+        mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
+        try:
+            if isinstance(mn, (int, float)) and isinstance(mx, (int, float)) and isinstance(v, (int, float)):
+                v = max(mn, min(v, mx))
+        except Exception:
+            pass
+        if typ == 'int':
+            clamped_params[n] = int(round(float(v)))
+        elif typ == 'float':
+            clamped_params[n] = float(v)
+        else:
+            clamped_params[n] = v
+
+    for n in list(clamped_params.keys()):
+        v = clamped_params[n]
+        if isinstance(v, float) and (np.isnan(v) or pd.isna(v)):
+            dv = param_dict.get(n, {}).get('value')
+            if dv is not None and not (isinstance(dv, float) and (np.isnan(dv) or pd.isna(dv))):
+                clamped_params[n] = dv
+        v = clamped_params[n]
+        if n in param_dict:
+            original_type = param_dict[n].get('type', '')
+            if original_type == 'bool' and isinstance(v, (int, float)) and not (isinstance(v, float) and (np.isnan(v) or pd.isna(v))):
+                clamped_params[n] = bool(int(round(v)))
+
+    if 'TP Method' in clamped_params:
+        tp_method = int(round(clamped_params['TP Method']))
+        clamped_params['Fixed BB at Entry TP'] = (tp_method == 0)
+        clamped_params['Fixed ATR TP'] = (tp_method == 1)
+        clamped_params['Opposite Bollinger Band TP'] = (tp_method == 2)
+        clamped_params.pop('TP Method', None)
+
+    if 'Bollinger Band Length' in clamped_params:
+        clamped_params['Bollinger Band Length'] = max(1, int(round(clamped_params['Bollinger Band Length'])))
+    if 'ATR Length for Trailing Stop' in clamped_params:
+        clamped_params['ATR Length for Trailing Stop'] = max(1, int(round(clamped_params['ATR Length for Trailing Stop'])))
+    if 'ATR Length for TP' in clamped_params:
+        clamped_params['ATR Length for TP'] = max(1, int(round(clamped_params['ATR Length for TP'])))
+    if 'Trailing Delay (bars)' in clamped_params:
+        clamped_params['Trailing Delay (bars)'] = max(0, int(round(clamped_params['Trailing Delay (bars)'])))
+    clamped_params['Timeframe (minutes)'] = max(1, int(round(clamped_params.get('Timeframe (minutes)', 15))))
+    if 'Max Open Trades' in clamped_params:
+        clamped_params['Max Open Trades'] = max(1, int(round(clamped_params['Max Open Trades'])))
+    if 'Enable ADX Filter' in clamped_params:
+        clamped_params['Enable ADX Filter'] = int(round(clamped_params['Enable ADX Filter']))
+    if 'ADX Period' in clamped_params:
+        clamped_params['ADX Period'] = max(1, int(round(clamped_params['ADX Period'])))
+    if 'Enable Trend Filter' in clamped_params:
+        clamped_params['Enable Trend Filter'] = int(round(clamped_params['Enable Trend Filter']))
+    if 'Trend EMA Length' in clamped_params:
+        clamped_params['Trend EMA Length'] = max(1, int(round(clamped_params['Trend EMA Length'])))
+    if 'RSI Period' in clamped_params:
+        clamped_params['RSI Period'] = max(2, int(round(clamped_params['RSI Period'])))
+    if 'RSI Overbought' in clamped_params:
+        clamped_params['RSI Overbought'] = max(50, int(round(clamped_params['RSI Overbought'])))
+    if 'RSI Oversold' in clamped_params:
+        clamped_params['RSI Oversold'] = max(1, int(round(clamped_params['RSI Oversold'])))
+    if 'Use RSI Filter' in clamped_params:
+        clamped_params['Use RSI Filter'] = int(round(clamped_params['Use RSI Filter']))
+    if 'Use VWAP Filter' in clamped_params:
+        clamped_params['Use VWAP Filter'] = int(round(clamped_params['Use VWAP Filter']))
+
+    return clamped_params
+
+
+def merge_solution_params_with_template(clamped_params, param_dict, param_df):
+    """
+    Fill in parameters that the GA does not mutate (fixed / template-only rows).
+
+    Hall-of-Fame CSV export previously left those cells empty, which made replays
+    ambiguous unless loaders fell back to the template ``Value`` column. We merge
+    ``param_dict`` / ``param_df`` defaults so every parameter row gets an explicit
+    value in each Solution_* column.
+    """
+    merged = dict(clamped_params)
+    for _, row in param_df.iterrows():
+        name = row.get('Name')
+        if pd.isna(name):
+            continue
+        name = str(name).strip()
+        if not name or name.startswith('===') or name.startswith('---'):
+            continue
+        if '__' in name:
+            continue
+        if name not in param_dict:
+            continue
+        meta = param_dict[name]
+        typ = meta.get('type', '')
+        if typ in ('statistic', 'robustness', 'split_detail'):
+            continue
+        if name in merged:
+            continue
+        default_val = meta.get('value')
+        if default_val is None and 'Value' in row.index:
+            default_val = row['Value']
+        merged[name] = default_val
+    return merged
+
+
 # Helper function to extract chart HTML (moved to global scope)
 def extract_chart_html(html_snippet):
     if not html_snippet or len(html_snippet) == 0:
@@ -1520,6 +1630,32 @@ def calculate_split_detail(params, is_periods, oos_periods, param_dict, df_full=
         oos_results.append(res)
         
     return is_results, oos_results
+
+
+def _atomic_write_utf8(target_path: str, content: str) -> None:
+    """
+    Write UTF-8 text atomically (temp file in same folder, then os.replace).
+    Normalizes the path; avoids Windows quirks with direct truncate-open on some setups.
+    """
+    target_path = os.path.abspath(os.path.normpath(target_path))
+    parent = os.path.dirname(target_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        suffix='.tmp', prefix='ga_dashboard_', dir=parent or None
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as tf:
+            tf.write(content)
+        os.replace(tmp_path, target_path)
+    except BaseException:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict,
                             logbook, is_res, oos_res, trades_is, trades_oos,
@@ -2553,30 +2689,42 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     html_content += pareto_table_html
     
     html_content += ' </body></html>'
-    
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-    
+
+    primary = os.path.abspath(os.path.normpath(html_path))
+    written_path = primary
+    try:
+        _atomic_write_utf8(primary, html_content)
+    except OSError as e:
+        fb = os.path.abspath(os.path.join(diag_dir, 'html', 'ga_dashboard_v4.html'))
+        try:
+            _atomic_write_utf8(fb, html_content)
+            written_path = fb
+            print(f"  NOTE: GA dashboard written to {written_path} (web path failed: {e})")
+        except OSError as e2:
+            raise OSError(
+                f"Failed to write dashboard to {primary!r} and fallback {fb!r}: {e!r}; {e2!r}"
+            ) from e2
+
     # Auto-launch only if requested (first update or final update)
     if auto_launch:
         try:
-            # Try to use web server URL if available, otherwise use file://
-            # Check if web server is running by trying to access it
             import urllib.request
             import urllib.error
+            from pathlib import Path
             web_url = None
             try:
-                # Try to connect to local web server
-                response = urllib.request.urlopen('http://127.0.0.1:8000/', timeout=1)
-                # If successful, use web server URL
-                html_filename = os.path.basename(html_path)
-                web_url = f'http://127.0.0.1:8000/{html_filename}'
+                urllib.request.urlopen('http://127.0.0.1:8000/', timeout=1)
+                web_root = os.path.normcase(
+                    os.path.abspath(os.path.normpath(os.path.join(os.getcwd(), 'web')))
+                )
+                if os.path.normcase(os.path.dirname(written_path)) == web_root:
+                    web_url = f"http://127.0.0.1:8000/{os.path.basename(written_path)}"
             except (urllib.error.URLError, OSError, Exception):
-                # Web server not available, use file://
-                web_url = f'file://{os.path.abspath(html_path)}'
-            
+                pass
+            if not web_url:
+                web_url = Path(written_path).resolve().as_uri()
             webbrowser.open(web_url)
-        except:
+        except Exception:
             pass
 
 # ----------------------------------------------------------------------
@@ -2664,6 +2812,92 @@ def load_checkpoint():
         print(f"Error loading checkpoint: {e}")
         print("Starting fresh run...")
         return None
+
+def build_ga_training_bundle(
+    param_dict,
+    *,
+    ga_start_date,
+    ga_end_date,
+    data_splits,
+    data_size,
+    use_interleaved,
+    num_periods,
+    data_csv=None,
+    verbose=True,
+):
+    """
+    Load ES 1m data and build (in_sample, oos, is_mask, is_periods, oos_periods) exactly as the GA uses.
+    Import this from tools (or notebooks) to replay `run_backtest(params, in_sample, ..., mask=is_mask)`.
+    """
+    if data_csv is None:
+        data_csv = 'Bollinger/data/ES_full_1min_continuous_ratio_adjusted.csv'
+
+    df = pd.read_csv(data_csv, header=None, names=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    if df['datetime'].dt.tz is None:
+        df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern').dt.tz_localize(None)
+    else:
+        df['datetime'] = df['datetime'].dt.tz_convert('US/Eastern').dt.tz_localize(None)
+    df.set_index('datetime', inplace=True)
+
+    if verbose:
+        print(f"\n=== Slicing Data Range: {ga_start_date} to {ga_end_date} ===")
+    original_size = len(df)
+    df = df.loc[ga_start_date:ga_end_date]
+    if verbose:
+        print(f"Data range sliced: {original_size} -> {len(df)} rows")
+
+    if data_size > 0:
+        df = df.tail(int(data_size))
+        if verbose:
+            print(f"Applied DATA_SIZE tail: {len(df)} rows")
+
+    if use_interleaved and num_periods > 1:
+        if verbose:
+            print(f"\n=== Using Interleaved Data Split ===")
+            print(f"Number of periods: {num_periods}")
+        df = df.sort_index()
+        period_size = len(df) // num_periods
+        is_periods = []
+        oos_periods = []
+        is_mask = pd.Series(False, index=df.index)
+
+        for i in range(num_periods):
+            start_idx = i * period_size
+            end_idx = (i + 1) * period_size if i < num_periods - 1 else len(df)
+            if i % 2 == 0:
+                is_mask.iloc[start_idx:end_idx] = True
+                period = df.iloc[start_idx:end_idx]
+                is_periods.append(period)
+                if verbose:
+                    print(f"  Period {i+1}: IS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
+            else:
+                period = df.iloc[start_idx:end_idx]
+                oos_periods.append(period)
+                if verbose:
+                    print(f"  Period {i+1}: OOS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
+
+        in_sample = df.copy()
+        oos = df[~is_mask]
+        if verbose:
+            print(f"\nIS Mask coverage: {is_mask.sum():,} rows ({is_mask.sum()/len(df)*100:.1f}%)")
+            print("=" * 50)
+    else:
+        split = int(len(df) * float(data_splits))
+        is_mask = pd.Series(False, index=df.index)
+        is_mask.iloc[:split] = True
+        in_sample = df.copy()
+        oos = df.iloc[split:]
+        is_periods = [df.iloc[:split]] if split > 0 else []
+        oos_periods = [df.iloc[split:]] if split < len(df) else []
+        if verbose:
+            print(f"\n=== Using Simple Chronological Split ===")
+            print(f"IS: {is_mask.sum()} rows ({is_mask.sum()/len(df)*100:.1f}%)")
+            print(f"OOS: {len(oos)} rows ({len(oos)/len(df)*100:.1f}%)")
+            print("=" * 50)
+
+    return in_sample, oos, is_mask, is_periods, oos_periods
+
 
 def verify_config_compatibility(saved_config, current_config):
     # Verify that saved checkpoint config matches current config
@@ -2893,96 +3127,16 @@ def main():
         'NUM_WORKERS': NUM_WORKERS
     }
     
-    DATA_CSV = 'Bollinger/data/ES_full_1min_continuous_ratio_adjusted.csv'
-    # Use timezone-aware loading matching backtest.py fixes
-    df = pd.read_csv(DATA_CSV, header=None, names=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    if df['datetime'].dt.tz is None:
-        # Localize naive timestamps as UTC and convert to US/Eastern
-        df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern').dt.tz_localize(None)
-    else:
-        # Convert tz-aware timestamps to US/Eastern
-        df['datetime'] = df['datetime'].dt.tz_convert('US/Eastern').dt.tz_localize(None)
-    df.set_index('datetime', inplace=True)
-
-    
-    # Apply Date Range Slicing BEFORE anything else
-    print(f"\n=== Slicing Data Range: {GA_START_DATE} to {GA_END_DATE} ===")
-    original_size = len(df)
-    df = df.loc[GA_START_DATE:GA_END_DATE]
-    print(f"Data range sliced: {original_size} -> {len(df)} rows")
-    
-    if DATA_SIZE > 0:
-        df = df.tail(DATA_SIZE)
-        print(f"Applied DATA_SIZE tail: {len(df)} rows")
-    
-    # Check if we should use interleaved periods or simple split
-    # USE_INTERLEAVED and NUM_PERIODS are already loaded above
-    if USE_INTERLEAVED and NUM_PERIODS > 1:
-        # Interleaved approach: Split into alternating IS/OOS periods
-        # Example with 5 periods: IS-OOS-IS-OOS-IS (3 IS, 2 OOS)
-        # This ensures the strategy is tested across different market conditions
-        print(f"\n=== Using Interleaved Data Split ===")
-        print(f"Number of periods: {NUM_PERIODS}")
-        print(f"Pattern: Alternating IS-OOS-IS-OOS...")
-        
-        # Ensure data is sorted by index (chronological order)
-        df = df.sort_index()
-        
-        period_size = len(df) // NUM_PERIODS
-        is_periods = []
-        oos_periods = []
-        
-        # Create Boolean Mask for In-Sample rows (same length as df)
-        is_mask = pd.Series(False, index=df.index)
-        
-        for i in range(NUM_PERIODS):
-            start_idx = i * period_size
-            end_idx = (i + 1) * period_size if i < NUM_PERIODS - 1 else len(df)
-            
-            # Alternate: even indices (0, 2, 4...) are IS, odd (1, 3, 5...) are OOS
-            if i % 2 == 0:
-                is_mask.iloc[start_idx:end_idx] = True
-                period = df.iloc[start_idx:end_idx]
-                is_periods.append(period)
-                print(f"  Period {i+1}: IS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
-            else:
-                period = df.iloc[start_idx:end_idx]
-                oos_periods.append(period)
-                print(f"  Period {i+1}: OOS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
-        
-        # in_sample is now the FULL continuous dataframe for history preservation
-        # But evaluation will only happen on is_mask periods
-        in_sample = df.copy()
-        # Create virtual OOS for metrics/dashboard (still used for some logic)
-        oos = df[~is_mask]
-        
-        print(f"\nIS Mask coverage: {is_mask.sum():,} rows ({is_mask.sum()/len(df)*100:.1f}%)")
-        if len(in_sample) > 0:
-            print(f"  Date range: {in_sample.index[0]} to {in_sample.index[-1]}")
-        else:
-            print("  WARNING: Combined IS data is empty!")
-        print(f"Combined OOS: {len(oos):,} rows ({len(oos)/len(df)*100:.1f}%)")
-        if len(oos) > 0:
-            print(f"  Date range: {oos.index[0]} to {oos.index[-1]}")
-        else:
-            print("  WARNING: Combined OOS data is empty!")
-            print("  This may indicate an issue with the interleaved split configuration.")
-            print(f"  Number of OOS periods: {len(oos_periods)}")
-        print("=" * 50)
-    else:
-        # Simple chronological split (original approach)
-        split = int(len(df) * DATA_SPLITS)
-        # Create mask for simple split too for consistent evaluator logic
-        is_mask = pd.Series(False, index=df.index)
-        is_mask.iloc[:split] = True
-        
-        in_sample = df.copy() # Full DF but eval on mask
-        oos = df.iloc[split:]
-        print(f"\n=== Using Simple Chronological Split ===")
-        print(f"IS: {is_mask.sum()} rows ({is_mask.sum()/len(df)*100:.1f}%)")
-        print(f"OOS: {len(oos)} rows ({len(oos)/len(df)*100:.1f}%)")
-        print("=" * 50)
+    in_sample, oos, is_mask, is_periods, oos_periods = build_ga_training_bundle(
+        param_dict,
+        ga_start_date=GA_START_DATE,
+        ga_end_date=GA_END_DATE,
+        data_splits=DATA_SPLITS,
+        data_size=DATA_SIZE,
+        use_interleaved=USE_INTERLEAVED,
+        num_periods=NUM_PERIODS,
+        verbose=True,
+    )
     
     # Check for --fresh flag to force fresh start
     force_fresh = ('--fresh' in sys.argv or '-f' in sys.argv) and not args.dashboard_from
@@ -3709,8 +3863,7 @@ def main():
                         print(f"  HTML Dashboard updated  {WEB_DASHBOARD}")
                 except Exception as e:
                     print(f"  WARNING: Failed to update HTML dashboard: {e}")
-                import traceback
-                traceback.print_exc()
+                    traceback.print_exc()
             
             print(f"Generation {gen} completed.\n")
             
@@ -4170,74 +4323,10 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
     # ------------------------------------------------------------------
     solutions_data = []
     for i, ind in enumerate(hof):
-        actual = getattr(ind, 'actual_metrics', {})
         raw_params = dict(zip(param_keys, ind))
-        # Clamp parameters
-        clamped_params = {}
-        for n, v in raw_params.items():
-            if n not in param_dict:
-                continue
-            mn, mx, typ = param_dict[n]['min'], param_dict[n]['max'], param_dict[n]['type']
-            try:
-                # Only clamp if mn and mx are numeric
-                if isinstance(mn, (int, float)) and isinstance(mx, (int, float)) and isinstance(v, (int, float)):
-                    v = max(mn, min(v, mx))
-            except:
-                pass
-            if typ == 'int':
-                clamped_params[n] = int(round(float(v)))
-            elif typ == 'float':
-                clamped_params[n] = float(v)
-            else:
-                clamped_params[n] = v
-        
-        # Handle boolean and TP method conversions
-        for n in list(clamped_params.keys()):
-            if n in param_dict:
-                original_type = param_dict[n].get('type', '')
-                if original_type == 'bool' and isinstance(clamped_params[n], (int, float)):
-                    clamped_params[n] = bool(int(round(clamped_params[n])))
-        
-        if 'TP Method' in clamped_params:
-            tp_method = int(round(clamped_params['TP Method']))
-            clamped_params['Fixed BB at Entry TP'] = (tp_method == 0)
-            clamped_params['Fixed ATR TP'] = (tp_method == 1)
-            clamped_params['Opposite Bollinger Band TP'] = (tp_method == 2)
-            clamped_params.pop('TP Method', None)
-        
-        # Ensure critical integer parameters
-        if 'Bollinger Band Length' in clamped_params:
-            clamped_params['Bollinger Band Length'] = max(1, int(round(clamped_params['Bollinger Band Length'])))
-        if 'ATR Length for Trailing Stop' in clamped_params:
-            clamped_params['ATR Length for Trailing Stop'] = max(1, int(round(clamped_params['ATR Length for Trailing Stop'])))
-        if 'ATR Length for TP' in clamped_params:
-            clamped_params['ATR Length for TP'] = max(1, int(round(clamped_params['ATR Length for TP'])))
-        if 'Trailing Delay (bars)' in clamped_params:
-            clamped_params['Trailing Delay (bars)'] = max(0, int(round(clamped_params['Trailing Delay (bars)'])))
-        clamped_params['Timeframe (minutes)'] = max(1, int(round(clamped_params.get('Timeframe (minutes)', 15))))
-        if 'Max Open Trades' in clamped_params:
-            clamped_params['Max Open Trades'] = max(1, int(round(clamped_params['Max Open Trades'])))
-        if 'Enable ADX Filter' in clamped_params:
-            clamped_params['Enable ADX Filter'] = int(round(clamped_params['Enable ADX Filter']))
-        if 'ADX Period' in clamped_params:
-            clamped_params['ADX Period'] = max(1, int(round(clamped_params['ADX Period'])))
-        if 'Enable Trend Filter' in clamped_params:
-            clamped_params['Enable Trend Filter'] = int(round(clamped_params['Enable Trend Filter']))
-        if 'Trend EMA Length' in clamped_params:
-            clamped_params['Trend EMA Length'] = max(1, int(round(clamped_params['Trend EMA Length'])))
-        
-        # V5 Clamping
-        if 'RSI Period' in clamped_params:
-            clamped_params['RSI Period'] = max(2, int(round(clamped_params['RSI Period'])))
-        if 'RSI Overbought' in clamped_params:
-            clamped_params['RSI Overbought'] = max(50, int(round(clamped_params['RSI Overbought'])))
-        if 'RSI Oversold' in clamped_params:
-            clamped_params['RSI Oversold'] = max(1, int(round(clamped_params['RSI Oversold'])))
-        if 'Use RSI Filter' in clamped_params:
-             clamped_params['Use RSI Filter'] = int(round(clamped_params['Use RSI Filter']))
-        if 'Use VWAP Filter' in clamped_params:
-             clamped_params['Use VWAP Filter'] = int(round(clamped_params['Use VWAP Filter']))
-        
+        clamped_params = finalize_ga_solution_params(raw_params, param_dict)
+        clamped_params = merge_solution_params_with_template(clamped_params, param_dict, param_df)
+
         # Calculate Splits and Robustness for Top Solutions
         is_periods_res, oos_periods_res = calculate_split_detail(clamped_params, is_periods, oos_periods, param_dict)
         
@@ -4249,13 +4338,16 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         robust = get_robustness_metrics(sol_is_res, sol_oos_res, is_periods_res, oos_periods_res)
         
         fitness = ind.fitness.values
+        # Statistics must match aggregate run_backtest(IS) so manual replays can reproduce them.
+        # (Previously we fell back to fitness[i], which are *normalized* objectives — not raw Sortino/PnL.)
         solutions_data.append({
             'params': clamped_params,
-            'sortino': actual.get('sortino', fitness[0]),
-            'max_dd': actual.get('max_drawdown', fitness[1]),
-            'profit_factor': actual.get('profit_factor', fitness[2]),
-            'avg_trades_day': actual.get('avg_trades_day', fitness[3] if len(fitness) > 3 else 0.0),
-            'total_profit': actual.get('total_profit', fitness[4] if len(fitness) > 4 else 0.0),
+            'sortino': float(sol_is_res.get('sortino', 0)),
+            'max_dd': float(sol_is_res.get('max_drawdown', 0)),
+            'profit_factor': float(sol_is_res.get('profit_factor', 0)),
+            'avg_trades_day': float(sol_is_res.get('avg_trades_day', 0)),
+            'total_profit': float(sol_is_res.get('total_profit', 0)),
+            'fitness_vector': tuple(float(x) for x in fitness),
             'is_selected': (ind == best),
             'robustness': robust,
             'is_periods': is_periods_res,
@@ -4299,11 +4391,11 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
     stats_rows.append({'Name': '=== SOLUTION STATISTICS ===', 'Value': '', 'Description': ''})
     
     metrics = [
-        ('Sortino Ratio', 'sortino', '{:.4f}'),
-        ('Max Drawdown ($)', 'max_dd', '${:,.2f}'),
-        ('Profit Factor', 'profit_factor', '{:.4f}'),
-        ('Avg Trades/Day', 'avg_trades_day', '{:.3f}'),
-        ('Total Profit (norm)', 'total_profit', '{:.4f}'),
+        ('Sortino Ratio (IS aggregate)', 'sortino', '{:.4f}'),
+        ('Max Drawdown ($) (IS aggregate)', 'max_dd', '${:,.2f}'),
+        ('Profit Factor (IS aggregate)', 'profit_factor', '{:.4f}'),
+        ('Avg Trades/Day (IS aggregate)', 'avg_trades_day', '{:.3f}'),
+        ('Total Profit ($) (IS aggregate)', 'total_profit', '${:,.2f}'),
     ]
     
     for metric_name, metric_key, format_str in metrics:
@@ -4321,6 +4413,26 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         if solutions_data[sol_idx]['is_selected']: col_name += "_SELECTED"
         rank_row[col_name] = f"#{sol_idx}" + (" (SELECTED)" if solutions_data[sol_idx]['is_selected'] else "")
     stats_rows.append(rank_row)
+
+    # Normalized NSGA-II objectives (for tuning / archive; not comparable to Sortino Ratio row above)
+    stats_rows.append({'Name': '--- GA FITNESS VECTOR (normalized, per DEAP) ---', 'Type': ''})
+    fitness_labels = [
+        'Fitness[0] norm Sortino obj',
+        'Fitness[1] norm DD obj',
+        'Fitness[2] norm PF obj',
+        'Fitness[3] norm Trades obj',
+        'Fitness[4] norm PnL obj',
+        'Fitness[5] norm PPT obj',
+    ]
+    for fi, flabel in enumerate(fitness_labels):
+        row = {'Name': flabel, 'Type': 'statistic', 'Description': 'Normalized objective after penalties; see Sortino row for raw IS aggregate'}
+        for sol_idx, sol_data in enumerate(solutions_data):
+            col_name = f"Solution_{sol_idx}"
+            if sol_data['is_selected']:
+                col_name += "_SELECTED"
+            fv = sol_data.get('fitness_vector', ())
+            row[col_name] = f"{fv[fi]:.6f}" if fi < len(fv) else ""
+        stats_rows.append(row)
     
     # Robustness Evaluation
     stats_rows.append({'Name': '--- ROBUSTNESS EVALUATION ---', 'Type': ''})
