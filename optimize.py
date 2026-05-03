@@ -49,6 +49,8 @@ CRITICAL ARGUMENTS:
   --fresh / -f            Force a fresh start (Ignores existing checkpoints).
                           WARNING: Will overwrite previous run logs if filenames collide.
 
+  --seed N                Optional int. Fixes Python and NumPy RNG for reproducible GA runs (A/B).
+
 COMMON QUESTIONS:
   Q: How do I resume a run?
   A: Just run `python BB_Genetic_v4.py`. It automatically detects the latest checkpoint 
@@ -144,6 +146,12 @@ parser.add_argument('--visualize-json', type=str, help='Generate dashboard for a
 parser.add_argument('--fresh', '-f', action='store_true', help='Force start fresh (ignore checkpoints)')
 parser.add_argument('--pop', type=int, help='Override Population Size', default=None)
 parser.add_argument('--gen', type=int, help='Override Number of Generations', default=None)
+parser.add_argument(
+    '--seed',
+    type=int,
+    default=None,
+    help='Random seed for deterministic GA runs (A/B reproducibility)',
+)
 args, _unknown_cli = parser.parse_known_args()
 
 import glob
@@ -2933,6 +2941,11 @@ def main():
     print("# Multi-core parallelization | Multi-objective (NSGA-II) | Sortino Ratio")
     print("# Checkpoint/Resume enabled - saves after each generation")
     print("# Use --fresh or -f flag to force a fresh start (ignores checkpoint)")
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"Random seed fixed to {args.seed}")
     
     # Load Parameters (only in main process, not in workers)
     param_dict, param_df = load_params(PARAM_CSV, return_dataframe=True)
@@ -3124,7 +3137,8 @@ def main():
         'DATA_SPLITS': DATA_SPLITS,
         'DATA_SIZE': DATA_SIZE,
         'PARAM_CSV': PARAM_CSV,
-        'NUM_WORKERS': NUM_WORKERS
+        'NUM_WORKERS': NUM_WORKERS,
+        'SEED': args.seed,
     }
     
     in_sample, oos, is_mask, is_periods, oos_periods = build_ga_training_bundle(
