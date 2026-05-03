@@ -37,6 +37,12 @@ class TrendStrategy(Strategy):
         self.atr_length_ts = int(get_param_value(self.params_dict, 'ATR Length for Trailing Stop', 14))
         self.atr_mult_ts = float(get_param_value(self.params_dict, 'ATR Multiplier for Trailing Stop', 3.0))
         self.trailing_delay = int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5))
+        self.trailing_delay_minutes = get_param_value(self.params_dict, 'Trailing Delay (minutes)', None)
+        self.trailing_delay = self._resolve_trailing_delay_bars(
+            self.trailing_delay_minutes,
+            self.trailing_delay,
+            self.timeframe,
+        )
         
         # Take Profit
         self.tp_mult_atr = float(get_param_value(self.params_dict, 'Take Profit ATR Multiplier', 0.0)) # 0 = disabled
@@ -140,11 +146,88 @@ class TrendStrategy(Strategy):
             'Exit Criteria': {
                 'Initial SL (%)': self.initial_sl_pct,
                 'Trailing Stop': self.enable_trailing,
+                'Trail Delay (bars)': self.trailing_delay,
+                'Trail Delay (minutes)': self.trailing_delay * self.timeframe,
                 'Trail ATR Mult': self.atr_mult_ts,
                 'TP ATR Mult': self.tp_mult_atr
             }
         }
-        
+
+    @staticmethod
+    def _resolve_trailing_delay_bars(delay_minutes, delay_bars, timeframe_minutes):
+        """
+        Resolve trailing delay in bars from context-aware minutes if present.
+        Fallback to explicit bars for backward compatibility.
+        """
+        tf = max(1, int(round(float(timeframe_minutes))))
+        if delay_minutes is not None:
+            try:
+                mins = max(0.0, float(delay_minutes))
+                return max(0, int(round(mins / tf)))
+            except Exception:
+                pass
+        try:
+            return max(0, int(round(float(delay_bars))))
+        except Exception:
+            return 0
+
+    def _restore_trailing_from_template(self):
+        """Reset trailing mechanics from strategy template when trailing is disabled."""
+        self.atr_length_ts = int(get_param_value(self.params_dict, 'ATR Length for Trailing Stop', 14))
+        self.atr_mult_ts = float(get_param_value(self.params_dict, 'ATR Multiplier for Trailing Stop', 3.0))
+        self.trailing_delay_minutes = get_param_value(self.params_dict, 'Trailing Delay (minutes)', None)
+        self.trailing_delay = int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5))
+        self.trailing_delay = self._resolve_trailing_delay_bars(
+            self.trailing_delay_minutes,
+            self.trailing_delay,
+            self.timeframe,
+        )
+
+    def _restore_rsi_from_template(self):
+        """Reset RSI thresholds from template when RSI filter is disabled (GA dead dims)."""
+        self.rsi_period = int(get_param_value(self.params_dict, 'RSI Period', 14))
+        self.rsi_max_buy = float(get_param_value(self.params_dict, 'RSI Max Buy Threshold', 70.0))
+        self.rsi_min_sell = float(get_param_value(self.params_dict, 'RSI Min Sell Threshold', 30.0))
+
+    def _restore_adx_from_template(self):
+        """Reset ADX tunables from template when ADX filter is disabled."""
+        self.adx_period = int(get_param_value(self.params_dict, 'ADX Period', 14))
+        self.min_adx = float(get_param_value(self.params_dict, 'Min ADX Threshold', 20.0))
+
+    def _restore_sma_from_template(self):
+        """Reset SMA tunables from template when SMA regime filter is disabled."""
+        self.sma_period = int(get_param_value(self.params_dict, 'SMA Period', 200))
+
+    def _restore_volume_from_template(self):
+        """Reset volume filter tunables from template when volume filter is disabled."""
+        self.vol_ma_length = int(get_param_value(self.params_dict, 'Volume MA Length', 20))
+        self.min_vol_mult = float(get_param_value(self.params_dict, 'Min Volume Multiplier', 1.5))
+
+    def _restore_rth_from_template(self):
+        """Reset RTH session times / exit buffer from template when RTH filter is off (enable stays off)."""
+        self.rth_start_str = get_param_value(self.params_dict, 'RTH Start (HH:MM)', '09:30')
+        self.rth_end_str = get_param_value(self.params_dict, 'RTH End (HH:MM)', '16:00')
+        self.rth_exit_buffer_minutes = int(get_param_value(self.params_dict, 'RTH Exit Buffer (minutes)', 0))
+        self.rth_start = self._parse_time(self.rth_start_str)
+        self.rth_end = self._parse_time(self.rth_end_str)
+
+    def _restore_maintenance_from_template(self):
+        """Reset maintenance schedule / buffer from template when maintenance filter is off (enable stays off)."""
+        self.daily_maintenance_start_str = get_param_value(
+            self.params_dict, 'Daily Maintenance Start (HH:MM)', '16:00')
+        self.daily_maintenance_end_str = get_param_value(
+            self.params_dict, 'Daily Maintenance End (HH:MM)', '16:30')
+        self.weekend_maintenance_start_day = int(get_param_value(
+            self.params_dict, 'Weekend Maintenance Start Day', 4))
+        self.weekend_maintenance_start_time_str = get_param_value(
+            self.params_dict, 'Weekend Maintenance Start Time (HH:MM)', '16:00')
+        self.weekend_maintenance_end_day = int(get_param_value(
+            self.params_dict, 'Weekend Maintenance End Day', 6))
+        self.weekend_maintenance_end_time_str = get_param_value(
+            self.params_dict, 'Weekend Maintenance End Time (HH:MM)', '17:00')
+        self.maintenance_buffer_minutes = int(get_param_value(
+            self.params_dict, 'Maintenance Buffer Minutes', 5))
+
     def update_optimizable_params(self, params):
         """Update params from GA individual."""
         if 'Buy Lookback' in params: self.lookback_buy = int(params['Buy Lookback'])
@@ -157,8 +240,11 @@ class TrendStrategy(Strategy):
         if 'Min ATR (Points)' in params: self.min_atr_points = float(params['Min ATR (Points)'])
         # ATR Filter Period
         if 'ATR Filter Period' in params: self.atr_filter_period = int(params['ATR Filter Period'])
-        # Trailing Delay
-        if 'Trailing Delay (bars)' in params: self.trailing_delay = int(params['Trailing Delay (bars)'])
+        # Trailing Delay (bars/minutes context)
+        if 'Trailing Delay (bars)' in params:
+            self.trailing_delay = int(params['Trailing Delay (bars)'])
+        if 'Trailing Delay (minutes)' in params:
+            self.trailing_delay_minutes = float(params['Trailing Delay (minutes)'])
         # Take Profit
         if 'Take Profit ATR Multiplier' in params: self.tp_mult_atr = float(params['Take Profit ATR Multiplier'])
         # ATR Length for TS
@@ -179,6 +265,36 @@ class TrendStrategy(Strategy):
         if 'Enable RSI Filter' in params: self.enable_rsi_filter = bool(int(params['Enable RSI Filter']))
         if 'Enable VWAP Filter' in params: self.enable_vwap_filter = bool(int(params['Enable VWAP Filter']))
 
+        if 'Enable RTH Filter' in params:
+            rv = params['Enable RTH Filter']
+            self.enable_rth_filter = rv if isinstance(rv, bool) else bool(int(rv))
+        if 'RTH Exit Buffer (minutes)' in params:
+            self.rth_exit_buffer_minutes = int(params['RTH Exit Buffer (minutes)'])
+        if 'RTH Start (HH:MM)' in params:
+            self.rth_start_str = str(params['RTH Start (HH:MM)'])
+            self.rth_start = self._parse_time(self.rth_start_str)
+        if 'RTH End (HH:MM)' in params:
+            self.rth_end_str = str(params['RTH End (HH:MM)'])
+            self.rth_end = self._parse_time(self.rth_end_str)
+
+        if 'Enable Maintenance Filter' in params:
+            mv = params['Enable Maintenance Filter']
+            self.enable_maintenance_filter = mv if isinstance(mv, bool) else bool(int(round(float(mv))))
+        if 'Maintenance Buffer Minutes' in params:
+            self.maintenance_buffer_minutes = int(params['Maintenance Buffer Minutes'])
+        if 'Daily Maintenance Start (HH:MM)' in params:
+            self.daily_maintenance_start_str = str(params['Daily Maintenance Start (HH:MM)'])
+        if 'Daily Maintenance End (HH:MM)' in params:
+            self.daily_maintenance_end_str = str(params['Daily Maintenance End (HH:MM)'])
+        if 'Weekend Maintenance Start Day' in params:
+            self.weekend_maintenance_start_day = int(params['Weekend Maintenance Start Day'])
+        if 'Weekend Maintenance Start Time (HH:MM)' in params:
+            self.weekend_maintenance_start_time_str = str(params['Weekend Maintenance Start Time (HH:MM)'])
+        if 'Weekend Maintenance End Day' in params:
+            self.weekend_maintenance_end_day = int(params['Weekend Maintenance End Day'])
+        if 'Weekend Maintenance End Time (HH:MM)' in params:
+            self.weekend_maintenance_end_time_str = str(params['Weekend Maintenance End Time (HH:MM)'])
+
         # Filter Parameters
         if 'RSI Period' in params: self.rsi_period = int(params['RSI Period'])
         if 'RSI Max Buy Threshold' in params: self.rsi_max_buy = float(params['RSI Max Buy Threshold'])
@@ -189,6 +305,30 @@ class TrendStrategy(Strategy):
             self.timeframe = int(round(params['Timeframe (minutes)']))
         elif 'timeframe' in params:
             self.timeframe = int(round(params['timeframe']))
+
+        if self.enable_trailing:
+            self.trailing_delay = self._resolve_trailing_delay_bars(
+                getattr(self, 'trailing_delay_minutes', None),
+                self.trailing_delay,
+                self.timeframe,
+            )
+        else:
+            self._restore_trailing_from_template()
+
+        if not self.enable_rsi_filter:
+            self._restore_rsi_from_template()
+
+        if not self.enable_adx_filter:
+            self._restore_adx_from_template()
+        if not self.enable_sma_filter:
+            self._restore_sma_from_template()
+        if not getattr(self, 'enable_vol_filter', False):
+            self._restore_volume_from_template()
+
+        if not self.enable_rth_filter:
+            self._restore_rth_from_template()
+        if not self.enable_maintenance_filter:
+            self._restore_maintenance_from_template()
 
     def calculate_indicators(self, df):
         """Calculate Donchian Channels, ATR, ADX."""
@@ -513,25 +653,40 @@ class TrendStrategy(Strategy):
         return False, None, None
 
     def update_trailing_stop(self, position, row, df):
-        """Update trailing stop based on ATR."""
-        if not self.enable_trailing: return
-        
+        """
+        Update trailing stop based on ATR (Chandelier-style).
+
+        Returns True if `position['stop']` changed (so live execution can modify the broker order).
+
+        First bar after entry only advances `bars_held`; no ratchet. That avoids using the
+        same bar's full high/low right after an open fill (OHLC ordering ambiguity vs GA/backtest).
+        """
+        if not self.enable_trailing:
+            return False
+
         high = row.high if not isinstance(row, pd.Series) else row['high']
         low = row.low if not isinstance(row, pd.Series) else row['low']
         atr = row.atr if not isinstance(row, pd.Series) else row['atr']
-        
+
+        if position['bars_held'] == 0:
+            position['bars_held'] = 1
+            return False
+
         position['bars_held'] += 1
-        if position['bars_held'] < self.trailing_delay: return
-        
+        if position['bars_held'] < self.trailing_delay:
+            return False
+
+        stop_before = position['stop']
         if position['direction'] == 1:
-            # Ratchet logic
-            new_stop = high - (atr * self.atr_mult_ts) # Standard Chandelier Exit uses High
+            new_stop = high - (atr * self.atr_mult_ts)
             if new_stop > position['stop']:
                 position['stop'] = new_stop
         else:
-             new_stop = low + (atr * self.atr_mult_ts)
-             if new_stop < position['stop']:
-                 position['stop'] = new_stop
+            new_stop = low + (atr * self.atr_mult_ts)
+            if new_stop < position['stop']:
+                position['stop'] = new_stop
+
+        return bool(position['stop'] != stop_before)
 
     def get_indicator_status(self, row: pd.Series) -> dict:
         """

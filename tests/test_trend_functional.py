@@ -411,6 +411,30 @@ class TestTrailingStop:
             "Stop should have trailed upward after delay period expired"
         )
 
+    def test_trailing_returns_false_when_disabled_or_unchanged(self):
+        """Live execution uses the return value to decide whether to modify IB stops."""
+        strategy = make_strategy(**{
+            'Enable Trailing Stop': 1,
+            'ATR Length for Trailing Stop': 3,
+            'ATR Multiplier for Trailing Stop': 1.0,
+            'Trailing Delay (bars)': 0,
+            'Initial Stop Loss (%)': 5.0,
+            'Buy Lookback': 3, 'Sell Lookback': 3,
+        })
+        df = make_trending_scenario(
+            entry_price=100, up_bars=5, dip_bars=0, resume_bars=0,
+            up_step=1.0, volatility=0.3, warmup_bars=30
+        )
+        df = strategy.calculate_indicators(df)
+        row0 = pd.Series(df.iloc[0], name=df.index[0])
+        position = strategy.setup_position(100.0, 1, row0, df)
+
+        assert strategy.update_trailing_stop(position, pd.Series(df.iloc[1], name=df.index[1]), df) is False
+        moved = strategy.update_trailing_stop(
+            position, pd.Series(df.iloc[2], name=df.index[2]), df
+        )
+        assert moved is True
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # §4C  Take Profit Precision

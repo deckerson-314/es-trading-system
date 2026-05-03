@@ -441,17 +441,33 @@ class BollingerStrategy(Strategy):
             return ""
 
     def update_trailing_stop(self, position, row, df):
-        """Update trailing stop based on ATR."""
+        """
+        Update trailing stop based on ATR. Returns True if `position['stop']` changed.
+
+        See TrendStrategy.update_trailing_stop for entry-bar handling (no same-bar ratchet).
+        """
+        if not self.enable_trailing:
+            return False
+
         high = row['high'] if isinstance(row, pd.Series) else row.high
         low = row['low'] if isinstance(row, pd.Series) else row.low
         atr = row['atr_ts'] if isinstance(row, pd.Series) else row.atr_ts
-        
-        position['bars_held'] = position.get('bars_held', 0) + 1
-        
-        if self.enable_trailing and position['bars_held'] >= self.trailing_delay:
-            if position['direction'] == 1:
-                new_stop = low - atr * self.atr_mult_ts_opt
-                position['stop'] = max(position['stop'], new_stop)
-            else:
-                new_stop = high + atr * self.atr_mult_ts_opt
-                position['stop'] = min(position['stop'], new_stop)
+
+        bh = position.get('bars_held', 0)
+        if bh == 0:
+            position['bars_held'] = 1
+            return False
+
+        position['bars_held'] = bh + 1
+        if position['bars_held'] < self.trailing_delay:
+            return False
+
+        stop_before = position['stop']
+        if position['direction'] == 1:
+            new_stop = low - atr * self.atr_mult_ts_opt
+            position['stop'] = max(position['stop'], new_stop)
+        else:
+            new_stop = high + atr * self.atr_mult_ts_opt
+            position['stop'] = min(position['stop'], new_stop)
+
+        return bool(position['stop'] != stop_before)
