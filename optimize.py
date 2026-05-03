@@ -49,6 +49,8 @@ CRITICAL ARGUMENTS:
   --fresh / -f            Force a fresh start (Ignores existing checkpoints).
                           WARNING: Will overwrite previous run logs if filenames collide.
 
+  --seed N                Optional int. Fixes Python and NumPy RNG for reproducible GA runs (A/B).
+
 COMMON QUESTIONS:
   Q: How do I resume a run?
   A: Just run `python BB_Genetic_v4.py`. It automatically detects the latest checkpoint 
