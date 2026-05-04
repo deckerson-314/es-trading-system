@@ -61,11 +61,18 @@ def _current_branch(repo: Path) -> str:
     return p.stdout.strip()
 
 
+def _path_slash(p: Path) -> str:
+    """Normalize for comparison with `git worktree list` (forward slashes)."""
+    return str(p.resolve()).replace("\\", "/")
+
+
 def _ensure_worktree(repo: Path, worktree: Path, branch: str) -> None:
     if worktree.is_dir() and (worktree / ".git").is_file():
         # Existing worktree: confirm it lists this path and branch matches
         wt = _git(repo, "worktree", "list", "--porcelain", check=True).stdout
-        if str(worktree.resolve()) not in wt.replace("\\", "/"):
+        wt_norm = wt.replace("\\", "/")
+        needle = _path_slash(worktree)
+        if needle not in wt_norm and (needle.rstrip("/") not in wt_norm):
             raise SystemExit(
                 f"Directory {worktree} exists but is not registered as a worktree for {repo}. "
                 "Remove it or pick a different --worktree path."
@@ -377,7 +384,22 @@ def main() -> int:
     per_path = outdir / "per_seed_metrics.csv"
     per.to_csv(per_path, index=False)
 
-    num_cols = [c for c in per.columns if c.startswith("metric_")]
+    # Only *_num / float metrics — formatted $ columns break groupby mean.
+    num_cols = [
+        "metric_sortino_is",
+        "metric_pf_is",
+        "metric_pnl_is_num",
+        "metric_dd_is_num",
+        "metric_trades_day_is",
+        "metric_ppt_is_num",
+        "metric_sortino_oos",
+        "metric_pf_oos",
+        "metric_pnl_oos_num",
+        "metric_dd_oos_num",
+        "metric_trades_day_oos",
+        "metric_ppt_oos_num",
+    ]
+    num_cols = [c for c in num_cols if c in per.columns]
     agg = per.groupby("arm")[num_cols].agg(["mean", "median", "std"])
     agg_path = outdir / "aggregate_by_arm.csv"
     agg.to_csv(agg_path)
