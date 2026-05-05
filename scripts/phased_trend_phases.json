@@ -1,0 +1,35 @@
+{
+  "phase_a": [
+    "Timeframe (minutes)",
+    "Buy Lookback (minutes)",
+    "Sell Lookback (minutes)",
+    "Buy Lookback",
+    "Sell Lookback",
+    "Enable ADX Filter",
+    "ADX Period",
+    "Min ADX Threshold",
+    "ATR Filter Period",
+    "Min ATR (Points)",
+    "Enable SMA Filter",
+    "SMA Period",
+    "Enable Volume Filter",
+    "Volume MA Length",
+    "Min Volume Multiplier",
+    "Enable RSI Filter",
+    "RSI Period",
+    "RSI Max Buy Threshold",
+    "RSI Min Sell Threshold",
+    "Enable VWAP Filter",
+    "Enable RTH Filter",
+    "RTH Exit Buffer (minutes)"
+  ],
+  "phase_b": [
+    "Initial Stop Loss (%)",
+    "Enable Trailing Stop",
+    "ATR Length for Trailing Stop",
+    "ATR Multiplier for Trailing Stop",
+    "Trailing Delay (bars)",
+    "Trailing Delay (minutes)",
+    "Take Profit ATR Multiplier"
+  ]
+}

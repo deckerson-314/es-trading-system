@@ -1,0 +1,82 @@
+﻿Name,Value,Min,Max,Type,Description
+=== Strategy Config ===,,,,,
+Enable Long Trades,True,,,bool,Allow long entries
+Enable Short Trades,True,,,bool,Allow short entries
+Max Open Trades,1,1,1,int,Max concurrent trades (1 means FIFO/Replace)
+Transaction Cost (Per Trade),15,15,15,float,Estimated friction per trade (Slippage + Commissions) to realistic PnL. E.g. $4 comm + $12.50 slip = 16.5
+Timeframe (minutes),11,1,15,int,Fixed timeframe
+=== Entry Logic ===,,,,,
+Buy Lookback,135,100,500,int,Donchian/Dual Thrust Lookback for Longs
+Sell Lookback,283,100,500,int,Donchian/Dual Thrust Lookback for Shorts
+Enable ADX Filter,1,0,1,int,Filter trending markets only
+ADX Period,15,8,25,int,ADX calculation period
+Min ADX Threshold,22.8257,5,35,float,Minimum ADX to trade
+ATR Filter Period,11,1,12,int,For volatility normalization
+Min ATR (Points),1.5018,0,5,float,Minimum volatility required to trade
+Enable SMA Filter,1,0,1,int,Trend Regime Filter (Major Trend)
+SMA Period,50,50,350,int,Lookback for Regime SMA
+Enable Volume Filter,0,0,1,int,Volume Breakout Validation
+Volume MA Length,14,8,50,int,Lookback for Avg Volume
+Min Volume Multiplier,1.4425,1,4,float,Breakout Vol > Avg Vol * Mult
+Enable RSI Filter,1,1,1,int,Filter entries using RSI (0=False 1=True)
+RSI Period,29,5,30,int,RSI calculation period
+RSI Max Buy Threshold,89.3463,50,95,float,RSI must be below this to buy (exhaustion)
+RSI Min Sell Threshold,26.1468,15,50,float,RSI must be above this to sell
+Enable VWAP Filter,0,0,1,int,Filter entries relative to VWAP (0=False 1=True)
+RTH Start (HH:MM),09:30,09:30,09:30,str,Regular trading hours start (Eastern Time)
+RTH End (HH:MM),16:00,16:00,16:00,str,Regular trading hours end (Eastern Time)
+Enable RTH Filter,1,0,1,int,"Restrict entries to RTH only (0=false, 1=true) - OPTIMIZABLE"
+RTH Exit Buffer (minutes),41,0,60,int,Minutes before RTH end to start closing positions (0 = no auto-close)
+Enable Maintenance Filter,true,false,true,bool,Exit positions before maintenance periods
+Daily Maintenance Start (HH:MM),17:00,17:00,17:00,str,Daily maintenance period start in Eastern Time (ES: 4:00 PM CT = 5:00 PM ET)
+Daily Maintenance End (HH:MM),17:30,17:30,17:30,str,Daily maintenance period end in Eastern Time (ES: 4:30 PM CT = 5:30 PM ET)
+Weekend Maintenance Start Day,4,4,4,int,"Weekend maintenance start day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 4 (Friday)"
+Weekend Maintenance Start Time (HH:MM),17:00,17:00,17:00,str,Weekend maintenance start time in Eastern Time (ES: Fri 4:00 PM CT = 5:00 PM ET)
+Weekend Maintenance End Day,6,6,6,int,"Weekend maintenance end day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 6 (Sunday)"
+Weekend Maintenance End Time (HH:MM),18:00,18:00,18:00,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET)
+Maintenance Buffer Minutes,23,1,60,int,Minutes before/after maintenance to exit/block trading
+Err:510,,,,,
+Initial Stop Loss (%),0.2265,0.05,5,float,Fixed stop loss
+Enable Trailing Stop,0,0,1,int,Use ATR trailing stop
+ATR Length for Trailing Stop,26,3,30,int,ATR period for trailing
+ATR Multiplier for Trailing Stop,1.5956,1.5,8,float,Trailing distance
+Trailing Delay (bars),7,0,50,int,Wait before trailing starts
+Take Profit ATR Multiplier,3,0,3,float,Optional Take Profit (0=None)
+Err:510,,,,,
+POP_SIZE,500,50,250,int,Population size
+NUM_GEN,300,50,150,int,Number of generations
+CX_PB,0.7,0.5,0.9,float,Crossover probability
+MUT_PB,0.4,0.2,0.5,float,Mutation probability
+MUT_MU,0,-1,1,float,Mutation mean
+MUT_SIGMA,0.25,0.1,0.4,float,Mutation std dev
+TARGET_TRADES_DAY,2,1,5,int,Ideal trades/day (Trend is slower)
+TRADES_PENALTY_WEIGHT,0.3,0.1,0.8,float,Penalty for excess trades
+DD_WEIGHT,0.5,0.2,0.8,float,Drawdown penalty weight
+DATA_SPLITS,0.65,0.6,0.7,float,In-sample fraction per period
+DATA_SIZE,0,0,10000000,int,Rows to subsample (0 = full dataset)
+,,,,,
+USE_INTERLEAVED_SPLIT,true,false,true,bool,Use interleaved IS/OOS periods instead of single split
+NUM_SPLIT_PERIODS,11,3,15,int,Number of alternating periods (IS-OOS-IS-OOS-IS)
+MIN_TRADES_DAY,1,0.5,2,float,MUST have at least 1.0 trades/day
+MIN_PROFIT_PER_TRADE,25,,,float,Hard Limit: Minimum accepted Profit Per Trade margin strictly enforced under slippage penalty
+MIN_TRADES_PEN_WEIGHT,-500,-200,-50,float,Scalar penalty â€” zero trades = -50
+NORM_SORTINO_MAX,10,5,20,float,Normalization range for Sortino Ratio
+NORM_DD_MAX,50000,50000,200000,float,Normalization range for Max Drawdown in dollars
+NORM_PF_MAX,2,3,10,float,Normalization range for Profit Factor
+NORM_TRADES_MAX,3,1,5,float,Normalization range for Avg Trades/Day
+NORM_PNL_MAX,200000,100000,1000000,float,Normalization range for Total Profit in dollars
+NORM_PROFIT_TRADE_MAX,200,100,500,float,Normalization range for Avg Profit Per Trade
+MIN_WIN_RATE,0.35,0.3,0.5,float,Minimum win rate threshold (trend following is often lower WR)
+SORTINO_CAP,10,5,20,float,Maximum Sortino value before capping
+GA_START_DATE,2020-01-02,,,str,Start date for GA backtest
+GA_END_DATE,2025-10-10,,,str,End date for GA backtest
+WEIGHT_SORTINO,1,,,float,Fitness weight: Sortino Ratio
+WEIGHT_DRAWDOWN,-1,,,float,Fitness weight: Max Drawdown
+WEIGHT_PF,1,,,float,Fitness weight: Profit Factor
+WEIGHT_TRADES,5,,,float,Fitness weight: Avg Trades/Day
+WEIGHT_PNL,2,,,float,Fitness weight: Total Profit
+WEIGHT_PPT,2,,,float,Fitness weight: Avg Profit/Trade
+MIN_TRADE_DURATION,2,,,float,Hard Limit: Min avg minutes per trade
+MAX_WIN_RATE_CAP,0.95,,,float,Hard Limit: Max win rate before penalty
+LIMIT_MAX_LOSS,50000,,,float,Hard Limit: Severe loss penalty threshold
+LIMIT_MIN_SORTINO,1,,,float,Hard Limit: Severe Sortino penalty threshold
