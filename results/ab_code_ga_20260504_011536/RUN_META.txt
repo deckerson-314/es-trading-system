@@ -1,0 +1,10 @@
+ab_code_ga_trend (baseline branch code vs current branch code)
+utc_stamp: 20260504_011536
+repo: C:\Trading
+current_branch (branch arm): ga-parameter-context
+baseline_branch (baseline arm): master
+worktree: C:\Trading_wt_master
+shared_params: C:\Trading\strategies\trend\parameters\trend_strategy_params.csv
+data_csv: C:\Trading\Bollinger\data\ES_full_1min_continuous_ratio_adjusted.csv
+seeds: [101, 202, 303]
+pop: 82  gen: 82  cores: 12
