@@ -7,12 +7,103 @@ import traceback
 import pandas as pd
 import numpy as np
 import os
-from datetime import datetime
+import copy
+from datetime import datetime, timedelta, date
 from core.charting import create_trade_chart
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 import pytz
 
 from core.account import get_account_summary, format_duration, add_to_live_tracker
+
+
+def _snapshot_strategy_params(strategy) -> dict:
+    """Capture a stable, serializable parameter snapshot at entry time."""
+    snap = {}
+    try:
+        if hasattr(strategy, "params_dict") and isinstance(strategy.params_dict, dict):
+            snap = copy.deepcopy(strategy.params_dict)
+        else:
+            attrs = [
+                "timeframe", "lookback_buy", "lookback_sell", "initial_sl_pct", "tp_mult_atr",
+                "enable_trailing", "atr_mult_ts", "atr_length_ts", "trailing_delay",
+                "enable_adx_filter", "adx_period", "min_adx", "min_atr_points", "atr_filter_period",
+                "enable_rsi_filter", "rsi_period", "rsi_max_buy", "rsi_min_sell",
+                "enable_sma_filter", "sma_period", "enable_vol_filter", "vol_ma_length", "min_vol_mult",
+                "enable_vwap_filter", "enable_rth_filter", "rth_start_str", "rth_end_str",
+                "rth_exit_buffer_minutes", "enable_maintenance_filter",
+                "daily_maintenance_start_str", "daily_maintenance_end_str",
+                "weekend_maintenance_start_day", "weekend_maintenance_start_time_str",
+                "weekend_maintenance_end_day", "weekend_maintenance_end_time_str",
+                "maintenance_buffer_minutes",
+            ]
+            for name in attrs:
+                if hasattr(strategy, name):
+                    snap[name] = getattr(strategy, name)
+    except Exception:
+        return {}
+    return snap
+
+
+def _row_bool(row, key: str) -> bool:
+    if isinstance(row, pd.Series):
+        return bool(row.get(key, False))
+    if isinstance(row, dict):
+        return bool(row.get(key, False))
+    return bool(getattr(row, key, False))
+
+
+def _in_rth_flatten_window_wall_clock(strategy) -> bool:
+    """True during [RTH_end - buffer, RTH_end): block new entries (matches flatten policy)."""
+    if not getattr(strategy, 'enable_rth_filter', False):
+        return False
+    buf = int(getattr(strategy, 'rth_exit_buffer_minutes', 0) or 0)
+    if buf <= 0:
+        return False
+    rth_end = getattr(strategy, 'rth_end', None)
+    if rth_end is None:
+        return False
+    et = pytz.timezone('US/Eastern')
+    now_t = datetime.now(et).time()
+    ref = datetime.combine(date.today(), rth_end)
+    start_buf = (ref - timedelta(minutes=buf)).time()
+    return start_buf <= now_t < rth_end
+
+
+def _align_ts_naive_et(ts):
+    """Normalize bar/entry timestamps to naive US/Eastern for safe comparison."""
+    if ts is None:
+        return None
+    t = pd.Timestamp(ts)
+    if getattr(t, 'tzinfo', None) is not None:
+        t = t.tz_convert('America/New_York').tz_localize(None)
+    return t
+
+
+def _find_entry_trade(ib, contract, order_id: int, perm_id: int):
+    """Locate entry trade by orderId first, then permId."""
+    for t in ib.trades():
+        if t.contract.conId != contract.conId:
+            continue
+        if order_id and getattr(t.order, 'orderId', 0) == order_id:
+            return t
+        if perm_id and getattr(t.order, 'permId', 0) == perm_id:
+            return t
+    return None
+
+
+def _ohlcv_resample_for_timeframe(df: pd.DataFrame, timeframe_mins: int) -> pd.DataFrame:
+    """Resample 1-minute OHLCV to strategy timeframe (same rules as core.monitoring.resample_data)."""
+    base_cols = ['open', 'high', 'low', 'close', 'volume']
+    for c in base_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing column {c} for resample")
+    ohlcv = df[base_cols].copy()
+    tf = max(1, int(timeframe_mins or 1))
+    if tf <= 1:
+        return ohlcv
+    logic = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    resampled = ohlcv.resample(f'{tf}min', closed='right', label='right').agg(logic)
+    return resampled.dropna()
 
 
 def check_entries(strategy, ib, contract, data, positions, params_dict, 
@@ -39,6 +130,13 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
         logging.info(f"Entry blocked: Max trades ({len(positions)}/{max_trades}) already open")
         return
 
+    if _in_rth_flatten_window_wall_clock(strategy):
+        logging.info("Entry blocked: RTH end flatten window (wall-clock Eastern)")
+        return
+    if _row_bool(latest_row, 'force_exit_rth') or _row_bool(latest_row, 'force_exit'):
+        logging.info("Entry blocked: force-exit window on signal row (RTH/maintenance)")
+        return
+
     # --- Signal Check ---
     # Check filters
     in_maint = latest_row.get('in_maintenance', False)
@@ -53,14 +151,23 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
         enter_short = triggered and direction_str == 'Short'
     elif hasattr(strategy, 'calculate_entry_signals'):
         try:
-            data_ind = strategy.calculate_indicators(data.copy())
-            long_sig, short_sig = strategy.calculate_entry_signals(data_ind)
-            if len(long_sig) >= 2 and len(short_sig) >= 2:
-                enter_long = bool(long_sig.iloc[-2])
-                enter_short = bool(short_sig.iloc[-2])
+            tf = max(1, int(getattr(strategy, 'timeframe', 1) or 1))
+            htf = _ohlcv_resample_for_timeframe(data, tf)
+            data_ind = strategy.calculate_indicators(htf.copy())
+            if hasattr(strategy, 'apply_filters'):
+                data_ind = strategy.apply_filters(data_ind)
+            sigs = strategy.calculate_entry_signals(data_ind)
+            if len(sigs) == 3:
+                long_sig, short_sig, _ = sigs
             else:
+                long_sig, short_sig = sigs
+            if idx not in long_sig.index or idx not in short_sig.index:
+                logging.debug(f"Entry signal index {idx} not in HTF signal range (tf={tf}).")
                 return
+            enter_long = bool(long_sig.loc[idx])
+            enter_short = bool(short_sig.loc[idx])
         except Exception:
+            logging.exception("calculate_entry_signals failed in check_entries")
             return
     else:
         return
@@ -122,7 +229,14 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
             'entry': entry_order, 'stopLoss': None, 'takeProfit': None,
             'direction': direction, 'position_dict': position_dict,
             'entry_time': entry_time, 'entry_price': entry_price,
-            'ocaGroup': oca_group # Store for protection logic
+            'entry_stop_price': stop_price,
+            'entry_tp_price': tp,
+            'params_snapshot': _snapshot_strategy_params(strategy),
+            'ocaGroup': oca_group,  # Store for protection logic
+            'contract': contract,
+            # Guard cleanup logic against race/callback timing for newly submitted bracket.
+            'created_at': datetime.now(pytz.utc),
+            'guard_until': datetime.now(pytz.utc) + timedelta(seconds=20),
         }
         positions.append(bracket)
 
@@ -134,6 +248,8 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
             entry_order_id = trade.order.orderId
         if entry_order_id == 0:
             logging.error("Failed to get entry orderId, cannot link bracket orders accurately")
+        else:
+            bracket['entryOrderId'] = entry_order_id
 
         # Stop loss
         stop_action = 'SELL' if direction == 1 else 'BUY'
@@ -172,32 +288,43 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
 
     ib.sleep(0.5)
 
-    # Entry email with risk/reward
-    account = get_account_summary(ib, data, contract)
-    contract_multiplier = 50
-    risk_dollars = abs(entry_price - stop_price) * contract_multiplier * qty
-    reward_dollars = abs(entry_price - tp) * contract_multiplier * qty if tp else None
-    rr_ratio = reward_dollars / risk_dollars if (tp and risk_dollars > 0) else None
+    # Entry notifications are sent only after confirming the parent actually filled.
+    entry_perm = getattr(entry_order, 'permId', 0)
+    confirmed_trade = _find_entry_trade(ib, contract, entry_order_id if 'entry_order_id' in locals() else 0, entry_perm)
+    is_filled = bool(confirmed_trade and confirmed_trade.filled())
+    if is_filled:
+        account = get_account_summary(ib, data, contract)
+        contract_multiplier = 50
+        risk_dollars = abs(entry_price - stop_price) * contract_multiplier * qty
+        reward_dollars = abs(entry_price - tp) * contract_multiplier * qty if tp else None
+        rr_ratio = reward_dollars / risk_dollars if (tp and risk_dollars > 0) else None
 
-    msg_lines = [
-        f"TRADE OPEN - {'LONG' if direction==1 else 'SHORT'}",
-        f"{'='*50}",
-        f"Entry Price: ${entry_price:.2f}",
-        f"Stop Loss: ${stop_price:.2f} (Risk: ${risk_dollars:,.2f})",
-        f"Take Profit: ${tp:.2f} (Reward: ${reward_dollars:,.2f})" if tp else "Take Profit: None",
-        f"Risk/Reward: {rr_ratio:.2f}:1" if rr_ratio else "Risk/Reward: N/A",
-        f"Position Size: {qty} contract(s)",
-        f"",
-        f"Account: NetLiq=${account.get('NetLiquidation', 'N/A')}, "
-        f"Cash=${account.get('TotalCashValue', 'N/A')}",
-        f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    ]
-    dir_str = 'L' if direction == 1 else 'S'
-    subj = f"[BB] O: {dir_str} {qty}@{entry_price:.2f}"
-    send_email_fn(subj, "\n".join(msg_lines))
-    tp_str = f"${tp:.2f}" if tp else "None"
-    logging.info(f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} @ {entry_price:.2f}, "
-                 f"SL: {stop_price:.2f}, TP: {tp_str}")
+        msg_lines = [
+            f"TRADE OPEN - {'LONG' if direction==1 else 'SHORT'}",
+            f"{'='*50}",
+            f"Entry Price: ${entry_price:.2f}",
+            f"Stop Loss: ${stop_price:.2f} (Risk: ${risk_dollars:,.2f})",
+            f"Take Profit: ${tp:.2f} (Reward: ${reward_dollars:,.2f})" if tp else "Take Profit: None",
+            f"Risk/Reward: {rr_ratio:.2f}:1" if rr_ratio else "Risk/Reward: N/A",
+            f"Position Size: {qty} contract(s)",
+            f"",
+            f"Account: NetLiq=${account.get('NetLiquidation', 'N/A')}, "
+            f"Cash=${account.get('TotalCashValue', 'N/A')}",
+            f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        ]
+        dir_str = 'L' if direction == 1 else 'S'
+        subj = f"[BB] O: {dir_str} {qty}@{entry_price:.2f}"
+        send_email_fn(subj, "\n".join(msg_lines))
+        tp_str = f"${tp:.2f}" if tp else "None"
+        logging.info(f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} @ {entry_price:.2f}, "
+                     f"SL: {stop_price:.2f}, TP: {tp_str}")
+        add_to_live_tracker(live_tracker, 'trade',
+            f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} @ ${entry_price:.2f}, SL: ${stop_price:.2f}")
+    else:
+        logging.warning(
+            "Entry parent not filled yet/rejected; suppressing TRADE OPEN email/log until confirmed fill "
+            f"(orderId={entry_order_id if 'entry_order_id' in locals() else 0}, permId={entry_perm})"
+        )
     
     # Double check order placement success
     ib.sleep(0.5)
@@ -206,8 +333,7 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
         send_email_fn("CRITICAL ERROR: Stop Loss Rejected", 
                       f"Stop Loss for {'LONG' if direction==1 else 'SHORT'} @ {entry_price} was rejected.\n"
                       f"Reason: {ib.trades()[-1].orderStatus.statusReason}")
-    add_to_live_tracker(live_tracker, 'trade',
-        f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} @ ${entry_price:.2f}, SL: ${stop_price:.2f}")
+    
 
 
 def _close_all_positions(reason_label, ib, contract, positions, data, 
@@ -410,10 +536,17 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 
                 eval_row = latest_row
                 if entry_time and bar_time:
+                    bar_ts = _align_ts_naive_et(bar_time)
+                    ent_ts = _align_ts_naive_et(entry_time)
                     # If this is the signal bar (precedes) or the first bar (overlaps):
                     # Clamp High/Low to Close to only check for breaches occurring NOW or forward.
                     # replace(second=0) to align with bar indices
-                    if bar_time <= entry_time.replace(second=0, microsecond=0):
+                    if bar_ts is not None and ent_ts is not None:
+                        ent_cmp = ent_ts.replace(second=0, microsecond=0) if hasattr(ent_ts, 'replace') else ent_ts
+                        cmp_ok = bar_ts <= ent_cmp
+                    else:
+                        cmp_ok = False
+                    if cmp_ok:
                         if isinstance(latest_row, pd.Series):
                             eval_row = latest_row.copy()
                             eval_row['high'] = eval_row['low'] = eval_row['close']
@@ -534,7 +667,12 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                             'entry_time': entry_time, 'exit_time': exit_time,
                             'direction': dir_, 'entry_price': entry_price,
                             'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
-                            'reason': reason
+                            'reason': reason,
+                            'stop_at_close': getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None)) if stop_order else None,
+                            'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
+                            'stop_at_open': bracket.get('entry_stop_price'),
+                            'tp_at_open': bracket.get('entry_tp_price'),
+                            'params_snapshot': bracket.get('params_snapshot') or {},
                         },
                         data, trades_dir
                     )
@@ -555,10 +693,16 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                 'direction': 'LONG' if dir_ == 1 else 'SHORT',
                 'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
                 'pnl': pnl, 'reason': reason, 'duration': duration_str,
-                'report_url': report_url
+                'report_url': report_url,
+                'params_snapshot': bracket.get('params_snapshot') or {},
+                'stop_at_open': bracket.get('entry_stop_price'),
+                'tp_at_open': bracket.get('entry_tp_price'),
+                'stop_at_close': getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None)) if stop_order else None,
+                'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
+                'entry_order_id': bracket.get('entryOrderId'),
             })
-            if len(completed_trades) > 50:
-                del completed_trades[:-50]
+            if len(completed_trades) > 1000:
+                del completed_trades[:-1000]
         else:
             logging.error(f"Force close failed: Position still exists for {bracket_contract.localSymbol}")
 
@@ -836,8 +980,13 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         if reason in ['Unknown', 'Manual / External']:
             # Search recent log entries for rejects or cancels related to this bracket's fills
             for trade in ib.trades():
-                 if trade.contract.conId == contract.conId and (trade.orderStatus.status == 'Rejected' or 'discarded' in trade.orderStatus.statusReason.lower()):
-                     reason = f'Rejected: {trade.orderStatus.statusReason[:30]}'
+                 if trade.contract.conId != contract.conId:
+                     continue
+                 status = getattr(trade.orderStatus, 'status', '') or ''
+                 why = getattr(trade.orderStatus, 'whyHeld', '') or ''
+                 reason_text = why if why else status
+                 if status == 'Rejected' or 'discarded' in str(reason_text).lower():
+                     reason = f"Rejected: {str(reason_text)[:30]}"
                      break
 
         # Final fallback: if position is closed but no fill found, it's external
@@ -915,7 +1064,12 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
                     'entry_time': entry_time, 'exit_time': exit_time,
                     'direction': dir_, 'entry_price': entry_price,
                     'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
-                    'reason': reason
+                        'reason': reason,
+                        'stop_at_close': curr_stop or None,
+                        'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
+                        'stop_at_open': bracket.get('entry_stop_price'),
+                        'tp_at_open': bracket.get('entry_tp_price'),
+                        'params_snapshot': bracket.get('params_snapshot') or {},
                 },
                 data, trades_dir
             )
@@ -946,10 +1100,16 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
         'pnl': pnl, 'r_multiple': r_multiple, 'reason': reason,
         'duration': duration_str,
-        'report_url': report_url
+        'report_url': report_url,
+        'params_snapshot': bracket.get('params_snapshot') or {},
+        'stop_at_open': bracket.get('entry_stop_price'),
+        'tp_at_open': bracket.get('entry_tp_price'),
+        'stop_at_close': curr_stop or None,
+        'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
+        'entry_order_id': bracket.get('entryOrderId'),
     })
-    if len(completed_trades) > 50:
-        del completed_trades[:-50]
+    if len(completed_trades) > 1000:
+        del completed_trades[:-1000]
 
     # Cancel ALL orphaned orders for this contract from ANY bracket (Safety Catch)
     # This prevents the 'stranded order' issue like the one at $7177.75

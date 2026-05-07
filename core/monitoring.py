@@ -4,6 +4,7 @@ Ported from ib_deployment_v4.py lines 1735-2095
 Made strategy-agnostic to support Bollinger, Trend, and future strategies.
 """
 import os
+import json
 import logging
 import pandas as pd
 import numpy as np
@@ -121,6 +122,54 @@ def save_live_data_row(output_dir, timestamp, row, full_df):
             row_series.to_frame().T.to_csv(csv_path, mode='a', header=False)
     except Exception as e:
         logging.error(f"Failed to save live data row: {e}")
+
+
+def append_open_trade_timeline(output_dir, timestamp, row, positions):
+    """Append per-bar diagnostics for each open tracked trade (for forensic reconstruction)."""
+    if not output_dir or not positions:
+        return
+    try:
+        path = os.path.join(output_dir, "open_trade_timeline.jsonl")
+        ts = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
+        close_px = float(row.get('close', 0) or 0)
+        for b in positions:
+            direction = b.get('direction', 0)
+            stop_order = b.get('stopLoss')
+            tp_order = b.get('takeProfit')
+            stop_px = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None)) if stop_order else None
+            tp_px = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+            entry_px = float(b.get('entry_price', 0) or 0)
+            qty = 1
+            if stop_order is not None and hasattr(stop_order, 'totalQuantity'):
+                qty = abs(stop_order.totalQuantity)
+            elif b.get('entry') is not None and hasattr(b.get('entry'), 'totalQuantity'):
+                qty = abs(b.get('entry').totalQuantity)
+            rec = {
+                "ts": ts,
+                "symbol": getattr(b.get('contract', None), 'localSymbol', 'ES'),
+                "direction": "LONG" if direction == 1 else "SHORT" if direction == -1 else "N/A",
+                "entry_time": b.get('entry_time').isoformat() if hasattr(b.get('entry_time'), "isoformat") else None,
+                "entry_price": entry_px,
+                "close": close_px,
+                "stop": float(stop_px) if stop_px is not None else None,
+                "tp": float(tp_px) if tp_px is not None else None,
+                "qty": qty,
+                "unrealized": ((close_px - entry_px) * direction * 50 * qty) if (entry_px and direction) else None,
+                "bar": {
+                    "open": float(row.get('open', 0) or 0),
+                    "high": float(row.get('high', 0) or 0),
+                    "low": float(row.get('low', 0) or 0),
+                    "close": close_px,
+                    "volume": float(row.get('volume', 0) or 0),
+                    "donchian_high": float(row.get('donchian_high')) if row.get('donchian_high') is not None and not pd.isna(row.get('donchian_high')) else None,
+                    "donchian_low": float(row.get('donchian_low')) if row.get('donchian_low') is not None and not pd.isna(row.get('donchian_low')) else None,
+                    "atr": float(row.get('atr')) if row.get('atr') is not None and not pd.isna(row.get('atr')) else None,
+                },
+            }
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        logging.debug(f"Failed to append open trade timeline: {e}")
 
 def save_shadow_audit(output_dir, timestamp, action_log):
     """Save rejection events to daily shadow_audit_YYYYMMDD.json."""
@@ -260,35 +309,55 @@ def log_entry_criteria_status(strategy, positions, resampled_row, data_with_filt
         parts.append(f"MaxTr: {'✅' if max_ok else '❌'}")
         parts.append(f"RTH: {'✅' if in_rth else '❌'}")
         parts.append(f"Maint: {'✅' if not in_maint else '❌'}")
+        if hasattr(strategy, 'enable_long'):
+            parts.append(f"EnL: {'✅' if strategy.enable_long else '❌'}")
+        if hasattr(strategy, 'enable_short'):
+            parts.append(f"EnS: {'✅' if strategy.enable_short else '❌'}")
         
-        # Numerical Filter Details
+        # Numerical Filter Details (Trend.get_indicator_status and similar)
         if num_status:
-            # Target columns for display
+            if 'ATR' in num_status:
+                s = num_status['ATR']
+                parts.append(
+                    f"ATRfl: {'✅' if s['pass'] else '❌'} "
+                    f"({s['value']:.2f}/{s['threshold']:.2f})"
+                )
             if 'ADX' in num_status:
                 s = num_status['ADX']
                 parts.append(f"ADX: {'✅' if s['pass'] else '❌'} ({s['value']:.1f}/{s['threshold']:.1f})")
-            
             if 'Volume' in num_status:
                 s = num_status['Volume']
-                # Compact volume display (k)
-                parts.append(f"Vol: {'✅' if s['pass'] else '❌'} ({s['value']/1000:.1f}k/{s['threshold']/1000:.1f}k)")
-                
+                parts.append(
+                    f"Vol: {'✅' if s['pass'] else '❌'} "
+                    f"({s['value']/1000:.1f}k/{s['threshold']/1000:.1f}k)"
+                )
             if 'RSI' in num_status:
                 s = num_status['RSI']
                 val = s['value']
-                target = s['buy_threshold'] if not enter_short else s['sell_threshold']
                 icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
-                parts.append(f"RSI: {icon} ({val:.1f})")
-
+                parts.append(
+                    f"RSI: {icon} ({val:.1f} / buy≤{s['buy_threshold']:.1f} sell≥{s['sell_threshold']:.1f})"
+                )
+            if 'SMA' in num_status:
+                s = num_status['SMA']
+                icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
+                sm_l = '✅' if s['pass_long'] else '❌'
+                sm_s = '✅' if s['pass_short'] else '❌'
+                parts.append(
+                    f"SMA: {icon} (C:{s['price']:.2f}/SMA:{s['sma']:.2f} L:{sm_l} S:{sm_s})"
+                )
             if 'VWAP' in num_status:
                 s = num_status['VWAP']
                 icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
-                parts.append(f"VWAP: {icon}")
-
+                parts.append(
+                    f"VWAP: {icon} (C:{s['price']:.2f}/VWAP:{s['vwap']:.2f})"
+                )
         else:
-            # Fallback to simple emojis if no numerical status available
             parts.append(f"ATR: {'✅' if atr_filter else '❌'}")
             parts.append(f"Vol: {'✅' if vol_filter else '❌'}")
+        # Row-level volume gate when strategy has no Volume in num_status (e.g. filter off)
+        if num_status and 'Volume' not in num_status:
+            parts.append(f"VolFlt: {'✅' if vol_filter else '❌'}")
 
         # Final Signal Status
         parts.append(f"Long: {'✅' if enter_long else '❌'} ({long_reason})")
@@ -403,6 +472,9 @@ def on_bar_update_handler(bars, hasNewBar, *, strategy, ib, contract, data_ref,
                 # Check exits using HTF bar (for boundary exit signals)
                 check_exits(strategy, ib, contract, data, positions, completed_trades,
                            live_tracker, send_email_fn, completed_idx, completed_row, allow_strategy_exit=True)
+
+                # Forensics: persist per-bar snapshot of every open trade for post-mortems.
+                append_open_trade_timeline(output_dir, completed_idx, completed_row, positions)
 
             # Bar log for dashboard
             bar_log.append({

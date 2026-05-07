@@ -11,6 +11,7 @@ from datetime import time
 from strategies.base import Strategy
 from .parameters import get_param_value
 from strategies.bollinger.filters import apply_rth_filter, apply_maintenance_filter
+from tools.reporting.unified_trade_report import generate_unified_trade_report
 
 class TrendStrategy(Strategy):
     """
@@ -152,6 +153,19 @@ class TrendStrategy(Strategy):
                 'TP ATR Mult': self.tp_mult_atr
             }
         }
+
+    def generate_trade_report(self, trade: dict, df: pd.DataFrame, output_dir: str) -> str:
+        """Unified chart + diagnostics report used by live and backtest."""
+        try:
+            return generate_unified_trade_report(
+                trade,
+                df,
+                output_dir,
+                version=self.params_dict.get("version", "trend-live"),
+                params_snapshot=trade.get("params_snapshot") if isinstance(trade, dict) else None,
+            )
+        except Exception:
+            return ""
 
     @staticmethod
     def _resolve_trailing_delay_bars(delay_minutes, delay_bars, timeframe_minutes):
@@ -626,6 +640,16 @@ class TrendStrategy(Strategy):
         high = row.high if not isinstance(row, pd.Series) else row['high']
         low = row.low if not isinstance(row, pd.Series) else row['low']
         close = row.close if not isinstance(row, pd.Series) else row['close']
+        if isinstance(row, pd.Series):
+            force_exit = bool(row.get('force_exit', False))
+            force_exit_rth = bool(row.get('force_exit_rth', False))
+        else:
+            force_exit = bool(getattr(row, 'force_exit', False))
+            force_exit_rth = bool(getattr(row, 'force_exit_rth', False))
+        if force_exit:
+            return True, 'Maintenance Exit', close
+        if force_exit_rth:
+            return True, 'RTH Exit', close
         donchian_low = row.donchian_low if hasattr(row, 'donchian_low') else row['donchian_low']
         donchian_high = row.donchian_high if hasattr(row, 'donchian_high') else row['donchian_high']
         

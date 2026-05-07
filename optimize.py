@@ -4693,6 +4693,30 @@ def main():
             print(f"{label}: PNL={total_pnl:,.0f} | Win%={win_rate:.1f} | PF={pf:.2f} | Calmar={calmar:.2f}")
     
     # ------------------------------------------------------------------
+    # Write genetic_results_*.csv early (before plots + dashboard)
+    # Each solution runs split-level + aggregate backtests; large HoF can take a long time.
+    # ------------------------------------------------------------------
+    print("\n=== Writing optimized parameters CSV (genetic_results) ===")
+    print(
+        "  This step can take many minutes if HoF is large (split backtests per solution). "
+        "Default export caps at 50 solutions (same as dashboard); set TRADING_GA_CSV_MAX_SOLUTIONS=0 to export all.",
+        flush=True,
+    )
+    save_optimized_results(
+        hof,
+        best,
+        param_df,
+        param_dict,
+        in_sample,
+        oos,
+        is_mask,
+        is_periods,
+        oos_periods,
+        suffix,
+        oos_mask=oos_mask if 'oos_mask' in locals() else None,
+    )
+    
+    # ------------------------------------------------------------------
     # DIAGNOSTIC PLOTS  ga_diagnostics/
     # ------------------------------------------------------------------
     # Convergence plots for each objective
@@ -4882,10 +4906,39 @@ def main():
             print("Start time file cleaned up.")
         except:
             pass
-    # ------------------------------------------------------------------
-    # Write optimized CSV
-    # ------------------------------------------------------------------
-    save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_mask, is_periods, oos_periods, suffix, oos_mask=oos_mask if 'oos_mask' in locals() else None)
+
+def _select_hof_for_csv_export(hof):
+    """
+    CSV export runs split-detail + aggregate backtests per solution and can dominate
+    wall time when the Pareto front is large. The final HTML dashboard already caps
+    expensive per-solution backtests at 50; align CSV export unless overridden.
+
+    Environment:
+      TRADING_GA_CSV_MAX_SOLUTIONS  (default 50 when unset/blank)
+        - Positive integer: export at most this many solutions (ranked by fitness Sortino).
+        - 0 or negative: export all solutions in HoF (slow).
+
+    Returns:
+        (list of individuals to export, truncated: bool)
+    """
+    if not hof:
+        return [], False
+
+    raw = os.environ.get('TRADING_GA_CSV_MAX_SOLUTIONS', '').strip()
+    if raw == '':
+        max_n = 50
+    else:
+        try:
+            max_n = int(raw)
+        except ValueError:
+            max_n = 50
+
+    if max_n <= 0 or max_n >= len(hof):
+        return list(hof), False
+
+    ranked = sorted(hof, key=lambda ind: ind.fitness.values[0], reverse=True)
+    return ranked[:max_n], True
+
 
 def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_mask, is_periods, oos_periods, suffix, oos_mask=None):
     """
@@ -4893,13 +4946,31 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
     """
     global param_keys, OUTPUT_CSV, CHECKPOINT_FILE, DIAG_DIR
     
-    # (Removed redundant nested call)
-    
+    hof_export, truncated = _select_hof_for_csv_export(hof)
+    if not hof_export:
+        print("WARNING: No Hall-of-Fame solutions to export; skipping CSV.")
+        return
+
+    if truncated:
+        print(
+            f"  CSV export: using top {len(hof_export)} of {len(hof)} Pareto solutions "
+            f"(by fitness Sortino). Set TRADING_GA_CSV_MAX_SOLUTIONS=0 to export all.",
+            flush=True,
+        )
+    else:
+        print(f"  CSV export: using all {len(hof_export)} Pareto solutions.", flush=True)
+
     # ------------------------------------------------------------------
-    # Write optimized CSV with ALL Pareto solutions as columns
+    # Write optimized CSV with Pareto solutions as columns (possibly capped)
     # ------------------------------------------------------------------
     solutions_data = []
-    for i, ind in enumerate(hof):
+    for i, ind in enumerate(hof_export):
+        if len(hof_export) <= 25 or i == 0 or (i + 1) % max(1, len(hof_export) // 10) == 0 or i == len(hof_export) - 1:
+            print(
+                f"    Building CSV rows: solution {i + 1}/{len(hof_export)} "
+                f"(fitness Sortino={ind.fitness.values[0]:.4f})...",
+                flush=True,
+            )
         raw_params = dict(zip(param_keys, ind))
         clamped_params = finalize_ga_solution_params(raw_params, param_dict)
         clamped_params = merge_solution_params_with_template(clamped_params, param_dict, param_df)

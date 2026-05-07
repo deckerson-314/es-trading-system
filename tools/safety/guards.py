@@ -24,6 +24,7 @@ class SecurityGuard:
         
         # State tracking
         self.last_pnl_check = datetime.now()
+        self.last_orphan_check = datetime.min
         self.flattened_today = False
         self.flattened_date = None  # Track which date was flattened for daily reset
         
@@ -117,19 +118,39 @@ class SecurityGuard:
         """
         if contract is None or not ib.isConnected():
             return
+        now = datetime.now()
+        # Throttle orphan checks to reduce race conditions during bracket submission.
+        if (now - self.last_orphan_check).total_seconds() < 3:
+            return
+        self.last_orphan_check = now
             
         try:
             # 1. Check actual open positions in account
             es_positions = [p for p in ib.positions() if p.contract.conId == contract.conId]
             has_open_position = any(abs(p.position) > 0 for p in es_positions)
             
-            # 2. Get all known order IDs from our tracked brackets
+            # 2. Get all known IDs from tracked brackets
+            tracked_perm_ids = set()
             tracked_order_ids = set()
+            tracked_parent_ids = set()
+            newest_guard_until = None
             for bracket in tracked_positions:
+                entry_obj = bracket.get('entry')
+                if entry_obj and getattr(entry_obj, 'orderId', 0):
+                    tracked_parent_ids.add(entry_obj.orderId)
+                if bracket.get('entryOrderId'):
+                    tracked_parent_ids.add(bracket.get('entryOrderId'))
+                guard_until = bracket.get('guard_until')
+                if guard_until:
+                    newest_guard_until = guard_until if newest_guard_until is None else max(newest_guard_until, guard_until)
                 for key in ['entry', 'stopLoss', 'takeProfit']:
                     order = bracket.get(key)
-                    if order and hasattr(order, 'permId') and order.permId:
-                        tracked_order_ids.add(order.permId)
+                    if not order:
+                        continue
+                    if hasattr(order, 'permId') and order.permId:
+                        tracked_perm_ids.add(order.permId)
+                    if hasattr(order, 'orderId') and order.orderId:
+                        tracked_order_ids.add(order.orderId)
 
             # 3. Analyze active trades
             for trade in ib.trades():
@@ -141,18 +162,36 @@ class SecurityGuard:
                     # If position is closed, ALL protective orders should be cancelled
                     is_orphaned = False
                     
+                    # Grace window: if we are actively building a new bracket, don't cancel.
+                    if newest_guard_until and now < newest_guard_until:
+                        continue
+
+                    # Brand new pending orders can race with IB assignment; skip.
+                    if trade.log:
+                        created = trade.log[0].time
+                        # Normalize timezone-aware timestamps for subtraction
+                        if hasattr(created, 'tzinfo') and created.tzinfo is not None:
+                            created = created.replace(tzinfo=None)
+                        if (now - created).total_seconds() < 15:
+                            continue
+
                     if not has_open_position and not tracked_positions:
                         is_orphaned = True
                         
                     # If we DO have a position, but this order isn't in our tracked brackets
-                    elif order.permId not in tracked_order_ids:
-                        # Only target standalone orders (no parent ID), highly likely to be trailing updates
-                        # OR orders whose parent is already filled
-                        if not hasattr(order, 'parentId') or order.parentId == 0:
+                    elif (order.permId not in tracked_perm_ids and
+                          order.orderId not in tracked_order_ids):
+                        parent_id = getattr(order, 'parentId', 0) or 0
+                        # Keep child orders whose parent orderId is tracked.
+                        if parent_id in tracked_parent_ids:
+                            continue
+                        # Only target standalone orders (no parent ID), highly likely to be trailing updates.
+                        if parent_id == 0:
                             is_orphaned = True
                         else:
+                            # parentId is an orderId (not permId)
                             parent_filled = any(
-                                p_trade.order.permId == order.parentId and p_trade.filled()
+                                getattr(p_trade.order, 'orderId', 0) == parent_id and p_trade.filled()
                                 for p_trade in ib.trades()
                             )
                             if parent_filled:

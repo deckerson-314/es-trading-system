@@ -89,12 +89,13 @@ def get_account_summary(ib, data=None, contract=None, portfolio_realized_pnl=Non
             realized = getattr(p, 'realizedPNL', None) or getattr(p, 'realizedPnl', None) or 0
             total_realized_pnl += realized
 
-        # Use portfolio callback PnL if available (most accurate)
-        # Use portfolio callback PnL if available (most accurate)
-        if portfolio_realized_pnl is not None:
-            summary['RealizedPNL'] = portfolio_realized_pnl
-        elif summary.get('RealizedPNL', 0) == 0:
+        # Account-level realized PnL must come from Account Summary tags (or ES position sum),
+        # not from a single PortfolioItem line — that field tracks contract-level / day slice and
+        # often tracks unrealized movement in paper, which made the top "Realized" box misleading.
+        if summary.get('RealizedPNL', 0) == 0 and total_realized_pnl:
             summary['RealizedPNL'] = total_realized_pnl
+        if portfolio_realized_pnl is not None:
+            summary['ContractRealizedPNL'] = portfolio_realized_pnl
 
         if summary.get('UnrealizedPNL', 0) == 0 and total_unrealized_pnl != 0:
             summary['UnrealizedPNL'] = total_unrealized_pnl

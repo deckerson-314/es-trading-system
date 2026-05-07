@@ -168,10 +168,11 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None, complet
                         'direction': 'LONG' if pos.position > 0 else 'SHORT',
                         'qty': abs(pos.position), 'entry_price': entry_price, 'exit_price': exit_price,
                         'pnl': pnl, 'r_multiple': 0, 'reason': 'Orphan Auto-Close',
-                        'duration': 'Auto-Closed'
+                        'duration': 'Auto-Closed',
+                        'stop_at_close': None, 'tp_at_close': None,
                     })
-                    if len(completed_trades) > 50:
-                        del completed_trades[:-50]
+                    if len(completed_trades) > 1000:
+                        del completed_trades[:-1000]
 
             except Exception as e:
                 logging.error(f"Failed to close orphaned position: {e}")
@@ -263,6 +264,48 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
                         f"Added protective stop for {pos.contract.localSymbol} at ${stop_order.auxPrice:.2f}")
             except Exception as e:
                 logging.error(f"Failed to place protective order for legacy contract: {e}")
+
+
+def enforce_stop_invariant(ib, positions, strategy, data, live_tracker=None):
+    """
+    Hard safety invariant:
+    Every open ES position must have at least one active stop order on the same contract/side/qty.
+    """
+    if not ib.isConnected() or data is None or data.empty:
+        return
+    try:
+        es_open = [p for p in ib.positions() if p.contract.symbol == 'ES' and p.position != 0]
+    except Exception as e:
+        logging.error(f"Failed to fetch positions for stop invariant: {e}")
+        return
+
+    if not es_open:
+        return
+
+    for pos in es_open:
+        qty = abs(pos.position)
+        direction = 1 if pos.position > 0 else -1
+        con_id = pos.contract.conId
+        has_stop = False
+        for trade in ib.trades():
+            if trade.contract.conId != con_id or not trade.isActive():
+                continue
+            order = trade.order
+            is_stop = isinstance(order, StopOrder) or (
+                getattr(order, 'auxPrice', 0) > 0 and getattr(order, 'lmtPrice', 0) == 0
+            )
+            if not is_stop:
+                continue
+            order_dir = 1 if order.action == 'SELL' else -1
+            if order_dir == direction and abs(order.totalQuantity) == qty:
+                has_stop = True
+                break
+
+        if not has_stop:
+            logging.error(
+                f"STOP INVARIANT BREACH: {qty} {pos.contract.localSymbol} has no active stop. Re-protecting now."
+            )
+            protect_existing_positions(ib, pos.contract, positions, strategy, data, live_tracker=live_tracker)
 
 
 def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker=None):
@@ -462,9 +505,9 @@ def reconcile_positions(ib, contract, positions, live_tracker=None,
 
 async def periodic_protection_check(ib, contract, positions, strategy, data, live_tracker=None, 
                                  send_email_fn=None, close_all_fn=None, completed_trades=None):
-    """Every-60s async task: maintenance -> cleanup -> protect -> recreate TP."""
+    """Every-20s async task: maintenance -> cleanup -> protect -> stop invariant -> recreate TP."""
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(20)
         if not ib.isConnected() or contract is None:
             continue
             
@@ -507,6 +550,7 @@ async def periodic_protection_check(ib, contract, positions, strategy, data, liv
             cleanup_orphaned_orders(ib, contract, positions)
             close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
             protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
+            enforce_stop_invariant(ib, positions, strategy, data, live_tracker)
             check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
         except Exception as e:
             logging.error(f"Error in periodic protection check: {e}")
@@ -522,5 +566,6 @@ def run_reconnection_safety_sequence(ib, contract, positions, strategy, data, li
     cleanup_orphaned_orders(ib, contract, positions)
     close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
     protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
+    enforce_stop_invariant(ib, positions, strategy, data, live_tracker)
     check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
     logging.info("Safety sequence complete")
