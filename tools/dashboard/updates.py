@@ -388,7 +388,7 @@ def generate_dashboard_html(state: DashboardState) -> str:
     <title>IB {state.mode.capitalize()} Dashboard</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>{icon_emoji}</text></svg>">
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="5">
+    <meta http-equiv="refresh" content="12">
     <style>
         body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; background: #eaeff2; color: #333; }}
         .container {{ max-width: 1600px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
@@ -918,6 +918,14 @@ def generate_dashboard_html(state: DashboardState) -> str:
                 yaxis4: { title: 'RSI', domain:[0.0,0.14], range:[0,100] },
                 shapes: shapes, annotations: ann, margin: { t: 40, r: 20, b: 36, l: 56 }
             };
+            if (p.active_trade_lines && p.active_trade_lines.times && p.active_trade_lines.times.length) {
+                if (anyNonNull(p.active_trade_lines.stop))
+                    traces.push({ type: 'scatter', x: p.active_trade_lines.times, y: p.active_trade_lines.stop, name: 'Active SL (per bar)',
+                        line: { color: '#b71c1c', width: 1.6, shape: 'hv' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
+                if (anyNonNull(p.active_trade_lines.tp))
+                    traces.push({ type: 'scatter', x: p.active_trade_lines.times, y: p.active_trade_lines.tp, name: 'Active TP (per bar)',
+                        line: { color: '#1b5e20', width: 1.6, shape: 'hv' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
+            }
             if (savedZoom) {
                 if (savedZoom.x0 && savedZoom.x1) {
                     layout.xaxis.range = [savedZoom.x0, savedZoom.x1];
@@ -938,6 +946,13 @@ def generate_dashboard_html(state: DashboardState) -> str:
                 if (savedZoom.y40 != null && savedZoom.y41 != null) {
                     layout.yaxis4.range = [savedZoom.y40, savedZoom.y41];
                     layout.yaxis4.autorange = false;
+                }
+            } else {
+                var right = new Date(p.times[p.times.length - 1]);
+                if (!isNaN(right.getTime())) {
+                    var left = new Date(right.getTime() - (2 * 24 * 60 * 60 * 1000));
+                    layout.xaxis.range = [left.toISOString(), right.toISOString()];
+                    layout.xaxis.autorange = false;
                 }
             }
             Plotly.react(el, traces, layout, { displayModeBar: true, responsive: true });

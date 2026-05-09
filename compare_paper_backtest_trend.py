@@ -13,6 +13,19 @@ from strategies.factory import StrategyFactory
 from plot_comparison import generate_comparison_charts
 
 
+def _parse_hhmm_policy(s) -> time:
+    """Parse maintenance/RTH time strings (24h HH:MM, HH:MM:SS, or 12h with AM/PM)."""
+    s = str(s).strip() if s is not None else ""
+    if not s:
+        return time(17, 30)
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return pd.to_datetime(s, format=fmt).time()
+        except ValueError:
+            continue
+    return pd.to_datetime(s).time()
+
+
 def _et_session_pad_end_time(strategy) -> time:
     """
     Eastern wall-clock time through which HTF rows should exist so a backtest can
@@ -20,7 +33,7 @@ def _et_session_pad_end_time(strategy) -> time:
     Uses maintenance end + post buffer, floored at 18:00 ET for ETH tails present in logs.
     """
     base_date = datetime(2000, 1, 1).date()
-    me = pd.to_datetime(strategy.daily_maintenance_end_str, format="%H:%M").time()
+    me = _parse_hhmm_policy(getattr(strategy, "daily_maintenance_end_str", "17:30"))
     end_dt = pd.Timestamp.combine(base_date, me)
     with_post_buf = end_dt + timedelta(minutes=int(strategy.maintenance_buffer_minutes))
     floor_eth = datetime.strptime("18:00", "%H:%M").time()
@@ -520,7 +533,7 @@ def main():
         # 6. Generate interactive dashboard
         try:
             print("\nGenerating interactive comparison dashboard overlays...")
-            generate_comparison_charts(args.results_csv, "web/comparison_charts")
+            generate_comparison_charts(args.results_csv, "web/comparison_charts", data_path=data_path, params_path=args.params)
         except Exception as e:
             print(f"Failed to generate dashboard: {e}")
     else:

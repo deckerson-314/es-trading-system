@@ -3019,7 +3019,12 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             </div>
         </div>
         """
-    fitness_weights_html = "<h2>Fitness Function Configuration</h2><div class='info-section'><table class='params-table'><thead><tr><th>Objective</th><th>Weight</th><th>Direction</th><th>Normalization Range</th><th>Notes</th></tr></thead><tbody>"
+    fitness_weights_html = (
+        "<h2>Fitness Function Configuration</h2><div class='info-section'>"
+        "<table class='params-table'><thead><tr><th>Objective</th><th>Weight</th><th>Direction</th>"
+        "<th>Norm. divisor<br/><span style='font-weight:normal;font-size:0.85em;color:#666'>"
+        "(CSV <code>Value</code> column)</span></th><th>Notes</th></tr></thead><tbody>"
+    )
     
     # Get weights from creator.FitnessMulti
     from deap import creator
@@ -3028,21 +3033,48 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         weight_names = ['Sortino Ratio', 'Max Drawdown', 'Profit Factor', 'Avg Trades/Day', 'Total Profit', 'Avg Profit/Trade']
         directions = ['Maximize', 'Minimize', 'Maximize', 'Maximize', 'Maximize', 'Maximize']
         
-        # Get normalization ranges from param_dict with safety check
+        # Reload PARAM_CSV from disk so mid-run edits to NORM_* show in the dashboard.
+        # (In-memory param_dict and worker processes still hold the snapshot from run start.)
+        param_dict_norm = param_dict
+        try:
+            param_dict_norm, _ = load_params(PARAM_CSV, return_dataframe=True)
+        except Exception:
+            pass
+
+        # Get normalization ranges from freshly loaded dict with safety check
         def get_p_val(key, default):
-            item = param_dict.get(key)
+            item = param_dict_norm.get(key)
             if isinstance(item, dict):
                 return item.get('value', default)
             return default
 
-        norm_ranges = {
-            'Sortino Ratio': get_p_val('NORM_SORTINO_MAX', 10.0),
-            'Max Drawdown': get_p_val('NORM_DD_MAX', 100000.0),
-            'Profit Factor': get_p_val('NORM_PF_MAX', 5.0),
-            'Avg Trades/Day': get_p_val('NORM_TRADES_MAX', 3.0),
-            'Total Profit': get_p_val('NORM_PNL_MAX', 200000.0),
-            'Avg Profit/Trade': get_p_val('NORM_PROFIT_TRADE_MAX', 250.0)
-        }
+        norm_keys = [
+            'NORM_SORTINO_MAX',
+            'NORM_DD_MAX',
+            'NORM_PF_MAX',
+            'NORM_TRADES_MAX',
+            'NORM_PNL_MAX',
+            'NORM_PROFIT_TRADE_MAX',
+        ]
+
+        def format_norm_cell(norm_key: str, fallback):
+            """Show active divisor (CSV Value) and Min/Max from file for clarity."""
+            v = get_p_val(norm_key, fallback)
+            if isinstance(v, float):
+                v_str = f"{v:,.0f}" if abs(v) >= 1000 else f"{v:.4g}"
+            else:
+                v_str = str(v)
+            item = param_dict_norm.get(norm_key)
+            extra = ''
+            if isinstance(item, dict):
+                mn, mx = item.get('min'), item.get('max')
+                if mn is not None and mx is not None and not (pd.isna(mn) or pd.isna(mx)):
+                    extra = (
+                        f"<br><span style='color:#888;font-size:0.82em'>"
+                        f"In CSV: Min={mn}, Max={mx} (bounds only; "
+                        f"<strong>fitness uses Value={v_str}</strong>)</span>"
+                    )
+            return f"<strong>{v_str}</strong>{extra}"
         
         notes = [
             '<strong>Constraint:</strong> Maximize. Penalized if < LIMIT_MIN_SORTINO.',
@@ -3053,12 +3085,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             '<strong>Goal:</strong> Maximize Profit Per Trade. Penalized if WinRate < MAX_WIN_RATE_CAP or Duration < MIN_TRADE_DURATION.'
         ]
         
-        for i, (name, weight, direction, note) in enumerate(zip(weight_names, weights, directions, notes)):
-            norm_range = norm_ranges.get(name, 'N/A')
-            if isinstance(norm_range, float):
-                norm_range_str = f"{norm_range:,.0f}" if norm_range >= 1000 else f"{norm_range:.1f}"
-            else:
-                norm_range_str = str(norm_range)
+        default_norms = [10.0, 100000.0, 5.0, 3.0, 200000.0, 250.0]
+        for i, (name, weight, direction, note, nk, fb) in enumerate(
+            zip(weight_names, weights, directions, notes, norm_keys, default_norms)
+        ):
+            norm_range_str = format_norm_cell(nk, fb)
             
             weight_str = f"{weight:.1f}"
             if weight == 100.0:
@@ -3068,7 +3099,20 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             
             fitness_weights_html += f"<tr><td>{name}</td><td>{weight_str}</td><td>{direction}</td><td>{norm_range_str}</td><td>{note}</td></tr>"
     
-    fitness_weights_html += "</tbody></table><p><em>Weights influence selection pressure.</em></p><p><em>Trade scores are normalized.</em></p></div>"
+    fitness_weights_html += (
+        "</tbody></table>"
+        "<p><em>Weights influence selection pressure.</em></p>"
+        "<p><em>Trade scores are normalized.</em></p>"
+        "<p style=\"font-size:0.88em;color:#666;margin-top:10px;\"><strong>Not hardcoded:</strong> each "
+        "<code>NORM_*</code> row uses the <strong>Value</strong> column as the divisor in "
+        "<code>core_evaluate</code>. Changing only <strong>Min</strong> or <strong>Max</strong> on that row "
+        "does not change fitness or this table — update <strong>Value</strong>, save the same file passed as "
+        "<code>--params</code> / default trend CSV, then start (or restart) the GA.</p>"
+        "<p style=\"font-size:0.88em;color:#666;\">Dashboard numbers are re-read from <code>PARAM_CSV</code> when "
+        "the HTML is rebuilt. If you edit the CSV <em>during</em> a run, refresh shows new Values, but worker "
+        "processes still use the snapshot from pool start until you restart.</p>"
+        "</div>"
+    )
     
     # Generate full HTML with tooltips and auto-refresh
     # Use JavaScript refresh that preserves scroll position instead of meta refresh
@@ -4699,7 +4743,7 @@ def main():
     print("\n=== Writing optimized parameters CSV (genetic_results) ===")
     print(
         "  This step can take many minutes if HoF is large (split backtests per solution). "
-        "Default export caps at 50 solutions (same as dashboard); set TRADING_GA_CSV_MAX_SOLUTIONS=0 to export all.",
+        "By default, CSV export includes all HoF solutions; set TRADING_GA_CSV_MAX_SOLUTIONS to cap.",
         flush=True,
     )
     save_optimized_results(
@@ -4910,11 +4954,10 @@ def main():
 def _select_hof_for_csv_export(hof):
     """
     CSV export runs split-detail + aggregate backtests per solution and can dominate
-    wall time when the Pareto front is large. The final HTML dashboard already caps
-    expensive per-solution backtests at 50; align CSV export unless overridden.
+    wall time when the Pareto front is large.
 
     Environment:
-      TRADING_GA_CSV_MAX_SOLUTIONS  (default 50 when unset/blank)
+      TRADING_GA_CSV_MAX_SOLUTIONS  (default: uncapped when unset/blank)
         - Positive integer: export at most this many solutions (ranked by fitness Sortino).
         - 0 or negative: export all solutions in HoF (slow).
 
@@ -4926,12 +4969,12 @@ def _select_hof_for_csv_export(hof):
 
     raw = os.environ.get('TRADING_GA_CSV_MAX_SOLUTIONS', '').strip()
     if raw == '':
-        max_n = 50
+        max_n = 0
     else:
         try:
             max_n = int(raw)
         except ValueError:
-            max_n = 50
+            max_n = 0
 
     if max_n <= 0 or max_n >= len(hof):
         return list(hof), False

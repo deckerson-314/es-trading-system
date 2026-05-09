@@ -336,14 +336,153 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
     
 
 
-def _close_all_positions(reason_label, ib, contract, positions, data, 
-                         live_tracker, send_email_fn, strategy=None, account_fn=None):
-    """Helper: Close all tracked positions with market orders."""
+def _record_flatten_close_from_market_order(
+    ib, bracket_contract, bracket, entry_trade, close_trade,
+    dir_, qty, reason_label, stop_at_close_snap, tp_at_close_snap,
+    completed_trades, live_tracker, send_email_fn, data, strategy=None,
+    send_close_email: bool = False,
+):
+    """
+    Record a completed trade after RTH/maintenance (or similar) forced market flatten.
+    Snapshots SL/TP prices must be taken before those orders were cancelled.
+    """
+    reason = f"{reason_label} (forced close)"
+    entry_price = float(bracket.get('entry_price', 0) or 0)
+    entry_time = bracket.get('entry_time')
+    if not entry_price and entry_trade and getattr(entry_trade, 'fills', None):
+        try:
+            entry_price = float(entry_trade.fills[0].execution.price)
+        except Exception:
+            pass
+
+    exit_price = 0.0
+    pnl = 0.0
+    if close_trade and close_trade.fills:
+        try:
+            exit_price = float(close_trade.fills[-1].execution.price)
+        except Exception:
+            exit_price = 0.0
+        for f in close_trade.fills:
+            cr = getattr(f, 'commissionReport', None)
+            if cr is not None and hasattr(cr, 'realizedPNL') and cr.realizedPNL is not None:
+                pnl = float(cr.realizedPNL)
+                break
+        if pnl == 0 and entry_price > 0 and exit_price > 0:
+            pnl = (exit_price - entry_price) * dir_ * 50 * qty
+    else:
+        expected_side = 'SLD' if dir_ == 1 else 'BOT'
+        is_aware = entry_time and getattr(entry_time, 'tzinfo', None) is not None
+        ref_time = entry_time
+        for f in reversed(ib.fills()):
+            if f.contract.conId != bracket_contract.conId:
+                continue
+            if not hasattr(f, 'execution') or f.execution.side != expected_side:
+                continue
+            f_time = f.execution.time
+            if is_aware and f_time.tzinfo is None:
+                f_time = pytz.utc.localize(f_time)
+            elif not is_aware and f_time.tzinfo is not None:
+                f_time = f_time.replace(tzinfo=None)
+            if ref_time and f_time < (ref_time - pd.Timedelta(seconds=5)):
+                continue
+            if abs(f.execution.shares) < qty:
+                continue
+            exit_price = float(f.execution.price)
+            if f.commissionReport and hasattr(f.commissionReport, 'realizedPNL'):
+                pnl = float(f.commissionReport.realizedPNL or 0)
+            if pnl == 0 and entry_price > 0:
+                pnl = (exit_price - entry_price) * dir_ * 50 * qty
+            break
+
+    if exit_price <= 0 and data is not None and not data.empty:
+        exit_price = float(data['close'].iloc[-1])
+        if entry_price > 0 and pnl == 0:
+            pnl = (exit_price - entry_price) * dir_ * 50 * qty
+
+    is_aware = entry_time and getattr(entry_time, 'tzinfo', None) is not None
+    exit_time = datetime.now()
+    if is_aware:
+        exit_time = exit_time.astimezone(pytz.utc)
+
+    duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
+
+    curr_stop = float(stop_at_close_snap) if stop_at_close_snap is not None else 0.0
+    initial_risk = abs(entry_price - curr_stop) * 50 * qty if curr_stop else 0
+    r_multiple = pnl / initial_risk if initial_risk > 0 else 0
+
+    report_url = ""
+    if strategy:
+        try:
+            trades_dir = os.path.join(os.getcwd(), 'web', 'trades')
+            os.makedirs(trades_dir, exist_ok=True)
+            report_path = strategy.generate_trade_report(
+                {
+                    'entry_time': entry_time, 'exit_time': exit_time,
+                    'direction': dir_, 'entry_price': entry_price,
+                    'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
+                    'reason': reason,
+                    'stop_at_close': stop_at_close_snap,
+                    'tp_at_close': tp_at_close_snap,
+                    'stop_at_open': bracket.get('entry_stop_price'),
+                    'tp_at_open': bracket.get('entry_tp_price'),
+                    'params_snapshot': bracket.get('params_snapshot') or {},
+                },
+                data, trades_dir
+            )
+            if report_path:
+                report_url = f"trades/{os.path.basename(report_path)}"
+        except Exception as e:
+            logging.error(f"Failed to generate HTML report (flatten): {e}")
+
+    if send_close_email:
+        _send_trade_close_notification(
+            ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason,
+            duration_str, exit_time, data, send_email_fn, live_tracker,
+            report_url=report_url
+        )
+
+    logging.info(f"TRADE CLOSE: {reason} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
+    add_to_live_tracker(live_tracker, 'trade',
+                        f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
+
+    completed_trades.append({
+        'exit_time': exit_time, 'entry_time': entry_time,
+        'direction': 'LONG' if dir_ == 1 else 'SHORT',
+        'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
+        'pnl': pnl, 'r_multiple': r_multiple, 'reason': reason,
+        'duration': duration_str,
+        'report_url': report_url,
+        'params_snapshot': bracket.get('params_snapshot') or {},
+        'stop_at_open': bracket.get('entry_stop_price'),
+        'tp_at_open': bracket.get('entry_tp_price'),
+        'stop_at_close': stop_at_close_snap,
+        'tp_at_close': tp_at_close_snap,
+        'entry_order_id': bracket.get('entryOrderId'),
+    })
+    if len(completed_trades) > 1000:
+        del completed_trades[:-1000]
+
+    try:
+        active_for_contract = [t for t in ib.trades() if t.contract.conId == bracket_contract.conId and t.isActive()]
+        for trade in active_for_contract:
+            perm_id = trade.order.permId
+            if entry_trade and perm_id == getattr(entry_trade.order, 'permId', 0):
+                continue
+            logging.info(f"Cleanup: Cancelling active order {trade.order.orderType} {trade.order.action} (PermID: {perm_id}) for {bracket_contract.localSymbol}")
+            ib.cancelOrder(trade.order)
+    except Exception as e:
+        logging.error(f"Error during flatten orphan cleanup: {e}")
+
+
+def _close_all_positions(reason_label, ib, contract, positions, data,
+                         live_tracker, send_email_fn, strategy=None, account_fn=None,
+                         completed_trades=None):
+    """Close all tracked positions with market orders; record completed_trades like other exits."""
     for bracket in positions[:]:
         try:
             entry_order = bracket['entry']
             entry_trade = next((t for t in ib.trades() if t.order.permId == entry_order.permId), None)
-            
+
             # If entry trade is not filled yet, cancel it
             if entry_trade and entry_trade.isActive():
                 ib.cancelOrder(entry_trade.order)
@@ -352,29 +491,66 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
             # Use bracket's contract if available, fallback to global
             bracket_contract = bracket.get('contract', contract)
             es_positions = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
-            
+
             if not es_positions or es_positions[0].position == 0:
-                if bracket in positions: positions.remove(bracket)
+                if bracket in positions:
+                    positions.remove(bracket)
                 continue
 
             actual_pos = es_positions[0].position
             actual_qty = abs(actual_pos)
+            dir_ = 1 if actual_pos > 0 else -1
             close_action = 'SELL' if actual_pos > 0 else 'BUY'
 
-            # Cancel stop and TP
-            for order in [bracket.get('stopLoss'), bracket.get('takeProfit')]:
+            stop_order = bracket.get('stopLoss')
+            tp_order = bracket.get('takeProfit')
+            stop_snap = None
+            tp_snap = None
+            if stop_order:
+                raw_sl = getattr(stop_order, 'auxPrice', None)
+                if raw_sl is None:
+                    raw_sl = getattr(stop_order, 'stopPrice', None)
+                if raw_sl is not None:
+                    try:
+                        stop_snap = float(raw_sl)
+                    except (TypeError, ValueError):
+                        stop_snap = None
+            if tp_order:
+                raw_tp = getattr(tp_order, 'lmtPrice', None)
+                if raw_tp is not None:
+                    try:
+                        tp_snap = float(raw_tp)
+                    except (TypeError, ValueError):
+                        tp_snap = None
+
+            for order in [stop_order, tp_order]:
                 if order:
-                    try: ib.cancelOrder(order)
-                    except: pass
+                    try:
+                        ib.cancelOrder(order)
+                    except Exception:
+                        pass
 
-            if bracket in positions: positions.remove(bracket)
+            if bracket in positions:
+                positions.remove(bracket)
 
-            close_order = MarketOrder(action=close_action, totalQuantity=actual_qty, transmit=True)
-            close_trade = ib.placeOrder(bracket_contract, close_order)
-            ib.sleep(1)
+            close_mkt = MarketOrder(action=close_action, totalQuantity=actual_qty, transmit=True)
+            close_trade = ib.placeOrder(bracket_contract, close_mkt)
+            ib.sleep(3)
+            if not close_trade.fills:
+                ib.sleep(2)
+
+            es_after = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
+            if (not es_after or es_after[0].position == 0) and completed_trades is not None:
+                _record_flatten_close_from_market_order(
+                    ib, bracket_contract, bracket, entry_trade, close_trade,
+                    dir_, actual_qty, reason_label, stop_snap, tp_snap,
+                    completed_trades, live_tracker, send_email_fn, data, strategy=strategy,
+                )
+            elif es_after and es_after[0].position != 0:
+                logging.error(f"{reason_label} market close may not have filled; position still open for {bracket_contract.localSymbol}")
 
             logging.info(f"Tracked position closed ({reason_label}): {close_action} {actual_qty} {bracket_contract.localSymbol}")
-            if live_tracker:
+            if live_tracker and completed_trades is None:
                 add_to_live_tracker(live_tracker, 'trade', f"{reason_label} EXIT: {bracket_contract.localSymbol}")
         except Exception as e:
             logging.error(f"Error closing tracked position ({reason_label}): {e}")
@@ -429,7 +605,10 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 rth_es_pos = [p for p in ib.positions() if p.contract.symbol == 'ES']
                 if rth_es_pos:
                     logging.warning(f"⚠️ RTH ENDING - Closing {len(rth_es_pos)} ES position(s)")
-                    _close_all_positions("RTH End", ib, contract, positions, data, live_tracker, send_email_fn, account_fn=acct_fn)
+                    _close_all_positions(
+                        "RTH End", ib, contract, positions, data, live_tracker, send_email_fn,
+                        strategy=strategy, account_fn=acct_fn, completed_trades=completed_trades,
+                    )
             else:
                 if hasattr(check_exits, '_rth_warned'):
                     delattr(check_exits, '_rth_warned')
@@ -451,7 +630,10 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 # Filter for ANY ES position during maintenance
                 maint_es_pos = [p for p in ib.positions() if p.contract.symbol == 'ES']
                 if maint_es_pos:
-                    _close_all_positions("Maintenance", ib, contract, positions, data, live_tracker, send_email_fn, account_fn=acct_fn)
+                    _close_all_positions(
+                        "Maintenance", ib, contract, positions, data, live_tracker, send_email_fn,
+                        strategy=strategy, account_fn=acct_fn, completed_trades=completed_trades,
+                    )
             else:
                 if hasattr(check_exits, '_maint_warned'):
                     delattr(check_exits, '_maint_warned')
@@ -609,6 +791,8 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                           live_tracker, send_email_fn, entry_trade, current_price, reason, data=None, strategy=None):
     """Force close a position with market order (PreSubmitted stop handler)."""
     try:
+        stop_order = bracket.get('stopLoss')
+        tp_order = bracket.get('takeProfit')
         # Cancel existing orders
         for order in [bracket.get('stopLoss'), bracket.get('takeProfit')]:
             if order:
@@ -1052,6 +1236,8 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     
     duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
 
+    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+
     # Generate HTML report if possible
     report_url = ""
     if strategy:
@@ -1089,7 +1275,6 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
     
     # Risk calculation for completed record
-    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
     initial_risk = abs(entry_price - curr_stop) * 50 * qty if curr_stop else 0
     r_multiple = pnl / initial_risk if initial_risk > 0 else 0
     

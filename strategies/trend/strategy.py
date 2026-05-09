@@ -662,10 +662,15 @@ class TrendStrategy(Strategy):
         if dir_ == 1 and low <= stop_price: return True, 'Stop Loss', stop_price
         if dir_ == -1 and high >= stop_price: return True, 'Stop Loss', stop_price
         
-        # 2. Take Profit
+        # 2. Take Profit (limit-style target)
+        # Use **close** vs TP, not **high/low**, so HTF candles do not fire on wicks that never
+        # filled the exchange limit (paper fills when trade prints through; wicks in aggregated
+        # bars often overstate vs queue timing). See May 2026 parity: high hit 05:35, fill ~08:30.
         if tp_price is not None and tp_price > 0:
-            if dir_ == 1 and high >= tp_price: return True, 'Take Profit', tp_price
-            if dir_ == -1 and low <= tp_price: return True, 'Take Profit', tp_price
+            if dir_ == 1 and close >= tp_price:
+                return True, 'Take Profit', tp_price
+            if dir_ == -1 and close <= tp_price:
+                return True, 'Take Profit', tp_price
             
         # 3. Channel Exit (Reversal)
         # If Long, and Price drops below Donchian Low (Support broken) -> Exit

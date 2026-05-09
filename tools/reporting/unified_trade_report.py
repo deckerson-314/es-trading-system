@@ -89,6 +89,7 @@ def generate_unified_trade_report(
     pnl = float(pnl or 0)
 
     reason = str(_trade_get(trade, "reason", "N/A"))
+    duration = str(_trade_get(trade, "duration", "N/A") or "N/A")
     stop_open = _trade_get(trade, "stop_at_open", _trade_get(trade, "stop", None))
     tp_open = _trade_get(trade, "tp_at_open", _trade_get(trade, "tp", None))
     stop_close = _trade_get(trade, "stop_at_close", None)
@@ -238,6 +239,7 @@ def generate_unified_trade_report(
         "Exit Price": f"{exit_price:,.2f}",
         "PnL": f"{pnl:,.2f}",
         "Qty": f"{qty:g}",
+        "Duration": duration,
         "Reason": reason,
         "Stop @ Open": "N/A" if stop_open is None else f"{float(stop_open):,.2f}",
         "TP @ Open": "N/A" if tp_open is None else f"{float(tp_open):,.2f}",

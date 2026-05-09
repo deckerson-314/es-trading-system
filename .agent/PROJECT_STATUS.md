@@ -1,5 +1,5 @@
-> **Last Updated:** 2026-04-11 12:30 ET
-> **Updated By:** Conversation (Pillar B Integration)
+> **Last Updated:** 2026-05-05 14:08 ET
+> **Updated By:** Cursor Conversation (Re-onboarding + GA Context Parameters)
 
 ---
 
@@ -39,7 +39,7 @@ c:\Trading\
 
 ---
 
-## Current State (as of 2026-04-03)
+## Current State (as of 2026-05-05)
 
 ### ✅ Working
 - **Paper trading with Trend strategy** — currently running, entered LONG @ 6809.75
@@ -57,6 +57,10 @@ c:\Trading\
 - **Functional Test Bench** — 28 pytest tests passing (`tests/test_trend_functional.py`). Covers crossover logic, kill switches, 6 filter gates, DoE grid, trailing stop ratchet/delay, ATR-TP precision, channel exit, and **Action Log diagnostics (Pillar B)**.
 - **Trend Reporting Module** — `strategies/trend/reporting.py` enhanced with **Rejection Gallery**. Provides strip charts for near-miss trades to verify execution parity and filter sensitivity.
 - **Improved Diagnostics** — `TrendStrategy` now reports actual vs. threshold values for all filters (Volume, ADX, SMA, etc.).
+- **GA Context-Aware Parameters (Trend)** — optimizer now strips inactive parameter clusters before fitness evaluation to remove dead dimensions and improve search quality.
+- **Context-Aware Delay/Lookback Semantics** — supports minutes-based fields derived to bars at evaluation time (e.g. trailing delay and lookback), reducing redundant genomes across timeframes.
+- **GA Conditional Filters Implemented** — context pruning is in place for Trailing, RSI, ADX, SMA, Volume, RTH, and Maintenance filter clusters.
+- **Context Regression Tests** — `tests/test_param_context.py` validates helper behavior for context pruning, effective RSI descriptions, and minute-to-bar derivations.
 
 ### ⚠️ Known Issues / Recently Fixed (may need restart to take effect)
 1. **Fixed in this session (Apr 3):**
@@ -64,20 +68,39 @@ c:\Trading\
    - Implemented complete Functional Test Bench (26 tests).
    - Expanded `STRATEGY_FUNCTIONAL_TEST_PLAN.md` with Three Pillars, DoE, and Exit Verification.
 
-2. **Trend strategy still needs:**
-   - Its own `reporting.py` module (currently uses Bollinger's)
-   - Its own parameter groups in `optimize.py` `group_and_print_params()` 
+2. **Trend strategy follow-up items:**
+   - Additional multi-seed / overnight evidence before merging GA context branch behavior into primary production defaults
+   - Continue tuning interaction penalties (`ENABLE_FILTER_STACK_TRADE_PENALTY`, `INTERACTION_*`) after longer A/B runs
 
-### 🔴 Not Yet Tested
+### 🔴 Not Yet Tested / In Progress
 - Live trading mode (only paper tested)
-- **Full GA optimization for Trend strategy** — ✅ Verified & Synchronized with backtest engine
-- **Data downloader tool** — ✅ Upgraded with chunking/pacing
-- **Data extender tool** — ✅ New: for historical back-filling
-- **ESM6 Contract Roll** — ✅ Verified with 8-day logic
+- Merge-grade GA context evidence (current results include promising snapshots but not final acceptance criteria)
+- Full paper/live validation using context-aware parameter copies with strict baseline snapshot discipline
 
 ---
 
 ## Changes Made This Session
+### Phase 11: GA Context-Aware Parameter Rollout (May 2026)
+- Added conditional parameter-context pruning in `optimize.py` so inactive clusters do not influence GA fitness:
+  - `apply_trailing_param_context`
+  - `apply_rsi_param_context`
+  - `apply_adx_param_context`
+  - `apply_sma_param_context`
+  - `apply_volume_param_context`
+  - `apply_rth_param_context`
+  - `apply_maintenance_param_context`
+- Added/expanded semantic derivation helpers:
+  - `resolve_trailing_delay_bars`
+  - `resolve_buy_lookback_bars`
+  - `finalize_ga_solution_params`
+- Added derived reporting rows for context interpretation (e.g. effective RSI gates and derived trailing delay bars).
+- Added verification tests in `tests/test_param_context.py`.
+- Added project design log in `GA_PARAMETER_CONTEXT_PLAN.md` including A/B evidence and merge policy guidance.
+
+### Session Admin Update (May 5, 2026)
+- Re-onboarding to Cursor after external development period.
+- Updated `.agent` docs to reflect current GA context-aware parameter status and next steps.
+
 ### Phase 10b: Rejection Gallery Implementation (Apr 12)
 - **Implemented Strip Charts**: Created `generate_near_miss_plot` to visualize why trades were rejected.
 - **Unified Action Log & Gallery**: The dashboard now includes both a detailed log and a visual gallery of "Near-Misses".
@@ -115,9 +138,13 @@ c:\Trading\
 tests/helpers/__init__.py          — NEW (package init)
 tests/helpers/synthetic_data.py    — NEW (OHLCV generators for test bench)
 tests/test_trend_functional.py     — UPDATED (28 functional tests total)
+tests/test_param_context.py        — UPDATED (GA context helper tests)
 strategies/trend/strategy.py       — UPDATED (Action Log logic)
+strategies/trend/strategy.py       — UPDATED (context-aware parameter restoration paths)
 strategies/trend/reporting.py      — NEW (Trend-specific dashboard)
 backtest.py                        — UPDATED (Action Log integration)
+optimize.py                        — UPDATED (context-aware GA parameter pruning + derived semantics)
+GA_PARAMETER_CONTEXT_PLAN.md       — NEW/UPDATED (design + A/B evidence)
 .agent/PROJECT_STATUS.md           — UPDATED
 .agent/HANDOFF.md                  — UPDATED
 ```
@@ -133,8 +160,10 @@ The Trend strategy paper trading is **currently running**.
 3. ~~**Create Trend-specific reporting**~~ — ✅ Complete (`strategies/trend/reporting.py`).
 
 ### Suggested Next Steps
-1. **Develop Rejection Gallery**: Create `rejection_gallery.py` to visualize "Near-Miss" trades from the Action Log.
-2. **Re-evaluate ADX filter** — Now that ADX is fixed and the Action Log is visible, re-run GA optimization with `Enable ADX Filter = 1`.
-3. **Pillar C (Shadow Auditor)**: Consider implementing live near-miss monitoring if parity issues occur between paper and backtest.
-4. **Validate Trend GA optimization** — `python optimize.py --strategy trend --cores 12`.
-5. **Run functional tests** — `python -m pytest tests/test_trend_functional.py -v` (should pass 28/28 in ~1s).
+1. **Run/extend multi-seed A/B** for baseline vs context-aware GA parameters (Trend) before merge decisions.
+2. **Preserve immutable baseline artifacts** for every accepted benchmark run (results CSV + checkpoint + params copy + commit hash).
+3. **Tune interaction penalties** using longer-budget runs once multi-seed direction is consistent.
+4. **Pillar C (Shadow Auditor)**: consider live near-miss monitoring if parity issues persist between paper and backtest.
+5. **Run validation tests**:
+   - `python -m pytest tests/test_trend_functional.py -v`
+   - `python -m pytest tests/test_param_context.py -v`

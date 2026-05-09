@@ -541,8 +541,11 @@ async def periodic_protection_check(ib, contract, positions, strategy, data, liv
                                 if close_all_fn and send_email_fn:
                                     logging.warning(f"⚠️ {reason.upper()} APPROACHING (Periodic Check) - Closing all ES positions")
                                     acct_fn = lambda: get_account_summary(ib, data, contract)
-                                    close_all_fn(reason, ib, contract, positions, data, 
-                                                 live_tracker, send_email_fn, strategy=strategy, account_fn=acct_fn)
+                                    close_all_fn(
+                                        reason, ib, contract, positions, data,
+                                        live_tracker, send_email_fn, strategy=strategy,
+                                        account_fn=acct_fn, completed_trades=completed_trades,
+                                    )
                 except Exception as e:
                     logging.error(f"Error checking maintenance in periodic loop: {e}")
 

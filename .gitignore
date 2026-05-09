@@ -78,6 +78,9 @@ Backtrader/data/
 .DS_Store
 Thumbs.db
 
+# LibreOffice lock files
+**/.~lock.*
+
 
 
 

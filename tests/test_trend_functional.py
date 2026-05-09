@@ -495,6 +495,65 @@ class TestTakeProfit:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# §4C2  Take Profit trigger (close vs wick on HTF / limit parity)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTakeProfitUsesCloseNotWick:
+    """Long TP is limit-style: require close >= TP, not merely high >= TP."""
+
+    def test_long_tp_wick_only_does_not_exit(self):
+        strategy = make_strategy(
+            **{
+                "Initial Stop Loss (%)": 99.0,
+                "Take Profit ATR Multiplier": 1.0,
+                "Buy Lookback": 3,
+                "Sell Lookback": 3,
+            }
+        )
+        ts = pd.Timestamp("2025-06-01 10:00")
+        row_setup = pd.Series(
+            {
+                "high": 100.0,
+                "low": 99.0,
+                "close": 99.5,
+                "donchian_low": 80.0,
+                "donchian_high": 120.0,
+                "atr": 5.0,
+            },
+            name=ts,
+        )
+        position = strategy.setup_position(100.0, 1, row_setup, None)
+        assert position["tp"] is not None and abs(position["tp"] - 105.0) < 1e-6
+
+        wick_row = pd.Series(
+            {
+                "high": 107.0,
+                "low": 104.0,
+                "close": 104.0,
+                "donchian_low": 80.0,
+                "donchian_high": 120.0,
+            },
+            name=ts + pd.Timedelta(minutes=1),
+        )
+        should_exit, reason, _ = strategy.check_exit(position, wick_row, None)
+        assert not should_exit, f"Wick above TP without close through should not exit; got {reason}"
+
+        through_row = pd.Series(
+            {
+                "high": 106.0,
+                "low": 104.5,
+                "close": 105.25,
+                "donchian_low": 80.0,
+                "donchian_high": 120.0,
+            },
+            name=ts + pd.Timedelta(minutes=2),
+        )
+        should_exit, reason, price = strategy.check_exit(position, through_row, None)
+        assert should_exit and reason == "Take Profit"
+        assert abs(float(price) - 105.0) < 1e-6
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # §4D  Channel Exit
 # ═══════════════════════════════════════════════════════════════════════════
 

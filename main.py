@@ -252,6 +252,71 @@ def _trade_overlay_from_open_brackets(open_brackets):
     return out or None
 
 
+def _active_trade_stop_tp_series(open_brackets, output_dir: str, max_points: int = 1200):
+    """
+    Load per-bar stop/TP history for the first active bracket from open_trade_timeline.jsonl.
+    """
+    if not open_brackets or not output_dir:
+        return None
+    b = open_brackets[0]
+    entry_time = b.get("entry_time")
+    direction = b.get("direction", 0)
+    if entry_time is None:
+        return None
+
+    timeline_path = os.path.join(output_dir, "open_trade_timeline.jsonl")
+    if not os.path.exists(timeline_path):
+        return None
+
+    target_dir = "LONG" if direction == 1 else "SHORT" if direction == -1 else None
+    target_entry = entry_time.isoformat() if hasattr(entry_time, "isoformat") else str(entry_time)
+
+    rows = []
+    try:
+        with open(timeline_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                rec_entry = rec.get("entry_time")
+                if not rec_entry or str(rec_entry) != target_entry:
+                    continue
+                if target_dir and str(rec.get("direction", "")).upper() != target_dir:
+                    continue
+                rows.append(rec)
+    except Exception:
+        return None
+
+    if not rows:
+        return None
+
+    rows = rows[-max_points:]
+    times, stop_vals, tp_vals = [], [], []
+    for rec in rows:
+        ts = rec.get("ts")
+        if not ts:
+            continue
+        times.append(str(ts))
+        try:
+            stop_vals.append(float(rec.get("stop")) if rec.get("stop") is not None else None)
+        except (TypeError, ValueError):
+            stop_vals.append(None)
+        try:
+            tp_vals.append(float(rec.get("tp")) if rec.get("tp") is not None else None)
+        except (TypeError, ValueError):
+            tp_vals.append(None)
+
+    if not times:
+        return None
+    return {"times": times, "stop": stop_vals, "tp": tp_vals}
+
+
 def _portfolio_row_for_dashboard(p, current_price: float, multiplier: float = 50.0) -> dict:
     """Normalize IB PortfolioItem for the dashboard (futures avg cost → price in points)."""
     sym = getattr(p.contract, 'symbol', '') or ''
@@ -471,6 +536,110 @@ def backfill_completed_trades_from_live_csv(csv_path: str, max_keep: int = 1000,
     return trades[-max_keep:]
 
 
+def _completed_trade_quality_score(tr: dict) -> int:
+    """Prefer real execution records over log/CSV backfills when collapsing duplicates."""
+    score = 0
+    if tr.get("entry_time") is not None:
+        score += 4
+    if tr.get("entry_price") not in (None, 0, 0.0):
+        score += 3
+    if tr.get("report_url"):
+        score += 2
+    if tr.get("stop_at_close") is not None:
+        score += 1
+    if tr.get("tp_at_close") is not None:
+        score += 1
+    if tr.get("params_snapshot"):
+        score += 3
+    reason = str(tr.get("reason") or "")
+    if "Backfilled" in reason:
+        score -= 3
+    return score
+
+
+def _normalize_trade_ts(val):
+    if val is None:
+        return None
+    try:
+        ts = pd.Timestamp(val)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("US/Eastern").tz_localize(None)
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _direction_compatible(a: str, b: str) -> bool:
+    da = str(a or "").strip().upper()
+    db = str(b or "").strip().upper()
+    if not da or da == "N/A" or not db or db == "N/A":
+        return True
+    return da == db
+
+
+def _same_fill_event(a: dict, b: dict, window_sec: float = 120.0) -> bool:
+    """
+    True when two completed_trade rows likely describe the same broker fill.
+    Log lines use second resolution; CSV and live paths use different timestamps
+    a few seconds apart for the same exit.
+    """
+    ea = _normalize_trade_ts(a.get("exit_time"))
+    eb = _normalize_trade_ts(b.get("exit_time"))
+    if ea is None or eb is None:
+        return False
+    if abs((ea - eb).total_seconds()) > window_sec:
+        return False
+    try:
+        pa = round(float(a.get("exit_price")), 2)
+        pb = round(float(b.get("exit_price")), 2)
+    except (TypeError, ValueError):
+        return False
+    if pa != pb:
+        return False
+    if not _direction_compatible(a.get("direction"), b.get("direction")):
+        return False
+    eta = _normalize_trade_ts(a.get("entry_time"))
+    etb = _normalize_trade_ts(b.get("entry_time"))
+    if eta is not None and etb is not None:
+        if abs((eta - etb).total_seconds()) > 1800:
+            return False
+    return True
+
+
+def dedupe_completed_trades_near_fills(trades: list, window_sec: float = 120.0, max_keep: int = 1000) -> list:
+    """Collapse near-duplicate rows from CSV + log backfill + live close for the same exit."""
+    if not trades:
+        return []
+    items = list(trades)
+    n = len(items)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _same_fill_event(items[i], items[j], window_sec):
+                union(i, j)
+
+    groups: dict = {}
+    for i in range(n):
+        r = find(i)
+        groups.setdefault(r, []).append(items[i])
+
+    out = [max(grp, key=_completed_trade_quality_score) for grp in groups.values()]
+    out.sort(key=lambda x: _normalize_trade_ts(x.get("exit_time")) or datetime.min)
+    return out[-max_keep:]
+
+
 def bootstrap_completed_trades(log_path: str, csv_path: str, max_keep: int = 1000) -> list:
     """Merge log-derived closes with execution-csv reconstructed closes."""
     log_trades = backfill_completed_trades_from_log(log_path, max_keep=max_keep * 2)
@@ -494,25 +663,12 @@ def bootstrap_completed_trades(log_path: str, csv_path: str, max_keep: int = 100
         merged.append(t)
 
     merged.sort(key=lambda x: x.get("exit_time") or datetime.min)
-    return merged[-max_keep:]
+    merged = dedupe_completed_trades_near_fills(merged, window_sec=120, max_keep=max_keep)
+    return merged
 
 
 def merge_completed_trade_lists(primary: list, secondary: list, max_keep: int = 1000) -> list:
     """Deduplicate and merge two completed trade lists, preferring richer records."""
-
-    def _quality_score(tr: dict) -> int:
-        score = 0
-        if tr.get("entry_time") is not None:
-            score += 4
-        if tr.get("entry_price") not in (None, 0, 0.0):
-            score += 3
-        if tr.get("report_url"):
-            score += 2
-        if tr.get("stop_at_close") is not None:
-            score += 1
-        if tr.get("tp_at_close") is not None:
-            score += 1
-        return score
 
     by_key = {}
     for t in (primary or []) + (secondary or []):
@@ -524,11 +680,11 @@ def merge_completed_trade_lists(primary: list, secondary: list, max_keep: int = 
             round(float(ep), 6) if ep is not None else None,
         )
         existing = by_key.get(key)
-        if existing is None or _quality_score(t) > _quality_score(existing):
+        if existing is None or _completed_trade_quality_score(t) > _completed_trade_quality_score(existing):
             by_key[key] = t
     merged = list(by_key.values())
-    merged.sort(key=lambda x: x.get("exit_time") or datetime.min)
-    return merged[-max_keep:]
+    merged = dedupe_completed_trades_near_fills(merged, window_sec=120, max_keep=max_keep)
+    return merged
 
 
 def persist_completed_trades(path: str, trades: list, max_keep: int = 1000) -> None:
@@ -730,6 +886,10 @@ async def update_ui_periodically():
                     data_ref['data'], max_bars=480, timeframe_mins=_chart_tf,
                     completed_trades=completed_trades, params=dashboard_state.params
                 )
+                if dashboard_state.chart_payload:
+                    tp_sl_series = _active_trade_stop_tp_series(positions, args.output_dir)
+                    if tp_sl_series:
+                        dashboard_state.chart_payload['active_trade_lines'] = tp_sl_series
                 dashboard_state.trade_overlay = _trade_overlay_from_open_brackets(positions)
                 ensure_completed_trade_reports(completed_trades, strategy, data_ref['data'])
                 maybe_persist_completed_trades(COMPLETED_TRADES_PATH, completed_trades)
