@@ -1,15 +1,122 @@
 import pandas as pd
 import sys
 import os
-from datetime import datetime
+import argparse
+from datetime import datetime, time, timedelta
 import numpy as np
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest import run_backtest
-from strategies.trend.strategy import TrendStrategy
+from strategies.factory import StrategyFactory
 from plot_comparison import generate_comparison_charts
+
+
+def _parse_hhmm_policy(s) -> time:
+    """Parse maintenance/RTH time strings (24h HH:MM, HH:MM:SS, or 12h with AM/PM)."""
+    s = str(s).strip() if s is not None else ""
+    if not s:
+        return time(17, 30)
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return pd.to_datetime(s, format=fmt).time()
+        except ValueError:
+            continue
+    return pd.to_datetime(s).time()
+
+
+def _et_session_pad_end_time(strategy) -> time:
+    """
+    Eastern wall-clock time through which HTF rows should exist so a backtest can
+    evaluate RTH buffer exits and daily maintenance buffer exits (same calendar day).
+    Uses maintenance end + post buffer, floored at 18:00 ET for ETH tails present in logs.
+    """
+    base_date = datetime(2000, 1, 1).date()
+    me = _parse_hhmm_policy(getattr(strategy, "daily_maintenance_end_str", "17:30"))
+    end_dt = pd.Timestamp.combine(base_date, me)
+    with_post_buf = end_dt + timedelta(minutes=int(strategy.maintenance_buffer_minutes))
+    floor_eth = datetime.strptime("18:00", "%H:%M").time()
+    return max(with_post_buf.time(), floor_eth)
+
+
+def pad_htf_for_session_force_exits(
+    df_ohlcv: pd.DataFrame,
+    strategy,
+    restrict_dates=None,
+):
+    """
+    Insert synthetic HTF rows where live_data.csv has intra-day gaps or stops short of
+    session end. Without this, missing bars skip entire RTH buffer / maintenance buffer
+    windows (e.g. no row between 15:16 and 18:22 means no force_exit_rth evaluation).
+    Synthetic rows reuse the prior bar's OHLC, volume 0.
+
+    If ``restrict_dates`` is a set of ``datetime.date``, only calendar days in that set
+    are padded (recommended: analysis window only so full-history equity is not distorted).
+    If None, every day in the CSV may receive gap/tail padding (heavy).
+    """
+    if df_ohlcv.empty:
+        return df_ohlcv
+    tf = max(1, int(getattr(strategy, "timeframe", 1) or 1))
+    pad_end_time = _et_session_pad_end_time(strategy)
+    df = df_ohlcv.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    orig_len = len(df)
+    step = pd.Timedelta(minutes=tf)
+    gap_threshold = step * 1.5
+    existing = set(df.index)
+
+    def synth_from(base: pd.Series) -> pd.Series:
+        p = base.copy()
+        p["volume"] = 0.0
+        return p
+
+    inserts = []
+
+    idx_list = list(df.index)
+    for i in range(len(idx_list) - 1):
+        a, b = idx_list[i], idx_list[i + 1]
+        if a.date() != b.date():
+            continue
+        if restrict_dates is not None and a.date() not in restrict_dates:
+            continue
+        if (b - a) <= gap_threshold:
+            continue
+        base = df.loc[a]
+        t = a + step
+        while t < b:
+            if t not in existing:
+                inserts.append((t, synth_from(base)))
+                existing.add(t)
+            t = t + step
+
+    for day in sorted(set(df.index.date)):
+        if restrict_dates is not None and day not in restrict_dates:
+            continue
+        sub = df[df.index.date == day]
+        last_ts = sub.index[-1]
+        last_row = sub.iloc[-1]
+        target_close = pd.Timestamp.combine(pd.Timestamp(day).date(), pad_end_time)
+        if last_ts >= target_close:
+            continue
+        t = last_ts + step
+        while t <= target_close:
+            if t not in existing:
+                inserts.append((t, synth_from(last_row)))
+                existing.add(t)
+            t = t + step
+
+    if not inserts:
+        return df
+
+    extra = pd.DataFrame([r for _, r in inserts], index=[ts for ts, _ in inserts])
+    out = pd.concat([df, extra]).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    print(
+        f"  Padded {len(out) - orig_len} synthetic HTF rows ({tf}m) through {pad_end_time} ET "
+        f"(intra-day gaps + session tail) for force-exit parity."
+    )
+    return out
 
 def parse_live_trades_csv(csv_path, analysis_start=None, analysis_end=None):
     if not os.path.exists(csv_path):
@@ -142,14 +249,54 @@ def load_trend_params(params_path):
     return params
 
 def main():
-    data_path = r'c:\Trading\paper_logs\live_data.csv'
-    live_trades_path = r'c:\Trading\paper_logs\live_trades.csv'
-    params_path = r'c:\Trading\strategies\trend\parameters\trend_strategy_params_testing_ultra_high.csv'
-    
-    analysis_start = pd.Timestamp("2026-03-31 12:00:00")
-    analysis_end = pd.Timestamp("2026-03-31 16:00:00")
+    parser = argparse.ArgumentParser(
+        description="Compare Trend paper trades (live_trades.csv) to run_backtest on live_data.csv."
+    )
+    parser.add_argument(
+        "--data",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_logs", "live_data.csv"),
+        help="OHLCV source (default: paper_logs/live_data.csv)",
+    )
+    parser.add_argument(
+        "--live-trades",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_logs", "live_trades.csv"),
+        help="IB execution log (default: paper_logs/live_trades.csv)",
+    )
+    parser.add_argument(
+        "--params",
+        default=os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "strategies",
+            "trend",
+            "parameters",
+            "trend_strategy_params.csv",
+        ),
+        help="Trend params CSV (default: production trend_strategy_params.csv)",
+    )
+    parser.add_argument(
+        "--analysis-start",
+        default="2026-03-31 12:00:00",
+        help="Inclusive start of trade comparison window (pandas-parsable)",
+    )
+    parser.add_argument(
+        "--analysis-end",
+        default="2026-03-31 16:00:00",
+        help="Inclusive end of trade comparison window (pandas-parsable)",
+    )
+    parser.add_argument(
+        "--results-csv",
+        default="final_comparison_results.csv",
+        help="Where to write the match table (default: final_comparison_results.csv)",
+    )
+    args = parser.parse_args()
 
-    print(f"--- Running Comparison for Trend Strategy (Analysis Window: {analysis_start.date()} to {analysis_end.date()}) ---")
+    data_path = args.data
+    live_trades_path = args.live_trades
+    params_path = args.params
+    analysis_start = pd.Timestamp(args.analysis_start)
+    analysis_end = pd.Timestamp(args.analysis_end)
+
+    print(f"--- Running Comparison for Trend Strategy (Analysis Window: {analysis_start} to {analysis_end}) ---")
 
     # 1. Parse Live Trades
     live_trades = parse_live_trades_csv(live_trades_path, analysis_start=analysis_start, analysis_end=analysis_end)
@@ -193,14 +340,23 @@ def main():
     
     # Drop any rows with NaN in OHLCV
     df_data = df_data.dropna(subset=ohlcv_cols)
-        
+
+    params_dict = load_trend_params(params_path)
+    print(f"Loaded {len(params_dict)} parameters for Trend strategy.")
+    strategy_inst = StrategyFactory.get_strategy("trend", params_dict)
+    pad_dates = {
+        d.date()
+        for d in pd.date_range(
+            analysis_start.normalize(), analysis_end.normalize(), freq="D"
+        )
+    }
+    df_data = pad_htf_for_session_force_exits(
+        df_data, strategy_inst, restrict_dates=pad_dates
+    )
+
     temp_data_path = r'c:\Trading\temp_trend_bt_data.csv'
     df_data.to_csv(temp_data_path)
     print(f"Saved {len(df_data)} rows to {temp_data_path} (OHLCV only, full history for warmup)")
-
-    # 3. Load Parameters
-    params_dict = load_trend_params(params_path)
-    print(f"Loaded {len(params_dict)} parameters for Trend strategy.")
 
     # 4. Run Backtest using unified backtest.py
     print(f"Running backtest...")
@@ -223,7 +379,19 @@ def main():
             'pnl_currency': 'bt_pnl',
             'reason': 'bt_reason'
         })
-        print(f"Backtest completed with {len(bt_trades)} trades in window.")
+        bt_trades['bt_entry_time'] = pd.to_datetime(bt_trades['bt_entry_time'])
+        if bt_trades['bt_entry_time'].dt.tz is not None:
+            bt_trades['bt_entry_time'] = bt_trades['bt_entry_time'].dt.tz_convert('US/Eastern').dt.tz_localize(None)
+        bt_trades['bt_exit_time'] = pd.to_datetime(bt_trades['bt_exit_time'])
+        if bt_trades['bt_exit_time'].dt.tz is not None:
+            bt_trades['bt_exit_time'] = bt_trades['bt_exit_time'].dt.tz_convert('US/Eastern').dt.tz_localize(None)
+        n_all = len(bt_trades)
+        win = (bt_trades['bt_entry_time'] >= analysis_start) & (bt_trades['bt_entry_time'] <= analysis_end)
+        bt_trades = bt_trades.loc[win].reset_index(drop=True)
+        print(
+            f"Backtest completed with {n_all} trades on full series (warmup preserved); "
+            f"{len(bt_trades)} entries fall in analysis window."
+        )
     else:
         print("Backtest produced 0 trades.")
 
@@ -352,19 +520,20 @@ def main():
         ]
         
         print("\n" + "="*95)
-        print("MATCHED COMPARISON (TREND STRATEGY - MARCH 2026)")
+        print("MATCHED COMPARISON (TREND STRATEGY)")
         print("="*95)
         print(matches_df[cols].to_string())
         
         summary = matches_df['Status'].value_counts()
-        matches_df.to_csv('final_comparison_results.csv', index=False)
+        matches_df.to_csv(args.results_csv, index=False)
         print("\nSummary:")
         print(summary)
+        print(f"\nWrote: {args.results_csv}")
         
         # 6. Generate interactive dashboard
         try:
             print("\nGenerating interactive comparison dashboard overlays...")
-            generate_comparison_charts("final_comparison_results.csv", "web/comparison_charts")
+            generate_comparison_charts(args.results_csv, "web/comparison_charts", data_path=data_path, params_path=args.params)
         except Exception as e:
             print(f"Failed to generate dashboard: {e}")
     else:

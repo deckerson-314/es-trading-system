@@ -12,11 +12,17 @@ description: How to handle agent handoff for the ES Trading System project
    ```
    This file contains the current system state, recent changes, known issues, and next steps.
 
-2. **Check if the trading bot is currently running:**
+2. **Read GA context status when working on optimization:**
+   ```
+   c:\Trading\GA_PARAMETER_CONTEXT_PLAN.md
+   ```
+   This file tracks the context-aware GA parameter implementation, A/B evidence, and merge policy.
+
+3. **Check if the trading bot is currently running:**
    - Ask the user or check for running Python processes
    - Any code changes to `core/`, `main.py`, `strategies/` require a bot restart
 
-3. **Review the architecture section** to understand the modular structure before making changes.
+4. **Review the architecture section** to understand the modular structure before making changes.
 
 ## At the End of Every Conversation
 
@@ -25,6 +31,7 @@ description: How to handle agent handoff for the ES Trading System project
    - Any new known issues
    - What the next agent should prioritize
    - Current bot running state
+   - Any GA context-aware parameter changes (conditional clusters, derivation helpers, interaction penalties)
 
 2. **Key sections to update:**
    - `Last Updated` timestamp

@@ -101,6 +101,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from plotly.io._utils import plotly_cdn_url
 import plotly.offline as pyo
 import plotly.offline as pyo
 import webbrowser
@@ -119,6 +120,65 @@ if sys.platform == 'win32':
 
 # Global flag for interrupt handling
 interrupt_flag = multiprocessing.Event()
+
+# Extra logbook columns for population min/max/std (convergence bands). Old checkpoints: header extended on load.
+GA_LOGBOOK_POP_STAT_KEYS = (
+    'pop_min_sortino', 'pop_std_sortino', 'pop_max_dd_norm', 'pop_std_dd',
+    'pop_min_pf', 'pop_std_pf', 'pop_min_trades_day', 'pop_std_trades_day',
+    'pop_avg_trades_day', 'pop_max_total_profit', 'pop_min_total_profit', 'pop_std_total_profit',
+    'pop_max_profit_per_trade', 'pop_min_profit_per_trade', 'pop_std_profit_per_trade',
+    'pop_avg_profit_per_trade',
+)
+GA_LOGBOOK_BASE_KEYS = (
+    'gen', 'evals', 'avg_sortino', 'avg_dd', 'avg_pf', 'pareto_size',
+    'avg_trades_day', 'max_trades_day', 'avg_total_profit', 'avg_profit_per_trade',
+    'actual_dd_best', 'actual_sortino_best', 'actual_pf_best', 'actual_pnl_best',
+)
+# Per-generation max of pre-cap ratio (metric / NORM_* divisor); can exceed 1.0; viz-only for logbook/dashboard.
+GA_LOGBOOK_UC_KEYS = (
+    'max_uc_sortino', 'max_uc_dd', 'max_uc_pf', 'max_uc_trades', 'max_uc_pnl', 'max_uc_ppt',
+)
+GA_LOGBOOK_HEADER_FULL = GA_LOGBOOK_BASE_KEYS + GA_LOGBOOK_UC_KEYS + GA_LOGBOOK_POP_STAT_KEYS
+
+
+def extend_logbook_header_for_pop_stats(logbook):
+    """Append population band columns; old log chapters return None for those keys in select()."""
+    if logbook is None or not logbook.header:
+        return
+    h = tuple(logbook.header)
+    extra = tuple(k for k in GA_LOGBOOK_UC_KEYS + GA_LOGBOOK_POP_STAT_KEYS if k not in h)
+    if extra:
+        logbook.header = h + extra
+
+
+def _inject_max_uc_from_offspring(record, offspring):
+    """Max pre-cap ratio per objective among individuals evaluated this generation (does not affect selection)."""
+    names = (
+        'max_uc_sortino', 'max_uc_dd', 'max_uc_pf', 'max_uc_trades', 'max_uc_pnl', 'max_uc_ppt',
+    )
+    for idx, key in enumerate(names):
+        vals = []
+        for ind in offspring or []:
+            uc = getattr(ind, 'uncapped_ratios', None)
+            if uc is None or len(uc) <= idx:
+                continue
+            try:
+                v = float(uc[idx])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v):
+                vals.append(v)
+        record[key] = float(np.max(vals)) if vals else None
+
+
+def _parallel_eval_result_to_fit_unc(item):
+    """Unpack (fit6, unc6) from parallel map; tolerate legacy 6-tuples."""
+    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], tuple) and len(item[0]) == 6:
+        return item[0], item[1]
+    if isinstance(item, (list, tuple)) and len(item) == 6:
+        return tuple(float(x) for x in item), (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return (-1000.0, 100000.0, 0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
 
 def signal_handler(signum, frame):
     print("\n\n(!)  Interrupt signal received. Will save checkpoint after current generation completes...")
@@ -320,9 +380,73 @@ param_keys = []
 # ----------------------------------------------------------------------
 # Back-tester using shared strategy module
 # ----------------------------------------------------------------------
+def _trade_duration_minutes_bar_aligned(trades_df, bar_minutes):
+    """
+    Per-trade holding span in minutes on the **bar grid** (inclusive), minimum one bar.
+
+    The simulator stamps ``entry_time`` at bar open and often ``exit_time`` a few seconds
+    into the same bar (end-of-bar convention). A raw datetime delta then looks like
+    sub-minute / sub-bar holds even when the trade was exposed for a full candle — which
+    misleads GA vs paper/live comparisons. We floor both timestamps to ``bar_minutes`` buckets,
+    count inclusive bars, and multiply by ``bar_minutes``.
+    """
+    if trades_df is None or trades_df.empty:
+        return pd.Series(dtype=float)
+    if 'entry_time' not in trades_df.columns or 'exit_time' not in trades_df.columns:
+        return pd.Series(dtype=float)
+    M = max(float(bar_minutes), 1.0)
+    try:
+        st = pd.to_datetime(trades_df['entry_time'])
+        et = pd.to_datetime(trades_df['exit_time'])
+        rule = f'{int(M)}min'
+        entry_bar = st.dt.floor(rule)
+        exit_bar = et.dt.floor(rule)
+        delta_min = (exit_bar - entry_bar).dt.total_seconds() / 60.0
+        delta_min = delta_min.fillna(0.0)
+        n_bars = (delta_min / M) + 1.0
+        n_bars = n_bars.clip(lower=1.0)
+        dur = n_bars * M
+        return dur.astype(float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _mean_trade_duration_minutes(trades_df, bar_minutes=None):
+    """Mean holding time in minutes; uses bar-aligned minutes when ``bar_minutes`` is set."""
+    if trades_df is None or trades_df.empty:
+        return 0.0
+    if 'entry_time' not in trades_df.columns or 'exit_time' not in trades_df.columns:
+        return 0.0
+    try:
+        if bar_minutes is not None and float(bar_minutes) > 0:
+            s = _trade_duration_minutes_bar_aligned(trades_df, float(bar_minutes))
+            if s is None or len(s) == 0:
+                return 0.0
+            v = float(s.mean())
+        else:
+            dur = (
+                pd.to_datetime(trades_df['exit_time']) - pd.to_datetime(trades_df['entry_time'])
+            ).dt.total_seconds() / 60.0
+            v = float(dur.mean())
+        if np.isnan(v) or np.isinf(v):
+            return 0.0
+        return max(0.0, v)
+    except Exception:
+        return 0.0
+
+
 def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=False, mask=None):
-    default_result = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0,
-                     'trades_df': pd.DataFrame(), 'monthly_profit_stats': {'max_monthly_profit': 0, 'min_monthly_profit': 0, 'avg_monthly_profit': 0}}
+    default_result = {
+        'sortino': 0,
+        'max_drawdown': 0,
+        'avg_trades_day': 0,
+        'profit_factor': 0,
+        'total_profit': 0,
+        'avg_profit_per_trade': 0.0,
+        'avg_trade_duration_min': 0.0,
+        'trades_df': pd.DataFrame(),
+        'monthly_profit_stats': {'max_monthly_profit': 0, 'min_monthly_profit': 0, 'avg_monthly_profit': 0},
+    }
     
     if len(df_in) == 0:
         return default_result.copy()
@@ -536,6 +660,8 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
          total_days = 1
 
     avg_trades_day = len(trades) / total_days
+    tf_m = float(max(1, int(getattr(strategy, 'timeframe', 1) or 1)))
+    avg_trade_duration_min = _mean_trade_duration_minutes(trades_df, bar_minutes=tf_m)
     
     # Monthly stats
     monthly_stats = {'max_monthly_profit': 0, 'min_monthly_profit': 0, 'avg_monthly_profit': 0}
@@ -559,6 +685,7 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
         'profit_factor': profit_factor,
         'total_profit': total_profit,
         'avg_profit_per_trade': total_profit / len(trades) if len(trades) > 0 else 0.0,
+        'avg_trade_duration_min': avg_trade_duration_min,
         'trades_df': trades_df,
         'monthly_profit_stats': monthly_stats
     }
@@ -799,11 +926,12 @@ def core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local=
         excess_wr = (win_rate - max_win_rate_cap) / (1.0 - max_win_rate_cap) if max_win_rate_cap < 1.0 else 1.0
         penalty_factor *= (1.0 - excess_wr * 0.3)
     
-    # Min Trade Duration Penalty
+    # Min Trade Duration Penalty (bar-aligned minutes, same definition as avg_trade_duration_min)
     min_trade_duration = param_dict_local.get('MIN_TRADE_DURATION', {'value': 2.0})['value']
+    _tf_pen = float(max(1, int(round(params.get('Timeframe (minutes)', 1)))))
     if not trades_df.empty and 'entry_time' in trades_df.columns and 'exit_time' in trades_df.columns:
-        durations = (trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds() / 60
-        avg_duration = durations.mean()
+        durations = _trade_duration_minutes_bar_aligned(trades_df, _tf_pen)
+        avg_duration = float(durations.mean()) if len(durations) else 0.0
         if avg_duration < min_trade_duration:
             penalty = (min_trade_duration - avg_duration) / min_trade_duration if min_trade_duration > 0 else 0
             penalty_factor *= (1.0 - penalty * 0.2)
@@ -857,13 +985,40 @@ def core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local=
     NORM_PPT_MAX = param_dict_local.get('NORM_PROFIT_TRADE_MAX', {'value': 250.0})['value']
     
     avg_profit_per_trade = total_pnl / len(trades_df) if not trades_df.empty else 0.0
-    
-    normalized_sortino = min(sortino / SORTINO_MAX, 1.0)
+
+    # Pre-cap ratios (same numerators as fitness normalization; no min(...,1) — can exceed 1.0 for dashboard only)
+    try:
+        uc_sortino = float(sortino) / float(SORTINO_MAX) if SORTINO_MAX else 0.0
+    except (TypeError, ZeroDivisionError, ValueError):
+        uc_sortino = 0.0
+    try:
+        uc_dd = float(max_dd) / float(DD_MAX) if DD_MAX else 0.0
+    except (TypeError, ZeroDivisionError, ValueError):
+        uc_dd = 0.0
+    try:
+        uc_pf = float(pf) / float(PF_MAX) if PF_MAX else 0.0
+    except (TypeError, ZeroDivisionError, ValueError):
+        uc_pf = 0.0
+    try:
+        uc_trades = float(avg_trades_day) / float(TRADES_MAX) if TRADES_MAX else 0.0
+    except (TypeError, ZeroDivisionError, ValueError):
+        uc_trades = 0.0
+    try:
+        uc_pnl = float(total_pnl) / float(PNL_MAX) if PNL_MAX else 0.0
+    except (TypeError, ZeroDivisionError, ValueError):
+        uc_pnl = 0.0
+    try:
+        uc_ppt = float(avg_profit_per_trade) / float(NORM_PPT_MAX) if NORM_PPT_MAX else 0.0
+    except (TypeError, ZeroDivisionError, ValueError):
+        uc_ppt = 0.0
+    uncapped_ratios = (uc_sortino, uc_dd, uc_pf, uc_trades, uc_pnl, uc_ppt)
+
+    normalized_sortino = min(uc_sortino, 1.0)
     normalized_dd = max_dd / DD_MAX
-    normalized_pf = min(pf / PF_MAX, 1.0)
-    normalized_trades = min(avg_trades_day / TRADES_MAX, 1.0)
-    normalized_pnl = min(total_pnl / PNL_MAX, 1.0)
-    normalized_ppt = min(avg_profit_per_trade / NORM_PPT_MAX, 1.0)
+    normalized_pf = min(uc_pf, 1.0)
+    normalized_trades = min(uc_trades, 1.0)
+    normalized_pnl = min(uc_pnl, 1.0)
+    normalized_ppt = min(uc_ppt, 1.0)
     
     # Apply Low Trade Penalty (Subtractive)
     normalized_sortino -= low_trade_penalty
@@ -883,8 +1038,15 @@ def core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local=
         normalized_ppt -= penalty_hit
         normalized_dd += penalty_hit
 
-    return (float(normalized_sortino), float(normalized_dd), float(normalized_pf), 
-            float(normalized_trades), float(normalized_pnl), float(normalized_ppt))
+    fit = (
+        float(normalized_sortino),
+        float(normalized_dd),
+        float(normalized_pf),
+        float(normalized_trades),
+        float(normalized_pnl),
+        float(normalized_ppt),
+    )
+    return fit, uncapped_ratios
 
 def evaluate_multi_objective(ind_and_data):
     global param_keys, param_dict
@@ -893,7 +1055,16 @@ def evaluate_multi_objective(ind_and_data):
     else:
         ind, df = ind_and_data
         mask = None
-    return core_evaluate(ind, df, param_dict, param_keys, mask)
+    out = core_evaluate(ind, df, param_dict, param_keys, mask)
+    if isinstance(out, tuple) and len(out) == 2:
+        fit, unc = out
+    else:
+        fit, unc = out, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    try:
+        setattr(ind, 'uncapped_ratios', unc)
+    except Exception:
+        pass
+    return fit
 
 # Setup toolbox
 toolbox = base.Toolbox()
@@ -935,8 +1106,9 @@ def _evaluate_worker(ind):
     
     # Check for legacy mode (WinError 1450 handled via proper init_worker now)
     if df_local is None:
-        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        
+        bad = (-1000.0, 100000.0, 0.0, 0.0, 0.0, 0.0)
+        return bad, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
     return core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local)
 
 def parallel_evaluate(individuals, df, param_dict_local, param_keys_local, pool=None):
@@ -1835,58 +2007,21 @@ def merge_solution_params_with_template(clamped_params, param_dict, param_df):
 def extract_chart_html(html_snippet):
     if not html_snippet or len(html_snippet) == 0:
         return "", ""
-    
-    # Find the inner chart div with id attribute (the actual chart container)
-    chart_div_start = html_snippet.find('<div id=')
-    if chart_div_start == -1:
-        # Fallback: find any div
-        chart_div_start = html_snippet.find('<div')
-    if chart_div_start == -1:
-        return "", ""
-    
-    # Find the closing tag for the chart div
-    chart_div_end = html_snippet.find('>', chart_div_start)
-    if chart_div_end == -1:
-        return "", ""
-    
-    # Check if it's self-closing
-    if html_snippet[chart_div_end-1] == '/':
-        # Self-closing: <div ... />
-        div_part = html_snippet[chart_div_start:chart_div_end + 1]
-    else:
-        # Regular div: find matching closing tag
-        div_end_pos = chart_div_start
-        depth = 0
-        i = chart_div_start
-        while i < len(html_snippet):
-            if html_snippet[i:i+4] == '<div':
-                tag_end = html_snippet.find('>', i)
-                if tag_end != -1:
-                    if html_snippet[tag_end-1] != '/':
-                        depth += 1
-                    i = tag_end + 1
-                else:
-                    i += 1
-            elif html_snippet[i:i+6] == '</div>':
-                depth -= 1
-                if depth == 0:
-                    div_end_pos = i + 6
-                    break
-                i += 6
-            else:
-                i += 1
-        div_part = html_snippet[chart_div_start:div_end_pos] if div_end_pos > chart_div_start else ""
-    
-    # Extract script separately
-    script_start = html_snippet.find('<script')
+    # Plotly full_html=False: <div>…<div id="…"></div>  <script>…</script>  </div>
+    # The closing </div> must stay with the div block; otherwise the outer <div>
+    # stays open and swallows following dashboard content (elite charts look blank).
+    script_start = html_snippet.find("<script")
     if script_start == -1:
-        return div_part, ""
-    
-    script_end = html_snippet.find('</script>', script_start)
+        return html_snippet.strip(), ""
+    div_part = html_snippet[:script_start].strip()
+    script_end = html_snippet.find("</script>", script_start)
     if script_end == -1:
         return div_part, ""
-    
-    script_part = html_snippet[script_start:script_end + 9]
+    script_part = html_snippet[script_start : script_end + 9]
+    remainder = html_snippet[script_end + 9 :].strip()
+    if remainder.startswith("</div>"):
+        close_end = remainder.find(">") + 1
+        div_part = (div_part + remainder[:close_end]).strip()
     return div_part, script_part
 
 # ----------------------------------------------------------------------
@@ -2183,14 +2318,289 @@ def _atomic_write_utf8(target_path: str, content: str) -> None:
         raise
 
 
+def _clamp(v, lo, hi):
+    if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+        return None
+    x = float(v)
+    if lo is not None:
+        x = max(lo, x)
+    if hi is not None:
+        x = min(hi, x)
+    return x
+
+
+def _mirror_missing_pop_bounds(avg, ymin, ymax, clamp_lo=None, clamp_hi=None):
+    """When checkpoint rows lack pop_min/pop_max columns, mirror spread around avg (viz-only estimate)."""
+    avg = list(avg)
+    ymin = list(ymin)
+    ymax = list(ymax)
+    n = min(len(avg), len(ymin), len(ymax))
+    has_lo = any(ymin[i] is not None for i in range(n))
+    has_hi = any(ymax[i] is not None for i in range(n))
+    if not has_lo and has_hi:
+        for i in range(n):
+            a, y = avg[i], ymax[i]
+            if a is not None and y is not None:
+                ymin[i] = _clamp(2.0 * float(a) - float(y), clamp_lo, clamp_hi)
+    elif has_lo and not has_hi:
+        for i in range(n):
+            a, lo = avg[i], ymin[i]
+            if a is not None and lo is not None:
+                ymax[i] = _clamp(2.0 * float(a) - float(lo), clamp_lo, clamp_hi)
+    return ymin, ymax
+
+
+def _synth_std_from_band_width(avg, ymin, ymax):
+    """Populate std when pop_std_* was never logged (checkpoint legacy rows)."""
+    std = []
+    for a, lo, hi in zip(avg, ymin, ymax):
+        if a is None or lo is None or hi is None:
+            std.append(None)
+            continue
+        w = max(abs(float(hi) - float(a)), abs(float(a) - float(lo)), 1e-12)
+        std.append(min(w, 10.0))  # cap so inner band does not dominate
+    return std
+
+
+def _add_population_envelope_traces(fig, gens, logbook, row, col, avg_key, min_key, max_key, std_key,
+                                    outer_rgba, inner_rgba, show_legend=False,
+                                    legend_outer='Pop min–max', legend_inner='Pop avg±0.5σ',
+                                    clamp_lo=None, clamp_hi=None, avg_fallback_key=None):
+    """Fill between pop min/max (light) and avg ± 0.5*std (darker).
+
+    Checkpoints saved before pop_* stats existed still have avg/max/min lines per generation;
+    header may list pop_* keys after resume but row dicts omit them — we mirror-estimate bounds.
+    """
+    hdr = tuple(logbook.header) if logbook.header else ()
+    if avg_key not in hdr or max_key not in hdr:
+        return
+    avg = list(logbook.select(avg_key))
+    if avg_fallback_key and avg_fallback_key in hdr and not any(v is not None for v in avg):
+        avg = list(logbook.select(avg_fallback_key))
+    ymin = list(logbook.select(min_key)) if min_key in hdr else [None] * len(avg)
+    ymax = list(logbook.select(max_key))
+    std = list(logbook.select(std_key)) if std_key in hdr else [None] * len(avg)
+
+    def _clean(seq, lo=None, hi=None):
+        out = []
+        for v in seq:
+            if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+                out.append(None)
+            elif isinstance(v, (int, float)):
+                fv = float(v)
+                if lo is not None and fv < lo:
+                    out.append(None)
+                elif hi is not None and fv > hi:
+                    out.append(None)
+                else:
+                    out.append(fv)
+            else:
+                out.append(None)
+        return out
+
+    avg = _clean(avg)
+    ymin = _clean(ymin)
+    ymax = _clean(ymax)
+    std = _clean(std, lo=0)
+    # Pad / trim to common length
+    m = min(len(gens), len(avg), len(ymin), len(ymax), len(std))
+    if m == 0:
+        return
+    gens = gens[:m]
+    avg, ymin, ymax, std = avg[:m], ymin[:m], ymax[:m], std[:m]
+
+    ymin, ymax = _mirror_missing_pop_bounds(avg, ymin, ymax, clamp_lo=clamp_lo, clamp_hi=clamp_hi)
+    if not any(std[i] is not None and std[i] > 1e-15 for i in range(m)):
+        std = _synth_std_from_band_width(avg, ymin, ymax)
+
+    if not any(x is not None for x in avg):
+        return
+    if not any(ymin[i] is not None and ymax[i] is not None for i in range(m)):
+        return
+    upper, lower = [], []
+    for a, s in zip(avg, std):
+        if a is None:
+            upper.append(None)
+            lower.append(None)
+        else:
+            half = (s or 0.0) * 0.5
+            upper.append(a + half)
+            lower.append(a - half)
+    fig.add_trace(go.Scatter(
+        x=gens, y=ymax, mode='lines', line=dict(width=0),
+        name=legend_outer, legendgroup=f'env{row}{col}', showlegend=False, hoverinfo='skip'),
+        row=row, col=col)
+    fig.add_trace(go.Scatter(
+        x=gens, y=ymin, mode='lines', line=dict(width=0), fill='tonexty',
+        fillcolor=outer_rgba, name=legend_outer, legendgroup=f'env{row}{col}',
+        showlegend=show_legend, hoverinfo='skip'),
+        row=row, col=col)
+    fig.add_trace(go.Scatter(
+        x=gens, y=upper, mode='lines', line=dict(width=0),
+        name=legend_inner, legendgroup=f'in{row}{col}', showlegend=False, hoverinfo='skip'),
+        row=row, col=col)
+    fig.add_trace(go.Scatter(
+        x=gens, y=lower, mode='lines', line=dict(width=0), fill='tonexty',
+        fillcolor=inner_rgba, name=legend_inner, legendgroup=f'in{row}{col}',
+        showlegend=show_legend, hoverinfo='skip'),
+        row=row, col=col)
+
+
+def generate_elite_parameter_insight_html(hof, param_keys, param_dict, max_individuals=400):
+    """
+    Boundary diagnostics + histograms + Sortino scatter for Hall of Fame elites.
+    Returns (info_html, hist_div, hist_script, scatter_div, scatter_script).
+    """
+    empty = ('', '', '', '', '')
+    if hof is None or len(hof) == 0:
+        return empty
+    inds = [ind for ind in list(hof)[:max_individuals] if getattr(ind, 'fitness', None) and ind.fitness.valid]
+    if not inds:
+        return empty
+    key_to_i = {k: i for i, k in enumerate(param_keys)}
+
+    def _numeric_param_bounds(name):
+        if name not in param_dict:
+            return None
+        meta = param_dict[name]
+        try:
+            mn = float(meta['min'])
+            mx = float(meta['max'])
+        except (TypeError, ValueError, KeyError):
+            return None
+        if mx <= mn:
+            return None
+        typ = str(meta.get('type', '')).lower()
+        return mn, mx, typ
+
+    table_rows = []
+    boundary_scores = []
+    # Per-parameter (x values, matching fitness Sortino for each x) — same length for scatter
+    param_series = {}
+
+    for pk in param_keys:
+        spec = _numeric_param_bounds(pk)
+        if spec is None:
+            continue
+        mn, mx, typ = spec
+        eps = max(1e-9, 0.01 * (mx - mn))
+        if typ == 'int':
+            eps = max(eps, 0.51)
+        vals = []
+        fit0 = []
+        ki = key_to_i.get(pk)
+        if ki is None:
+            continue
+        for ind in inds:
+            try:
+                vals.append(float(ind[ki]))
+                fit0.append(float(ind.fitness.values[0]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not vals:
+            continue
+        arr = np.array(vals, dtype=float)
+        param_series[pk] = (arr, np.array(fit0, dtype=float))
+        n = len(arr)
+        near_lo = np.sum(arr <= mn + eps) / n * 100.0
+        near_hi = np.sum(arr >= mx - eps) / n * 100.0
+        med = float(np.median(arr))
+        boundary_scores.append((pk, near_lo + near_hi, near_lo, near_hi, med, mn, mx, n))
+        flag = ''
+        if near_lo >= 35 or near_hi >= 35:
+            flag = ' (!) wall'
+        elif near_lo >= 20 or near_hi >= 20:
+            flag = ' (?) near bound'
+        table_rows.append((pk, mn, mx, med, near_lo, near_hi, flag))
+
+    table_rows.sort(key=lambda t: t[4] + t[5], reverse=True)
+
+    info_html = (
+        "<div class='info-section'><strong>How to read this:</strong> "
+        "<em>% near Min/Max</em> is the share of Hall of Fame solutions within 1% of the allowed range "
+        "(or 0.51 units for ints). High values suggest the GA is pressing a constraint — "
+        "expansion <em>might</em> help, or the bound may be economically correct. "
+        "This is not automatic advice.</div>"
+        "<table class='params-table'><thead><tr>"
+        "<th>Parameter</th><th>Min</th><th>Max</th><th>Elite median</th>"
+        "<th>% near Min</th><th>% near Max</th><th>Flag</th></tr></thead><tbody>"
+        + ''.join(
+            f'<tr><td>{pk}</td><td>{mn:g}</td><td>{mx:g}</td><td>{med:.5g}</td>'
+            f'<td>{near_lo:.1f}%</td><td>{near_hi:.1f}%</td><td>{flag}</td></tr>'
+            for pk, mn, mx, med, near_lo, near_hi, flag in table_rows
+        ) + "</tbody></table>"
+    )
+
+    boundary_scores.sort(key=lambda t: t[1], reverse=True)
+    top_params = [t[0] for t in boundary_scores[:18]]
+
+    if not top_params:
+        return info_html, '', '', '', ''
+
+    n_chart = len(top_params)
+    n_cols = 3
+    n_rows = (n_chart + n_cols - 1) // n_cols
+    _cells = n_rows * n_cols
+    _hist_titles = list(top_params) + [''] * max(0, _cells - n_chart)
+    fig_h = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=_hist_titles[:_cells], vertical_spacing=0.08, horizontal_spacing=0.06)
+    for i, pk in enumerate(top_params):
+        r = i // n_cols + 1
+        c = i % n_cols + 1
+        series = param_series.get(pk)
+        if series is None:
+            continue
+        arr, _fit0 = series
+        if arr is None or len(arr) == 0:
+            continue
+        fig_h.add_trace(go.Histogram(x=arr, nbinsx=min(30, max(8, int(np.sqrt(len(arr))))), name=pk, showlegend=False), row=r, col=c)
+    fig_h.update_layout(height=260 * n_rows, title_text='Elite parameter distributions (high boundary pressure)', showlegend=False)
+    hist_html = fig_h.to_html(include_plotlyjs=False, full_html=False, div_id='elite_hist')
+    hist_div, hist_script = extract_chart_html(hist_html)
+
+    top_scatter = boundary_scores[:12]
+    n_s = len(top_scatter)
+    n_c2 = 3
+    n_r2 = (n_s + n_c2 - 1) // n_c2 if n_s else 1
+    _cells2 = n_r2 * n_c2
+    _sc_titles = [t[0] for t in top_scatter] + [''] * max(0, _cells2 - n_s)
+    fig_s = make_subplots(rows=n_r2, cols=n_c2, subplot_titles=_sc_titles[:_cells2], vertical_spacing=0.1, horizontal_spacing=0.06)
+    for i, tup in enumerate(top_scatter):
+        pk = tup[0]
+        r = i // n_c2 + 1
+        c = i % n_c2 + 1
+        series = param_series.get(pk)
+        if series is None:
+            continue
+        arr, y_sort = series
+        if len(arr) == 0:
+            continue
+        fig_s.add_trace(
+            go.Scatter(x=arr, y=y_sort, mode='markers', marker=dict(size=6, opacity=0.55), showlegend=False),
+            row=r, col=c)
+    fig_s.update_layout(height=280 * n_r2, title_text='Elite: parameter vs fitness Sortino (normalized)', showlegend=False)
+    sc_html = fig_s.to_html(include_plotlyjs=False, full_html=False, div_id='elite_scatter')
+    sc_div, sc_script = extract_chart_html(sc_html)
+
+    return info_html, hist_div, hist_script, sc_div, sc_script
+
+
 def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict,
                             logbook, is_res, oos_res, trades_is, trades_oos,
                             html_path, diag_dir, current_gen=None, total_gen=None, 
                             is_final=False, auto_launch=False, is_periods=None, oos_periods=None,
-                            in_sample=None, best_gen_found=None, pop=None): # Added pop argument
+                            in_sample=None, best_gen_found=None, pop=None,
+                            csv_export_index=None, csv_export_total=None):
 
     if os.environ.get('TRADING_GA_NO_BROWSER', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         auto_launch = False
+
+    if is_final:
+        try:
+            _csv_phase_fp = os.path.join(diag_dir, 'csv_export_phase_start.txt')
+            if os.path.exists(_csv_phase_fp):
+                os.remove(_csv_phase_fp)
+        except OSError:
+            pass
 
     # print(f"DEBUG: oos_res['sortino']: {oos_res.get('sortino')}")
     # print(f"DEBUG: trades_oos len: {len(trades_oos) if isinstance(trades_oos, pd.DataFrame) else 'Not a DF'}")
@@ -2358,151 +2768,143 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     gens = logbook.select("gen")
     fig_convergence = make_subplots(rows=3, cols=2,
         subplot_titles=('Sortino Convergence', 'Drawdown Convergence', 'Profit Factor Convergence', 'Avg Trades/Day Convergence', 'Total Profit Convergence', 'Avg Profit/Trade Convergence'))
+    _band_outer = 'rgba(33, 150, 243, 0.14)'
+    _band_inner = 'rgba(33, 150, 243, 0.32)'
+    # Row 1: population bands first (behind lines). Legacy checkpoints: mirror-estimated bounds when pop_* rows missing.
+    _add_population_envelope_traces(
+        fig_convergence, gens, logbook, 1, 1, 'avg_sortino', 'pop_min_sortino', 'max_sortino', 'pop_std_sortino',
+        _band_outer, _band_inner, show_legend=True,
+        legend_outer='Sortino pop range', legend_inner='Sortino avg±0.5σ')
+    _add_population_envelope_traces(
+        fig_convergence, gens, logbook, 1, 2, 'avg_dd', 'min_dd', 'pop_max_dd_norm', 'pop_std_dd',
+        _band_outer, _band_inner, show_legend=True,
+        legend_outer='DD pop range', legend_inner='DD avg±0.5σ', clamp_lo=0.0, clamp_hi=1.0)
+    # Rows 2–3 (normalized fitness space)
+    _add_population_envelope_traces(
+        fig_convergence, gens, logbook, 2, 1, 'avg_pf', 'pop_min_pf', 'max_pf', 'pop_std_pf',
+        _band_outer, _band_inner, show_legend=True,
+        legend_outer='PF pop range', legend_inner='PF avg±0.5σ',
+        clamp_lo=0.0, clamp_hi=1.0)
+    _add_population_envelope_traces(
+        fig_convergence, gens, logbook, 2, 2, 'pop_avg_trades_day', 'pop_min_trades_day', 'max_trades_day', 'pop_std_trades_day',
+        _band_outer, _band_inner, show_legend=True,
+        legend_outer='Trades pop range', legend_inner='Trades avg±0.5σ',
+        clamp_lo=0.0, clamp_hi=None, avg_fallback_key='avg_trades_day')
+    if 'avg_total_profit' in logbook.header:
+        _add_population_envelope_traces(
+            fig_convergence, gens, logbook, 3, 1, 'avg_total_profit', 'pop_min_total_profit', 'pop_max_total_profit', 'pop_std_total_profit',
+            _band_outer, _band_inner, show_legend=True,
+            legend_outer='PnL pop range', legend_inner='PnL avg±0.5σ',
+            clamp_lo=0.0, clamp_hi=1.0)
+    if 'avg_profit_per_trade' in logbook.header:
+        _add_population_envelope_traces(
+            fig_convergence, gens, logbook, 3, 2, 'pop_avg_profit_per_trade', 'pop_min_profit_per_trade', 'pop_max_profit_per_trade', 'pop_std_profit_per_trade',
+            _band_outer, _band_inner, show_legend=True,
+            legend_outer='PPT pop range', legend_inner='PPT avg±0.5σ',
+            clamp_lo=None, clamp_hi=None, avg_fallback_key='avg_profit_per_trade')
     
-    # Sortino (row 1, col 1) - Show ACTUAL Sortino if available, otherwise normalized
-    if 'actual_sortino_best' in logbook.header:
-        # Show actual Sortino (from best individual each generation)
-        actual_sortino_values = logbook.select("actual_sortino_best")
-        # Filter out invalid values (inf, -inf, nan) but keep 0.0 if it's a real value
-        # Check if all values are 0.0 (might indicate missing data from old checkpoint)
-        all_zero = all(v == 0.0 or v is None for v in actual_sortino_values if isinstance(v, (int, float)))
-        
-        if not all_zero and len(actual_sortino_values) > 0:
-            # We have valid actual values
-            actual_sortino_values = [v if isinstance(v, (int, float)) and not (np.isinf(v) or np.isnan(v)) else None for v in actual_sortino_values]
-            fig_convergence.add_trace(go.Scatter(x=gens, y=actual_sortino_values, name='Best (Actual)', line=dict(width=2, color='blue'), showlegend=False), row=1, col=1)
-            # Also show normalized for comparison (dashed line)
-            avg_sortino_norm = logbook.select("avg_sortino")
-            # Filter out penalty values (-1000, -inf) for display
-            avg_sortino_norm = [v if isinstance(v, (int, float)) and v > -500 and not np.isinf(v) else None for v in avg_sortino_norm]
-            fig_convergence.add_trace(go.Scatter(x=gens, y=avg_sortino_norm, name='Avg (Normalized)', line=dict(dash='dash', color='gray'), showlegend=False), row=1, col=1)
-        else:
-            # All zeros or missing - fall back to normalized, but try to use is_res for final generation
-            avg_sortino = logbook.select("avg_sortino")
-            max_sortino = logbook.select("max_sortino")
-            # Filter out -1000 penalty values and -inf for cleaner display
-            avg_sortino = [v if isinstance(v, (int, float)) and v > -500 and not np.isinf(v) else None for v in avg_sortino]
-            max_sortino = [v if isinstance(v, (int, float)) and v > -500 and not np.isinf(v) else None for v in max_sortino]
-            
-            # If we have is_res with actual Sortino, use it for the final generation
-            if is_res and isinstance(is_res, dict) and 'sortino' in is_res and is_res['sortino'] > 0:
-                # Replace the last value with actual Sortino from backtest
-                if len(max_sortino) > 0:
-                    max_sortino[-1] = is_res['sortino']
-            
-            fig_convergence.add_trace(go.Scatter(x=gens, y=avg_sortino, name='Avg (Normalized)', line=dict(dash='dash'), showlegend=False), row=1, col=1)
-            fig_convergence.add_trace(go.Scatter(x=gens, y=max_sortino, name='Best (Actual if available)', line=dict(width=2), showlegend=False), row=1, col=1)
-    else:
-        # Fallback: show normalized values, filtering out penalty values
-        avg_sortino = logbook.select("avg_sortino")
-        max_sortino = logbook.select("max_sortino")
-        # Filter out -1000 penalty values and -inf for cleaner display
-        avg_sortino = [v if isinstance(v, (int, float)) and v > -500 and not np.isinf(v) else None for v in avg_sortino]
-        max_sortino = [v if isinstance(v, (int, float)) and v > -500 and not np.isinf(v) else None for v in max_sortino]
-        
-        # If we have is_res with actual Sortino, use it for the final generation
-        if is_res and isinstance(is_res, dict) and 'sortino' in is_res and is_res['sortino'] > 0:
-            # Replace the last value with actual Sortino from backtest
-            if len(max_sortino) > 0:
-                max_sortino[-1] = is_res['sortino']
-        
-        fig_convergence.add_trace(go.Scatter(x=gens, y=avg_sortino, name='Avg (Normalized)', line=dict(dash='dash'), showlegend=False), row=1, col=1)
-        fig_convergence.add_trace(go.Scatter(x=gens, y=max_sortino, name='Best (Actual if available)', line=dict(width=2), showlegend=False), row=1, col=1)
-    
-    # Drawdown (row 1, col 2) - Show ACTUAL drawdown in dollars if available, otherwise normalized
-    if 'actual_dd_best' in logbook.header:
-        # Show actual drawdown in dollars (from best individual)
-        actual_dd_values = logbook.select("actual_dd_best")
-        # Filter out invalid values
-        actual_dd_values = [v if isinstance(v, (int, float)) and not (np.isinf(v) or np.isnan(v)) else 0.0 for v in actual_dd_values]
-        fig_convergence.add_trace(go.Scatter(x=gens, y=actual_dd_values, name='Best (Actual $)', line=dict(width=2, color='blue'), showlegend=False), row=1, col=2)
-        # Also show normalized for comparison (dashed line) - but only if values are reasonable
-        avg_dd_norm = logbook.select("avg_dd")
-        avg_dd_norm = [v if isinstance(v, (int, float)) and not np.isinf(v) and v >= 0 and v <= 1 else None for v in avg_dd_norm]
-        fig_convergence.add_trace(go.Scatter(x=gens, y=avg_dd_norm, name='Avg (Normalized 0-1)', line=dict(dash='dash', color='gray'), showlegend=False), row=1, col=2)
-    else:
-        # Fallback: show normalized values
-        avg_dd = logbook.select("avg_dd")
-        min_dd = logbook.select("min_dd")
-        # Filter to ensure values are in 0-1 range (normalized)
-        avg_dd = [v if isinstance(v, (int, float)) and not np.isinf(v) and v >= 0 and v <= 1 else None for v in avg_dd]
-        min_dd = [v if isinstance(v, (int, float)) and not np.isinf(v) and v >= 0 and v <= 1 else None for v in min_dd]
-        fig_convergence.add_trace(go.Scatter(x=gens, y=avg_dd, name='Avg (Normalized 0-1)', line=dict(dash='dash'), showlegend=False), row=1, col=2)
-        fig_convergence.add_trace(go.Scatter(x=gens, y=min_dd, name='Best (Normalized 0-1)', line=dict(width=2), showlegend=False), row=1, col=2)
+    # Sortino (row 1, col 1) — normalized only (same y-scale as population bands; no dual-scale overlay)
+    avg_sortino = logbook.select("avg_sortino")
+    max_sortino = logbook.select("max_sortino")
+    avg_sortino = [v if isinstance(v, (int, float)) and v > -500 and not np.isinf(v) else None for v in avg_sortino]
+    max_sortino = [v if isinstance(v, (int, float)) and v > -500 and not np.isinf(v) else None for v in max_sortino]
+    fig_convergence.add_trace(
+        go.Scatter(x=gens, y=avg_sortino, name='Sortino avg (normalized)', line=dict(dash='dash', color='gray'), showlegend=True),
+        row=1, col=1)
+    fig_convergence.add_trace(
+        go.Scatter(x=gens, y=max_sortino, name='Sortino max in pop (normalized)', line=dict(width=2, color='blue'), showlegend=True),
+        row=1, col=1)
+
+    # Drawdown (row 1, col 2) — normalized only. Best-in-population is max(f[1]) = pop_max_dd_norm, not min_dd.
+    avg_dd = logbook.select("avg_dd")
+    avg_dd = [v if isinstance(v, (int, float)) and not np.isinf(v) and v >= 0 and v <= 1 else None for v in avg_dd]
+    fig_convergence.add_trace(
+        go.Scatter(x=gens, y=avg_dd, name='DD avg (normalized)', line=dict(dash='dash', color='gray'), showlegend=True),
+        row=1, col=2)
+    if 'pop_max_dd_norm' in logbook.header:
+        dd_max_norm = logbook.select("pop_max_dd_norm")
+        dd_max_norm = [v if isinstance(v, (int, float)) and not np.isinf(v) and v >= 0 and v <= 1 else None for v in dd_max_norm]
+        if any(v is not None for v in dd_max_norm):
+            fig_convergence.add_trace(
+                go.Scatter(x=gens, y=dd_max_norm, name='DD max in pop (normalized)', line=dict(width=2, color='blue'), showlegend=True),
+                row=1, col=2)
     
     # Profit Factor (row 2, col 1)
-    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_pf"), name='Avg', line=dict(dash='dash'), showlegend=False), row=2, col=1)
-    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("max_pf"), name='Best', line=dict(width=2), showlegend=False), row=2, col=1)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_pf"), name='PF avg', line=dict(dash='dash'), showlegend=True), row=2, col=1)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("max_pf"), name='PF best', line=dict(width=2), showlegend=True), row=2, col=1)
     
-    # Avg Trades/Day (row 2, col 2)
-    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_trades_day"), name='Avg', line=dict(dash='dash'), showlegend=False), row=2, col=2)
-    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("max_trades_day"), name='Best', line=dict(width=2), showlegend=False), row=2, col=2)
+    # Avg Trades/Day (row 2, col 2) — use pop_avg_trades_day: logbook avg_trades_day is overwritten with best-individual actual in record()
+    if 'pop_avg_trades_day' in logbook.header:
+        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("pop_avg_trades_day"), name='Trades pop avg', line=dict(dash='dash'), showlegend=True), row=2, col=2)
+    else:
+        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_trades_day"), name='Trades avg (logbook)', line=dict(dash='dash'), showlegend=True), row=2, col=2)
+    fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("max_trades_day"), name='Trades pop max', line=dict(width=2), showlegend=True), row=2, col=2)
     
     # Total Profit (row 3, col 1)
     if 'avg_total_profit' in logbook.header:
-        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_total_profit"), name='Avg', line=dict(dash='dash'), showlegend=False), row=3, col=1)
-        # For max, we'll use the same as avg for now (logbook doesn't track max_total_profit separately)
-        # In practice, this will be similar to avg since we're tracking normalized values
-        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_total_profit"), name='Best', line=dict(width=2), showlegend=False), row=3, col=1)
+        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_total_profit"), name='PnL avg', line=dict(dash='dash'), showlegend=True), row=3, col=1)
+        if 'pop_max_total_profit' in logbook.header:
+            fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("pop_max_total_profit"), name='PnL pop max', line=dict(width=2), showlegend=True), row=3, col=1)
+        else:
+            fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_total_profit"), name='PnL best (fallback)', line=dict(width=2), showlegend=True), row=3, col=1)
     else:
         # Fallback: use zeros if logbook doesn't have it yet
         fig_convergence.add_trace(go.Scatter(x=gens, y=[0]*len(gens), name='Avg', line=dict(dash='dash'), showlegend=False), row=3, col=1)
         fig_convergence.add_trace(go.Scatter(x=gens, y=[0]*len(gens), name='Best', line=dict(width=2), showlegend=False), row=3, col=1)
 
-    # Avg Profit Per Trade (row 3, col 2)
-    if 'avg_profit_per_trade' in logbook.header:
-        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_profit_per_trade"), name='Avg', line=dict(dash='dash'), showlegend=False), row=3, col=2)
-        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_profit_per_trade"), name='Best', line=dict(width=2), showlegend=False), row=3, col=2)
+    # Avg Profit Per Trade (row 3, col 2) — lines use population stats when available (avg_trades_day overwrite makes raw avg_* misleading)
+    if 'pop_avg_profit_per_trade' in logbook.header:
+        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("pop_avg_profit_per_trade"), name='PPT pop avg', line=dict(dash='dash'), showlegend=True), row=3, col=2)
+        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("pop_max_profit_per_trade"), name='PPT pop max', line=dict(width=2), showlegend=True), row=3, col=2)
+    elif 'avg_profit_per_trade' in logbook.header:
+        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_profit_per_trade"), name='PPT avg', line=dict(dash='dash'), showlegend=True), row=3, col=2)
+        fig_convergence.add_trace(go.Scatter(x=gens, y=logbook.select("avg_profit_per_trade"), name='PPT best (fallback)', line=dict(width=2), showlegend=True), row=3, col=2)
     else:
          # Fallback
         fig_convergence.add_trace(go.Scatter(x=gens, y=[0]*len(gens), name='Avg', line=dict(dash='dash'), showlegend=False), row=3, col=2)
         fig_convergence.add_trace(go.Scatter(x=gens, y=[0]*len(gens), name='Best', line=dict(width=2), showlegend=False), row=3, col=2)
-    
+
+    def _max_uc_y_series(logbook, key):
+        try:
+            raw = list(logbook.select(key))
+        except Exception:
+            return None
+        out = []
+        for v in raw:
+            if isinstance(v, (int, float)) and np.isfinite(v):
+                out.append(float(v))
+            else:
+                out.append(None)
+        return out if any(x is not None for x in out) else None
+
+    _uc_style = dict(width=2, color='darkorange', dash='dot')
+    _uc_pairs = [
+        ('max_uc_sortino', 'Sortino pop max (pre-cap ratio)', 1, 1),
+        ('max_uc_dd', 'DD pop max ($ / NORM_DD_MAX)', 1, 2),
+        ('max_uc_pf', 'PF pop max (pre-cap ratio)', 2, 1),
+        ('max_uc_trades', 'Trades pop max (pre-cap ratio)', 2, 2),
+        ('max_uc_pnl', 'PnL pop max (pre-cap ratio)', 3, 1),
+        ('max_uc_ppt', 'PPT pop max (pre-cap ratio)', 3, 2),
+    ]
+    for _uk, _un, _r, _c in _uc_pairs:
+        _ys = _max_uc_y_series(logbook, _uk)
+        if _ys:
+            fig_convergence.add_trace(
+                go.Scatter(x=gens, y=_ys, name=_un, line=_uc_style, showlegend=True),
+                row=_r, col=_c,
+            )
+
     fig_convergence.update_layout(height=900, showlegend=True, title_text="Convergence Plots")
+    fig_convergence.update_xaxes(title_text="Generation", row=1, col=1)
+    fig_convergence.update_xaxes(title_text="Generation", row=1, col=2)
     fig_convergence.update_xaxes(title_text="Generation", row=2, col=1)
     fig_convergence.update_xaxes(title_text="Generation", row=2, col=2)
     fig_convergence.update_xaxes(title_text="Generation", row=3, col=1)
     fig_convergence.update_xaxes(title_text="Generation", row=3, col=2)
-    # Update axis labels based on what data is being shown
-    # Check if we're actually showing actual values (not all zeros)
-    showing_actual = False
-    if 'actual_sortino_best' in logbook.header:
-        actual_vals = logbook.select("actual_sortino_best")
-        # Check if we have any non-zero actual values
-        if any(v and isinstance(v, (int, float)) and v > 0.01 and not np.isinf(v) and not np.isnan(v) for v in actual_vals):
-            showing_actual = True
-    # Also check if we used is_res for the final generation
-    if is_res and isinstance(is_res, dict) and 'sortino' in is_res and is_res['sortino'] > 0:
-        showing_actual = True
-    
-    # Calculate max Sortino value for y-axis upper bound
-    sortino_max = 1.0  # Default minimum upper bound
-    if 'actual_sortino_best' in logbook.header:
-        actual_vals = logbook.select("actual_sortino_best")
-        valid_vals = [v for v in actual_vals if isinstance(v, (int, float)) and not (np.isinf(v) or np.isnan(v)) and v > -500]
-        if valid_vals:
-            sortino_max = max(max(valid_vals), 1.0)  # At least show up to 1.0
-    else:
-        # Use normalized values
-        max_vals = logbook.select("max_sortino")
-        valid_vals = [v for v in max_vals if isinstance(v, (int, float)) and v > -500 and not np.isinf(v)]
-        if valid_vals:
-            sortino_max = max(max(valid_vals), 1.0)
-    
-    # Add 20% padding to upper bound, but ensure minimum of 1.0
-    sortino_max = max(sortino_max * 1.2, 1.0)
-    
-    if showing_actual:
-        # Fix lower bound at -1 so negative Sortino values remain visible and scale doesn't zoom excessively
-        fig_convergence.update_yaxes(title_text="Sortino Ratio (Actual)", row=1, col=1, range=[-1, sortino_max])
-    else:
-        fig_convergence.update_yaxes(title_text="Sortino (Normalized 0-1)", row=1, col=1, range=[-1, sortino_max])
-    
-    if 'actual_dd_best' in logbook.header:
-        fig_convergence.update_yaxes(title_text="Max Drawdown ($)", row=1, col=2)
-    else:
-        fig_convergence.update_yaxes(title_text="Drawdown (Normalized 0-1, inverted)", row=1, col=2)
-    fig_convergence.update_yaxes(title_text="Profit Factor", row=2, col=1)
+    # Row 1: normalized bands + lines; y-axis autoranges so pre-cap ratio traces can exceed 1.0.
+    fig_convergence.update_yaxes(title_text="Sortino (normalized + pre-cap max)", row=1, col=1, autorange=True)
+    fig_convergence.update_yaxes(title_text="Drawdown (normalized + pre-cap max)", row=1, col=2, autorange=True)
+    fig_convergence.update_yaxes(title_text="Profit Factor (normalized 0-1)", row=2, col=1)
     fig_convergence.update_yaxes(title_text="Avg Trades/Day (Score 0-1)", row=2, col=2)
     fig_convergence.update_yaxes(title_text="Total Profit (norm)", row=3, col=1)
     
@@ -2830,7 +3232,24 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         oos_res = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0}
     
     # Ensure all required keys exist
-    required_keys = ['sortino', 'max_drawdown', 'avg_trades_day', 'profit_factor', 'total_profit', 'avg_profit_per_trade']
+    _dash_tf = 15.0
+    try:
+        if isinstance(best_params, dict) and best_params.get('Timeframe (minutes)') is not None:
+            _dash_tf = float(max(1, int(round(best_params['Timeframe (minutes)']))))
+        elif param_dict and 'Timeframe (minutes)' in param_dict:
+            _dash_tf = float(max(1, int(round(param_dict['Timeframe (minutes)']['value']))))
+    except Exception:
+        _dash_tf = 15.0
+
+    required_keys = [
+        'sortino',
+        'max_drawdown',
+        'avg_trades_day',
+        'profit_factor',
+        'total_profit',
+        'avg_profit_per_trade',
+        'avg_trade_duration_min',
+    ]
     for key in required_keys:
         if key not in is_res:
              # Try to calculate if missing
@@ -2838,6 +3257,8 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                  tp = is_res.get('total_profit', 0)
                  count = len(trades_is) if 'trades_is' in locals() else 0
                  is_res[key] = tp / count if count > 0 else 0
+             elif key == 'avg_trade_duration_min':
+                 is_res[key] = _mean_trade_duration_minutes(trades_is, bar_minutes=_dash_tf)
              else:
                  is_res[key] = 0
         if key not in oos_res:
@@ -2845,6 +3266,8 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                  tp = oos_res.get('total_profit', 0)
                  count = len(trades_oos) if 'trades_oos' in locals() else 0
                  oos_res[key] = tp / count if count > 0 else 0
+             elif key == 'avg_trade_duration_min':
+                 oos_res[key] = _mean_trade_duration_minutes(trades_oos, bar_minutes=_dash_tf)
              else:
                  oos_res[key] = 0
     
@@ -2887,6 +3310,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         ('avg_trades_day', 'Avg Trades/Day', False),
         ('profit_factor', 'Profit Factor', False),
         ('avg_profit_per_trade', 'Avg Profit/Trade', False), # NEW: Requested by User
+        ('avg_trade_duration_min', 'Avg Trade Duration (min, bar-span)', False),
         ('total_profit', 'Total Profit', False)  # NEW: 5th objective
     ]
     
@@ -2921,6 +3345,10 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             is_str = f"${is_val:,.2f}"
             oos_str = f"${oos_val:,.2f}"
             diff_str = f"${diff:+,.2f} ({diff_pct:+.1f}%)"
+        elif metric_key == 'avg_trade_duration_min':
+            is_str = f"{is_val:.2f}"
+            oos_str = f"{oos_val:.2f}"
+            diff_str = f"{diff:+.2f} ({diff_pct:+.1f}%)"
         else:
             is_str = f"{is_val:.6f}"
             oos_str = f"{oos_val:.6f}"
@@ -2956,10 +3384,10 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     summary_html += "</tbody></table>"
     
     # Generate HTML snippets for charts
-    conv_html = fig_convergence.to_html(include_plotlyjs=False, div_id='conv_chart')
-    pareto3d_html = fig_pareto_3d.to_html(include_plotlyjs=False, div_id='pareto3d_chart')
-    pareto2d_html = fig_pareto_2d.to_html(include_plotlyjs=False, div_id='pareto2d_chart')
-    paretosize_html = fig_pareto_size.to_html(include_plotlyjs=False, div_id='paretosize_chart')
+    conv_html = fig_convergence.to_html(include_plotlyjs=False, full_html=False, div_id='conv_chart')
+    pareto3d_html = fig_pareto_3d.to_html(include_plotlyjs=False, full_html=False, div_id='pareto3d_chart')
+    pareto2d_html = fig_pareto_2d.to_html(include_plotlyjs=False, full_html=False, div_id='pareto2d_chart')
+    paretosize_html = fig_pareto_size.to_html(include_plotlyjs=False, full_html=False, div_id='paretosize_chart')
     
     # Extract div and script from each chart (extract_chart_html is defined earlier)
     conv_div, conv_script = extract_chart_html(conv_html)
@@ -2967,59 +3395,143 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     pareto2d_div, pareto2d_script = extract_chart_html(pareto2d_html)
     paretosize_div, paretosize_script = extract_chart_html(paretosize_html)
     
-    # Progress information with time tracking
+    try:
+        elite_info_html, elite_hist_div, elite_hist_script, elite_sc_div, elite_sc_script = generate_elite_parameter_insight_html(
+            hof, param_keys, param_dict, max_individuals=400)
+    except Exception as _elite_e:
+        print(f"  Warning: elite parameter insight charts failed: {_elite_e}")
+        traceback.print_exc()
+        elite_info_html = ''
+        elite_hist_div = elite_hist_script = elite_sc_div = elite_sc_script = ''
+    
+    # Progress information with time tracking (GA generations + optional CSV export phase)
     progress_html = ""
-    if current_gen is not None and total_gen is not None:
-        progress_pct = (current_gen / total_gen * 100) if total_gen > 0 else 0
-        status = "COMPLETE" if is_final else "IN PROGRESS"
-        status_color = "#4CAF50" if is_final else "#FF9800"
-        
-        # Calculate elapsed time and predicted completion
+    show_ga = current_gen is not None and total_gen is not None and total_gen > 0
+    show_csv = csv_export_total is not None and int(csv_export_total) > 0
+    if show_ga or show_csv:
+        ga_pct = min(100.0, (current_gen / total_gen * 100)) if show_ga else 0.0
+        csv_idx = int(csv_export_index) if csv_export_index is not None else 0
+        csv_tot = int(csv_export_total) if csv_export_total is not None else 0
+        csv_pct = min(100.0, (csv_idx / csv_tot * 100)) if show_csv and csv_tot > 0 else 0.0
+
+        if is_final:
+            status = "COMPLETE"
+            status_color = "#4CAF50"
+        elif show_csv:
+            status = "POST-GA EXPORT"
+            status_color = "#FFB74D"
+        else:
+            status = "IN PROGRESS"
+            status_color = "#FF9800"
+
+        if show_ga and show_csv:
+            combined_pct = (ga_pct + csv_pct) / 2.0
+            headline = (
+                f"{status} — GA {current_gen}/{total_gen} ({ga_pct:.1f}%) · "
+                f"CSV rows {csv_idx}/{csv_tot} ({csv_pct:.1f}%) · "
+                f"overall ~{combined_pct:.1f}%"
+            )
+        elif show_csv:
+            combined_pct = csv_pct
+            headline = f"{status} — building solution CSV rows {csv_idx}/{csv_tot} ({csv_pct:.1f}%)"
+        else:
+            combined_pct = ga_pct
+            headline = f"{status} - Generation {current_gen}/{total_gen} ({ga_pct:.1f}%)"
+
         elapsed_time_str = "N/A"
         predicted_completion_str = "N/A"
-        
-        # Try to read start time from file
+
         start_time = None
         START_TIME_FILE = os.path.join(diag_dir, 'ga_start_time.txt')
         if os.path.exists(START_TIME_FILE):
             try:
                 with open(START_TIME_FILE, 'r') as f:
                     start_time = float(f.read().strip())
-            except:
+            except Exception:
                 pass
-        
+
         if start_time is not None:
             elapsed_seconds = time.time() - start_time
             elapsed_td = timedelta(seconds=int(elapsed_seconds))
-            # Format as HH:MM:SS
             hours, remainder = divmod(elapsed_td.seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
             elapsed_time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             if elapsed_td.days > 0:
                 elapsed_time_str = f"{elapsed_td.days}d {elapsed_time_str}"
-            
-            # Calculate predicted completion time
-            if current_gen > 0 and not is_final:
-                avg_time_per_gen = elapsed_seconds / current_gen
-                remaining_gens = total_gen - current_gen
-                predicted_seconds = avg_time_per_gen * remaining_gens
-                predicted_completion = datetime.now() + timedelta(seconds=int(predicted_seconds))
-                predicted_completion_str = predicted_completion.strftime('%Y-%m-%d %H:%M:%S')
-                
-        # Status Banner HTML
+
+            if not is_final:
+                if show_csv and csv_tot > 0 and csv_idx > 0:
+                    csv_phase_start = None
+                    CSV_PHASE_START_FILE = os.path.join(diag_dir, 'csv_export_phase_start.txt')
+                    if os.path.exists(CSV_PHASE_START_FILE):
+                        try:
+                            with open(CSV_PHASE_START_FILE, 'r') as f:
+                                csv_phase_start = float(f.read().strip())
+                        except Exception:
+                            csv_phase_start = None
+                    if csv_phase_start is not None:
+                        elapsed_csv = max(0.0, time.time() - csv_phase_start)
+                        rate = elapsed_csv / float(csv_idx)
+                        remaining = rate * max(0, csv_tot - csv_idx)
+                        predicted_completion = datetime.now() + timedelta(seconds=int(remaining))
+                        predicted_completion_str = predicted_completion.strftime('%Y-%m-%d %H:%M:%S')
+                elif show_ga and current_gen > 0 and (not show_csv or csv_idx == 0):
+                    remaining_gens = total_gen - current_gen
+                    if remaining_gens > 0:
+                        avg_time_per_gen = elapsed_seconds / float(current_gen)
+                        predicted_seconds = avg_time_per_gen * remaining_gens
+                        predicted_completion = datetime.now() + timedelta(seconds=int(predicted_seconds))
+                        predicted_completion_str = predicted_completion.strftime('%Y-%m-%d %H:%M:%S')
+
+        ga_bar_color = "#4CAF50" if (show_csv and csv_idx >= csv_tot) else ("#81C784" if is_final else "#2196F3")
+        csv_bar_color = "#FFB74D" if (show_csv and csv_idx < csv_tot) else "#4CAF50"
+
+        ga_bar_block = ""
+        if show_ga:
+            ga_bar_block = f"""
+            <div style="margin-top: 12px; text-align: left; font-size: 0.82em; color: #ccc;">GA (generations)</div>
+            <div style="width: 100%; background-color: #555; height: 8px; border-radius: 4px; overflow: hidden;">
+                <div style="width: {ga_pct:.4f}%; background-color: {ga_bar_color}; height: 100%;"></div>
+            </div>"""
+
+        csv_bar_block = ""
+        if show_csv:
+            csv_bar_block = f"""
+            <div style="margin-top: 10px; text-align: left; font-size: 0.82em; color: #ccc;">CSV export (per-solution backtests / rows)</div>
+            <div style="width: 100%; background-color: #555; height: 8px; border-radius: 4px; overflow: hidden;">
+                <div style="width: {csv_pct:.4f}%; background-color: {csv_bar_color}; height: 100%;"></div>
+            </div>"""
+
+        footnote = ""
+        if show_ga and show_csv:
+            footnote = (
+                "<div style=\"margin-top: 8px; font-size: 0.78em; color: #bbb;\">"
+                "Overall % is the average of GA completion and CSV row completion. "
+                "Refresh cadence: TRADING_GA_DASH_CSV_PROGRESS_EVERY (default 10).</div>"
+            )
+
         progress_html = f"""
         <div style="background-color: #333; color: white; padding: 15px; text-align: center; margin-bottom: 20px; border-radius: 5px;">
-            <h2 style="margin: 0; color: {status_color};">{status} - Generation {current_gen}/{total_gen} ({progress_pct:.1f}%)</h2>
+            <h2 style="margin: 0; color: {status_color}; font-size: 1.15em;">{headline}</h2>
             <div style="margin-top: 10px; font-size: 0.9em;">
-                <span>Elapsed: {elapsed_time_str}</span> | 
-                <span>Est. Completion: {predicted_completion_str}</span>
+                <span>Elapsed (run): {elapsed_time_str}</span> |
+                <span>Est. completion: {predicted_completion_str}</span>
             </div>
-            <div style="width: 100%; background-color: #555; height: 10px; margin-top: 10px; border-radius: 5px; overflow: hidden;">
-                <div style="width: {progress_pct}%; background-color: {status_color}; height: 100%;"></div>
-            </div>
+            {ga_bar_block}
+            {csv_bar_block}
+            {footnote}
         </div>
         """
-    fitness_weights_html = "<h2>Fitness Function Configuration</h2><div class='info-section'><table class='params-table'><thead><tr><th>Objective</th><th>Weight</th><th>Direction</th><th>Normalization Range</th><th>Notes</th></tr></thead><tbody>"
+    fitness_weights_html = (
+        "<h2>Fitness Function Configuration</h2><div class='info-section'>"
+        "<table class='params-table'><thead><tr><th>Objective</th>"
+        "<th>MO weight<span class='tooltip-icon'>?</span><span class='tooltip'>"
+        "DEAP multi-objective scalar weight (not the normalization divisor). "
+        "The divisor used in <code>core_evaluate</code> is the next column.</span></th>"
+        "<th>Direction</th>"
+        "<th>Norm. divisor<br/><span style='font-weight:normal;font-size:0.85em;color:#666'>"
+        "(CSV <code>Value</code> column)</span></th><th>Notes</th></tr></thead><tbody>"
+    )
     
     # Get weights from creator.FitnessMulti
     from deap import creator
@@ -3028,21 +3540,38 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         weight_names = ['Sortino Ratio', 'Max Drawdown', 'Profit Factor', 'Avg Trades/Day', 'Total Profit', 'Avg Profit/Trade']
         directions = ['Maximize', 'Minimize', 'Maximize', 'Maximize', 'Maximize', 'Maximize']
         
-        # Get normalization ranges from param_dict with safety check
+        # Reload PARAM_CSV from disk so mid-run edits to NORM_* show in the dashboard.
+        # (In-memory param_dict and worker processes still hold the snapshot from run start.)
+        param_dict_norm = param_dict
+        try:
+            param_dict_norm, _ = load_params(PARAM_CSV, return_dataframe=True)
+        except Exception:
+            pass
+
+        # Get normalization ranges from freshly loaded dict with safety check
         def get_p_val(key, default):
-            item = param_dict.get(key)
+            item = param_dict_norm.get(key)
             if isinstance(item, dict):
                 return item.get('value', default)
             return default
 
-        norm_ranges = {
-            'Sortino Ratio': get_p_val('NORM_SORTINO_MAX', 10.0),
-            'Max Drawdown': get_p_val('NORM_DD_MAX', 100000.0),
-            'Profit Factor': get_p_val('NORM_PF_MAX', 5.0),
-            'Avg Trades/Day': get_p_val('NORM_TRADES_MAX', 3.0),
-            'Total Profit': get_p_val('NORM_PNL_MAX', 200000.0),
-            'Avg Profit/Trade': get_p_val('NORM_PROFIT_TRADE_MAX', 250.0)
-        }
+        norm_keys = [
+            'NORM_SORTINO_MAX',
+            'NORM_DD_MAX',
+            'NORM_PF_MAX',
+            'NORM_TRADES_MAX',
+            'NORM_PNL_MAX',
+            'NORM_PROFIT_TRADE_MAX',
+        ]
+
+        def format_norm_cell(norm_key: str, fallback):
+            """Show active divisor (CSV Value column) used in core_evaluate."""
+            v = get_p_val(norm_key, fallback)
+            if isinstance(v, float):
+                v_str = f"{v:,.0f}" if abs(v) >= 1000 else f"{v:.4g}"
+            else:
+                v_str = str(v)
+            return f"<strong>{v_str}</strong>"
         
         notes = [
             '<strong>Constraint:</strong> Maximize. Penalized if < LIMIT_MIN_SORTINO.',
@@ -3053,12 +3582,11 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             '<strong>Goal:</strong> Maximize Profit Per Trade. Penalized if WinRate < MAX_WIN_RATE_CAP or Duration < MIN_TRADE_DURATION.'
         ]
         
-        for i, (name, weight, direction, note) in enumerate(zip(weight_names, weights, directions, notes)):
-            norm_range = norm_ranges.get(name, 'N/A')
-            if isinstance(norm_range, float):
-                norm_range_str = f"{norm_range:,.0f}" if norm_range >= 1000 else f"{norm_range:.1f}"
-            else:
-                norm_range_str = str(norm_range)
+        default_norms = [10.0, 100000.0, 5.0, 3.0, 200000.0, 250.0]
+        for i, (name, weight, direction, note, nk, fb) in enumerate(
+            zip(weight_names, weights, directions, notes, norm_keys, default_norms)
+        ):
+            norm_range_str = format_norm_cell(nk, fb)
             
             weight_str = f"{weight:.1f}"
             if weight == 100.0:
@@ -3068,7 +3596,20 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             
             fitness_weights_html += f"<tr><td>{name}</td><td>{weight_str}</td><td>{direction}</td><td>{norm_range_str}</td><td>{note}</td></tr>"
     
-    fitness_weights_html += "</tbody></table><p><em>Weights influence selection pressure.</em></p><p><em>Trade scores are normalized.</em></p></div>"
+    fitness_weights_html += (
+        "</tbody></table>"
+        "<p><em>Weights influence selection pressure.</em></p>"
+        "<p><em>Trade scores are normalized.</em></p>"
+        "<p style=\"font-size:0.88em;color:#666;margin-top:10px;\"><strong>Not hardcoded:</strong> each "
+        "<code>NORM_*</code> row uses the <strong>Value</strong> column as the divisor in "
+        "<code>core_evaluate</code>. Changing only <strong>Min</strong> or <strong>Max</strong> on that row "
+        "does not change fitness or this table — update <strong>Value</strong>, save the same file passed as "
+        "<code>--params</code> / default trend CSV, then start (or restart) the GA.</p>"
+        "<p style=\"font-size:0.88em;color:#666;\">Dashboard numbers are re-read from <code>PARAM_CSV</code> when "
+        "the HTML is rebuilt. If you edit the CSV <em>during</em> a run, refresh shows new Values, but worker "
+        "processes still use the snapshot from pool start until you restart.</p>"
+        "</div>"
+    )
     
     # Generate full HTML with tooltips and auto-refresh
     # Use JavaScript refresh that preserves scroll position instead of meta refresh
@@ -3095,7 +3636,8 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     html_content = "<!DOCTYPE html>\n"
     html_content += "<html><head><title>GA Dashboard v4.0</title>\n"
     html_content += f"{refresh_script}\n"
-    html_content += "<script src='https://cdn.plot.ly/plotly-latest.min.js'></script>\n"
+    # plotly-latest.min.js is frozen at plotly.js v1.x; Python plotly 3.x emits v2/v3 figure JSON — use versioned CDN.
+    html_content += f"<script src='{plotly_cdn_url()}' charset='utf-8'></script>\n"
     html_content += "<style> body { font-family: Arial; margin: 0; padding: 0; background: #f5f5f5; padding-top: 60px; } .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; } h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; } h2 { color: #555; margin-top: 30px; border-bottom: 2px solid #ddd; position: relative; } h2 .tooltip-icon { display: inline-block; width: 18px; height: 18px; background: #4CAF50; color: white; border-radius: 50%; text-align: center; line-height: 18px; font-size: 12px; margin-left: 8px; cursor: help; vertical-align: middle; } h2 .tooltip { visibility: hidden; width: 300px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 1; bottom: 125%; left: 0; font-size: 12px; line-height: 1.4; box-shadow: 0 2px 8px rgba(0,0,0,0.3); } h2 .tooltip-icon:hover + .tooltip { visibility: visible; } table { width: 100%; border-collapse: collapse; margin: 15px 0; } th { background: #4CAF50; color: white; padding: 10px; text-align: left; position: relative; } th .tooltip-icon { display: inline-block; width: 16px; height: 16px; background: rgba(255,255,255,0.3); color: white; border-radius: 50%; text-align: center; line-height: 16px; font-size: 11px; margin-left: 5px; cursor: help; vertical-align: middle; } th .tooltip { visibility: hidden; width: 280px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 8px; position: absolute; z-index: 1; bottom: 125%; left: 0; font-size: 11px; line-height: 1.3; box-shadow: 0 2px 8px rgba(0,0,0,0.3); } th .tooltip-icon:hover + .tooltip { visibility: visible; } td { padding: 8px; border: 1px solid #ddd; } tr:nth-child(even) { background: #f9f9f9; } .selected-row { background: #fff3cd !important; font-weight: bold; } .positive { color: green; } .negative { color: red; } .metric-box { display: inline-block; background: #4CAF50; color: white; padding: 10px 20px; margin: 5px; border-radius: 5px; font-weight: bold; position: relative; cursor: help; } .metric-box .tooltip { visibility: hidden; width: 250px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 8px; position: absolute; z-index: 1; bottom: 125%; left: 50%; transform: translateX(-50%); font-size: 11px; line-height: 1.3; box-shadow: 0 2px 8px rgba(0,0,0,0.3); } .metric-box:hover .tooltip { visibility: visible; } .info-section { background: #e3f2fd; border-left: 4px solid #2196F3; padding: 12px; margin: 15px 0; border-radius: 4px; font-size: 0.9em; line-height: 1.5; } .chart-container { margin: 20px 0; padding: 20px 0; border-top: 1px solid #ddd; border-bottom: 1px solid #ddd; } .chart-container .plotly-graph-div { margin: 20px 0; display: block; min-height: 400px; } .return-button { display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; } .return-button:hover { background: #5568d3; } </style></head><body>\n"
     html_content += f"{progress_html}\n"
     html_content += "<div class='container'>\n"
@@ -3121,7 +3663,27 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     # Merged into main Parameter Analysis section below
         
     html_content += "<h2>Fitness Convergence</h2>\n"
+    html_content += (
+        "<div class='info-section' style='font-size:0.88em'>"
+        "<strong>Bands:</strong> light fill = population min–max per generation (normalized fitness); "
+        "darker fill = mean ± 0.5×std. "
+        "<strong>Sortino / Drawdown (row 1):</strong> solid/dashed lines and fills use the <strong>normalized fitness</strong> scale "
+        "(solid = best in evaluated population that generation; dashed = population mean). "
+        "<strong>Orange dotted</strong> traces (when present) show <code>max_uc_*</code>: the largest "
+        "<em>pre-cap</em> ratio (raw metric ÷ CSV <code>NORM_*</code> divisor) among offspring that generation — "
+        "values may exceed 1.0; they are <strong>not</strong> used by NSGA-II (selection still uses capped fitness). "
+        "Actual Sortino and drawdown in dollars appear in Performance Metrics and elsewhere — not on this chart. "
+        "<strong>Legacy checkpoints</strong> (no per-gen <code>pop_*</code> or <code>max_uc_*</code>) omit dotted lines until you run with a current build. "
+        "Approximate bands still apply when <code>pop_*</code> is missing."
+        "</div>\n")
     html_content += f"{conv_div}\n"
+    if elite_info_html:
+        html_content += "<h2>Elite parameter range pressure</h2>\n"
+        html_content += elite_info_html
+        if elite_hist_div:
+            html_content += f"<h3>Histograms (highest boundary pressure)</h3>\n{elite_hist_div}\n"
+        if elite_sc_div:
+            html_content += f"<h3>Parameter vs fitness Sortino (top pressure params)</h3>\n{elite_sc_div}\n"
     html_content += "<h2>Pareto Front 3D</h2>\n"
     html_content += f"{pareto3d_div}\n"
     html_content += "<h2>Pareto Front 2D</h2>\n"
@@ -3156,11 +3718,44 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         periods_html += "</tbody></table>"
         html_content += periods_html
         
+    # Add individual IS period statistics if we have best_params
+    if best_params and is_periods and len(is_periods) > 0:
+            html_content += ' <h2>Individual In-Sample Period Statistics<span class="tooltip-icon">?</span> <span class="tooltip">Average holding time in minutes, counting whole bars (inclusive): entry and exit in the same candle count as one bar times your Timeframe (minutes). Matches the GA backtest clock; avoids sub-minute artifacts from fill-at-open vs end-of-bar exit timestamps.</span> </h2> <div class="info-section"> <strong>Per-slice trade duration:</strong> Values are bar-aligned (minimum one bar of exposure per trade). Compare across IS periods; chronically low averages (near one bar) still mean very fast exits in signal space. </div> '
+            is_period_stats_html = "<table class='oos-periods-table'><thead><tr> <th>Period #</th> <th>Date Range</th> <th>Total PNL</th> <th>Trades</th> <th>Win Rate</th> <th>Profit Factor</th> <th>Sortino</th> <th>Max DD</th> <th>Avg Trades/Day</th> <th>Avg Profit/Trade</th> <th>Avg Span (min)</th> </tr></thead><tbody>"
+            for i, is_period in enumerate(is_periods, 1):
+                try:
+                    period_res = run_backtest(best_params, is_period, param_dict, suppress_output=True)
+                    period_trades = period_res.pop('trades_df')
+                    if not period_trades.empty:
+                        total_pnl = period_trades['pnl'].sum()
+                        num_trades = len(period_trades)
+                        win_rate = (period_trades['pnl'] > 0).mean() * 100
+                        avg_win = period_trades[period_trades['pnl'] > 0]['pnl'].mean() if (period_trades['pnl'] > 0).any() else 0
+                        avg_loss = period_trades[period_trades['pnl'] < 0]['pnl'].mean() if (period_trades['pnl'] < 0).any() else 0
+                        pf = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
+                        sortino = period_res.get('sortino', 0)
+                        max_dd = period_res.get('max_drawdown', 0)
+                        avg_trades_day = period_res.get('avg_trades_day', 0)
+                        if avg_trades_day == 0 and num_trades > 0:
+                            period_start = is_period.index.min()
+                            period_end = is_period.index.max()
+                            days = (period_end - period_start).days or 1
+                            avg_trades_day = num_trades / days if days > 0 else 0
+                        avg_profit_trade = total_pnl / num_trades if num_trades > 0 else 0
+                        avg_dur = float(period_res.get('avg_trade_duration_min', 0.0))
+                        is_period_stats_html += f"<tr> <td>{i}</td> <td>{is_period.index[0].strftime('%Y-%m-%d')} to {is_period.index[-1].strftime('%Y-%m-%d')}</td> <td class=\"{'positive' if total_pnl > 0 else 'negative'}\">${total_pnl:,.2f}</td> <td>{num_trades}</td> <td>{win_rate:.1f}%</td> <td>{pf:.2f}</td> <td>{sortino:.2f}</td> <td>${max_dd:,.2f}</td> <td>{avg_trades_day:.2f}</td> <td class=\"{'positive' if avg_profit_trade > 0 else 'negative'}\">${avg_profit_trade:,.2f}</td> <td>{avg_dur:.2f}</td> </tr>"
+                    else:
+                        is_period_stats_html += f"<tr> <td>{i}</td> <td>{is_period.index[0].strftime('%Y-%m-%d')} to {is_period.index[-1].strftime('%Y-%m-%d')}</td> <td colspan=\"9\" style=\"text-align: center; color: #999;\">No trades</td> </tr>"
+                except Exception as e:
+                    is_period_stats_html += f"<tr> <td>{i}</td> <td>{is_period.index[0].strftime('%Y-%m-%d')} to {is_period.index[-1].strftime('%Y-%m-%d')}</td> <td colspan=\"9\" style=\"text-align: center; color: #f00;\">Error: {str(e)}</td> </tr>"
+            is_period_stats_html += "</tbody></table>"
+            html_content += is_period_stats_html
+
     # Add individual OOS period statistics if we have best_params
     if best_params and oos_periods and len(oos_periods) > 0:
-            html_content += ' <h2>Individual OOS Period Statistics<span class="tooltip-icon">?</span> <span class="tooltip">Performance statistics for each individual Out-of-Sample period. This helps identify if the strategy performs consistently across different time periods or if it\'s overfitted to specific market conditions.</span> </h2> <div class="info-section"> <strong>Period-by-Period Analysis:</strong> If performance varies significantly across OOS periods, the strategy may be overfitted to the training data. Consistent performance across periods is a good sign of robustness. </div> '
+            html_content += ' <h2>Individual OOS Period Statistics<span class="tooltip-icon">?</span> <span class="tooltip">Performance statistics for each individual Out-of-Sample period. Avg Span (min) = average trade length in minutes on the bar grid (inclusive whole bars times Timeframe minutes), not raw seconds between timestamps; same convention as the GA CSV.</span> </h2> <div class="info-section"> <strong>Period-by-Period Analysis:</strong> If performance varies significantly across OOS periods, the strategy may be overfitted to the training data. Consistent performance across periods is a good sign of robustness. </div> '
             
-            oos_period_stats_html = "<table class='oos-periods-table'><thead><tr> <th>Period #</th> <th>Date Range</th> <th>Total PNL</th> <th>Trades</th> <th>Win Rate</th> <th>Profit Factor</th> <th>Sortino</th> <th>Max DD</th> <th>Avg Trades/Day</th> <th>Avg Profit/Trade</th> </tr></thead><tbody>"
+            oos_period_stats_html = "<table class='oos-periods-table'><thead><tr> <th>Period #</th> <th>Date Range</th> <th>Total PNL</th> <th>Trades</th> <th>Win Rate</th> <th>Profit Factor</th> <th>Sortino</th> <th>Max DD</th> <th>Avg Trades/Day</th> <th>Avg Profit/Trade</th> <th>Avg Span (min)</th> </tr></thead><tbody>"
             
             for i, oos_period in enumerate(oos_periods, 1):
                 try:
@@ -3188,12 +3783,13 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         
                         # Calculate Avg Profit/Trade
                         avg_profit_trade = total_pnl / num_trades if num_trades > 0 else 0
+                        avg_dur = float(period_res.get('avg_trade_duration_min', 0.0))
 
-                        oos_period_stats_html += f"<tr> <td>{i}</td> <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td> <td class=\"{'positive' if total_pnl > 0 else 'negative'}\">${total_pnl:,.2f}</td> <td>{num_trades}</td> <td>{win_rate:.1f}%</td> <td>{pf:.2f}</td> <td>{sortino:.2f}</td> <td>${max_dd:,.2f}</td> <td>{avg_trades_day:.2f}</td> <td class=\"{'positive' if avg_profit_trade > 0 else 'negative'}\">${avg_profit_trade:,.2f}</td> </tr>"
+                        oos_period_stats_html += f"<tr> <td>{i}</td> <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td> <td class=\"{'positive' if total_pnl > 0 else 'negative'}\">${total_pnl:,.2f}</td> <td>{num_trades}</td> <td>{win_rate:.1f}%</td> <td>{pf:.2f}</td> <td>{sortino:.2f}</td> <td>${max_dd:,.2f}</td> <td>{avg_trades_day:.2f}</td> <td class=\"{'positive' if avg_profit_trade > 0 else 'negative'}\">${avg_profit_trade:,.2f}</td> <td>{avg_dur:.2f}</td> </tr>"
                     else:
-                        oos_period_stats_html += f"<tr> <td>{i}</td> <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td> <td colspan=\"7\" style=\"text-align: center; color: #999;\">No trades</td> </tr>"
+                        oos_period_stats_html += f"<tr> <td>{i}</td> <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td> <td colspan=\"9\" style=\"text-align: center; color: #999;\">No trades</td> </tr>"
                 except Exception as e:
-                    oos_period_stats_html += f"<tr> <td>{i}</td> <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td> <td colspan=\"7\" style=\"text-align: center; color: #f00;\">Error: {str(e)}</td> </tr>"
+                    oos_period_stats_html += f"<tr> <td>{i}</td> <td>{oos_period.index[0].strftime('%Y-%m-%d')} to {oos_period.index[-1].strftime('%Y-%m-%d')}</td> <td colspan=\"9\" style=\"text-align: center; color: #f00;\">Error: {str(e)}</td> </tr>"
             
             oos_period_stats_html += "</tbody></table>"
             html_content += oos_period_stats_html
@@ -3208,7 +3804,9 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     html_content += "<h3>Correlation & Importance Analysis</h3>"
     html_content += param_analysis_html
     html_content += ' </div> '
-    html_content += conv_script + ' ' + pareto3d_script + ' ' + pareto2d_script + ' ' + paretosize_script + ' ' + param_analysis_scripts
+    html_content += conv_script + ' ' + pareto3d_script + ' ' + pareto2d_script + ' ' + paretosize_script + ' '
+    html_content += (elite_hist_script + ' ' + elite_sc_script + ' ').strip() + ' '
+    html_content += param_analysis_scripts
     
     # All Solutions Table (Moved to bottom)
     html_content += ' <h2>All Solutions<span class="tooltip-icon">?</span> <span class="tooltip">Complete list of all Pareto-optimal solutions ranked by Sortino Ratio.</span> </h2> <div class="info-section"> '
@@ -3750,12 +4348,43 @@ def main():
         
         # Create dummy logbook and hof for dashboard generation
         logbook = tools.Logbook()
-        logbook.header = "gen", "evals", "avg_sortino", "avg_dd", "avg_pf", "pareto_size", "avg_trades_day", "max_trades_day", "avg_total_profit", "avg_profit_per_trade", "actual_dd_best", "actual_sortino_best", "actual_pf_best", "actual_pnl_best"
-        logbook.record(gen=0, evals=1, avg_sortino=is_res['sortino'], avg_dd=is_res['max_drawdown'], avg_pf=is_res['profit_factor'],
-                       pareto_size=1, avg_trades_day=is_res['avg_trades_day'], max_trades_day=is_res['avg_trades_day'],
-                       avg_total_profit=is_res['total_profit'], avg_profit_per_trade=is_res.get('avg_profit_per_trade', 0),
-                       actual_dd_best=is_res['max_drawdown'], actual_sortino_best=is_res['sortino'],
-                       actual_pf_best=is_res['profit_factor'], actual_pnl_best=is_res['total_profit'])
+        logbook.header = GA_LOGBOOK_HEADER_FULL
+        _s0, _dd0, _pf0, _td0, _pnl0, _ppt0 = (
+            is_res['sortino'], is_res['max_drawdown'], is_res['profit_factor'],
+            is_res['avg_trades_day'], is_res['total_profit'], is_res.get('avg_profit_per_trade', 0),
+        )
+
+        def _norm_div(k, default):
+            meta = param_dict.get(k, {})
+            if isinstance(meta, dict):
+                return float(meta.get('value', default))
+            return float(default)
+
+        _sm = _norm_div('NORM_SORTINO_MAX', 10.0)
+        _dm = _norm_div('NORM_DD_MAX', 100000.0)
+        _pm = _norm_div('NORM_PF_MAX', 5.0)
+        _tm = _norm_div('NORM_TRADES_MAX', 3.0)
+        _nm = _norm_div('NORM_PNL_MAX', 200000.0)
+        _xm = _norm_div('NORM_PROFIT_TRADE_MAX', 250.0)
+        _uc_s = float(_s0) / _sm if _sm else 0.0
+        _uc_d = float(_dd0) / _dm if _dm else 0.0
+        _uc_p = float(_pf0) / _pm if _pm else 0.0
+        _uc_t = float(_td0) / _tm if _tm else 0.0
+        _uc_n = float(_pnl0) / _nm if _nm else 0.0
+        _uc_x = float(_ppt0) / _xm if _xm else 0.0
+
+        logbook.record(gen=0, evals=1, avg_sortino=_s0, avg_dd=_dd0, avg_pf=_pf0,
+                       pareto_size=1, avg_trades_day=_td0, max_trades_day=_td0,
+                       avg_total_profit=_pnl0, avg_profit_per_trade=_ppt0,
+                       actual_dd_best=_dd0, actual_sortino_best=_s0,
+                       actual_pf_best=_pf0, actual_pnl_best=_pnl0,
+                       max_uc_sortino=_uc_s, max_uc_dd=_uc_d, max_uc_pf=_uc_p,
+                       max_uc_trades=_uc_t, max_uc_pnl=_uc_n, max_uc_ppt=_uc_x,
+                       pop_min_sortino=_s0, pop_std_sortino=0.0, pop_max_dd_norm=_dd0, pop_std_dd=0.0,
+                       pop_min_pf=_pf0, pop_std_pf=0.0, pop_min_trades_day=_td0, pop_std_trades_day=0.0,
+                       pop_avg_trades_day=_td0, pop_max_total_profit=_pnl0, pop_min_total_profit=_pnl0,
+                       pop_std_total_profit=0.0, pop_max_profit_per_trade=_ppt0, pop_min_profit_per_trade=_ppt0,
+                       pop_std_profit_per_trade=0.0, pop_avg_profit_per_trade=_ppt0)
         
         hof = tools.ParetoFront()
         hof.update([best_ind]) # Add the single best individual to hof
@@ -3815,6 +4444,7 @@ def main():
     
     if checkpoint_data is not None:
         pop, hof, logbook, start_gen, saved_config = checkpoint_data
+        extend_logbook_header_for_pop_stats(logbook)
         
         # CRITICAL FIX: Clamp all individuals in loaded population to valid parameter ranges
         # Checkpoint may contain individuals with values outside valid ranges
@@ -3853,7 +4483,7 @@ def main():
                 clamp_individual(ind)
             hof = tools.ParetoFront()  # Store Pareto-optimal solutions
             logbook = tools.Logbook()
-            logbook.header = "gen", "evals", "avg_sortino", "avg_dd", "avg_pf", "pareto_size", "avg_trades_day", "max_trades_day", "avg_total_profit", "actual_dd_best", "actual_sortino_best", "actual_pf_best", "actual_pnl_best"
+            logbook.header = GA_LOGBOOK_HEADER_FULL
             start_gen = 0
         elif not verify_config_compatibility(saved_config, current_config):
             print("\nWARNING: Config mismatch detected!")
@@ -3867,7 +4497,7 @@ def main():
             clamp_individual(ind)
         hof = tools.ParetoFront()  # Store Pareto-optimal solutions
         logbook = tools.Logbook()
-        logbook.header = "gen", "evals", "avg_sortino", "avg_dd", "avg_pf", "pareto_size", "avg_trades_day", "max_trades_day", "avg_total_profit", "avg_profit_per_trade", "actual_dd_best", "actual_sortino_best", "actual_pf_best", "actual_pnl_best"
+        logbook.header = GA_LOGBOOK_HEADER_FULL
         start_gen = 0
         print("\nStarting fresh run...")
     
@@ -3884,7 +4514,24 @@ def main():
     # We'll track actual drawdown separately by re-running backtests for the best individual
     stats.register("max_sortino", lambda x: np.max([f[0] for f in x]))
     stats.register("max_pf", lambda x: np.max([f[2] for f in x]))
-    stats.register("max_trades_day", lambda x: np.max([f[3] for f in x]))  # Max avg trades/day
+    stats.register("max_trades_day", lambda x: np.max([f[3] for f in x]))  # max normalized trades score in pop (0-1)
+    # Population distribution stats for convergence bands (dashboard only; does not affect selection)
+    stats.register("pop_min_sortino", lambda x: np.min([f[0] for f in x]))
+    stats.register("pop_std_sortino", lambda x: np.std([f[0] for f in x], ddof=0))
+    stats.register("pop_max_dd_norm", lambda x: np.max([f[1] for f in x]))
+    stats.register("pop_std_dd", lambda x: np.std([f[1] for f in x], ddof=0))
+    stats.register("pop_min_pf", lambda x: np.min([f[2] for f in x]))
+    stats.register("pop_std_pf", lambda x: np.std([f[2] for f in x], ddof=0))
+    stats.register("pop_min_trades_day", lambda x: np.min([f[3] for f in x]))
+    stats.register("pop_std_trades_day", lambda x: np.std([f[3] for f in x], ddof=0))
+    stats.register("pop_avg_trades_day", lambda x: np.mean([f[3] for f in x]))
+    stats.register("pop_max_total_profit", lambda x: np.max([f[4] for f in x if len(f) > 4]))
+    stats.register("pop_min_total_profit", lambda x: np.min([f[4] for f in x if len(f) > 4]))
+    stats.register("pop_std_total_profit", lambda x: np.std([f[4] for f in x if len(f) > 4], ddof=0))
+    stats.register("pop_max_profit_per_trade", lambda x: np.max([f[5] for f in x if len(f) > 5]))
+    stats.register("pop_min_profit_per_trade", lambda x: np.min([f[5] for f in x if len(f) > 5]))
+    stats.register("pop_std_profit_per_trade", lambda x: np.std([f[5] for f in x if len(f) > 5], ddof=0))
+    stats.register("pop_avg_profit_per_trade", lambda x: np.mean([f[5] for f in x if len(f) > 5]))
     
     if start_gen == 0:
         print(logbook.header)
@@ -3987,21 +4634,25 @@ def main():
                 
                 # Validate all fitness tuples have correct length BEFORE assignment
                 invalid_fits = []
-                for idx, fit in enumerate(fits):
-                    if len(fit) != 6:
-                        invalid_fits.append((idx, fit, len(fit)))
+                for idx, item in enumerate(fits):
+                    fit6, _unc = _parallel_eval_result_to_fit_unc(item)
+                    if len(fit6) != 6:
+                        invalid_fits.append((idx, item, len(fit6)))
                 
                 if invalid_fits:
                     print(f"  (!)  ERROR: Found {len(invalid_fits)} fitness tuples with wrong length:")
                     for idx, fit, length in invalid_fits[:5]:  # Show first 5
                         print(f"    Individual {idx}: length={length}, values={fit}")
                     # Fix them
+                    _bad_fit = (-1000.0, 100000.0, 0.0, 0.0, 0.0, 0.0)
+                    _bad_uc = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                     for idx, fit, length in invalid_fits:
-                        fits[idx] = (-1000.0, 100000.0, 0.0, 0.0, 0.0, 0.0)
+                        fits[idx] = (_bad_fit, _bad_uc)
                     print(f"  Fixed {len(invalid_fits)} invalid fitness tuples.")
                 
                 # Diagnostic: Check if all solutions are getting penalized
-                penalty_count = sum(1 for f in fits if f[0] < 0)  # Count negative Sortino (penalties)
+                penalty_count = sum(
+                    1 for it in fits if _parallel_eval_result_to_fit_unc(it)[0][0] < 0)
                 if penalty_count == len(fits) and gen % 5 == 0:  # Only print every 5 generations to avoid spam
                     print(f"  (!)  WARNING: All {len(fits)} solutions are getting penalized (likely failing MIN_TRADES_DAY={MIN_TRADES_DAY})")
                     # Sample a few to see what avg_trades_day values are
@@ -4045,15 +4696,21 @@ def main():
                         fits.append((-1000.0, 100000.0, 0.0, 0.0, 0.0, 0.0))  # Very poor fitness (6 objectives)
             
             # Assign fitness values
-            for idx, (fit, ind) in enumerate(zip(fits, offspring)):
+            for idx, (item, ind) in enumerate(zip(fits, offspring)):
+                fit, unc = _parallel_eval_result_to_fit_unc(item)
                 # Safety check: ensure fitness has correct number of values
                 if len(fit) != 6:
                     print(f"  ERROR: Individual {idx} has fitness tuple with {len(fit)} values, expected 6.")
                     print(f"  Fitness values: {fit}")
                     print(f"  Assigning poor fitness instead.")
                     fit = (-1000.0, 100000.0, 0.0, 0.0, 0.0, 0.0)  # 6 objectives
+                    unc = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                 # Convert numpy types to Python floats (DEAP requires native Python types)
                 fit = tuple(float(x) for x in fit)
+                try:
+                    setattr(ind, 'uncapped_ratios', tuple(float(x) for x in unc))
+                except Exception:
+                    pass
                 
                 # Check if individual's fitness object has correct weights BEFORE assignment
                 if hasattr(ind.fitness, 'weights') and len(ind.fitness.weights) != 6:
@@ -4144,6 +4801,7 @@ def main():
             # Record statistics
             record = stats.compile(pop)
             record['pareto_size'] = len(hof)
+            _inject_max_uc_from_offspring(record, offspring)
             
             # Calculate avg_trades_day for best individual (for tracking)
             # Use current generation best for convergence plots (shows progress per generation)
@@ -4223,7 +4881,11 @@ def main():
             
             print(f"{gen}\t{len(pop)}\t{round(record['avg_sortino'], 4)}\t{round(record['avg_dd'], 2)}\t{round(record['avg_pf'], 4)}\t{len(hof)}")
             actual_dd_str = f", Actual DD=${record.get('actual_dd_best', 0):,.0f}" if 'actual_dd_best' in record else ""
-            print(f"  Best: Sortino={round(record['max_sortino'], 4)}, DD={round(record['min_dd'], 2)} (norm){actual_dd_str}, PF={round(record['max_pf'], 4)}")
+            _pdn = record.get('pop_max_dd_norm')
+            _dd_mx_s = (
+                f"{round(float(_pdn), 4)}" if isinstance(_pdn, (int, float)) and not (np.isnan(_pdn) or np.isinf(_pdn)) else "n/a"
+            )
+            print(f"  Best: Sortino={round(record['max_sortino'], 4)}, DD max in pop (norm)={_dd_mx_s}{actual_dd_str}, PF={round(record['max_pf'], 4)}")
             if 'avg_trades_day' in record:
                 print(f"  Avg Trades/Day: {record['avg_trades_day']:.3f}")
             
@@ -4693,6 +5355,78 @@ def main():
             print(f"{label}: PNL={total_pnl:,.0f} | Win%={win_rate:.1f} | PF={pf:.2f} | Calmar={calmar:.2f}")
     
     # ------------------------------------------------------------------
+    # Write genetic_results_*.csv early (before plots + dashboard)
+    # Each solution runs split-level + aggregate backtests; large HoF can take a long time.
+    # ------------------------------------------------------------------
+    print("\n=== Writing optimized parameters CSV (genetic_results) ===")
+    print(
+        "  This step can take many minutes if HoF is large (split backtests per solution). "
+        "By default, CSV export includes all HoF solutions; set TRADING_GA_CSV_MAX_SOLUTIONS to cap.",
+        flush=True,
+    )
+
+    def _csv_dash_progress(done, total):
+        """Refresh live dashboard during CSV row build (throttled inside save_optimized_results)."""
+        os.makedirs(WEB_DIR, exist_ok=True)
+        phase_fp = os.path.join(DIAG_DIR, 'csv_export_phase_start.txt')
+        if done == 0:
+            try:
+                with open(phase_fp, 'w') as f:
+                    f.write(str(time.time()))
+            except OSError:
+                pass
+        try:
+            generate_html_dashboard(
+                hof,
+                best,
+                best_params,
+                best_fitness,
+                param_keys,
+                param_dict,
+                logbook,
+                is_res,
+                oos_res,
+                trades_is,
+                trades_oos,
+                WEB_DASHBOARD,
+                DIAG_DIR,
+                current_gen=NUM_GEN,
+                total_gen=NUM_GEN,
+                is_final=False,
+                auto_launch=False,
+                is_periods=is_periods if 'is_periods' in locals() else None,
+                oos_periods=oos_periods if 'oos_periods' in locals() else None,
+                in_sample=in_sample if 'in_sample' in locals() else None,
+                best_gen_found=best_gen_found if 'best_gen_found' in locals() else None,
+                pop=pop if 'pop' in locals() else None,
+                csv_export_index=done,
+                csv_export_total=total,
+            )
+        except Exception as e:
+            print(f"  WARNING: CSV-phase dashboard refresh failed: {e}", flush=True)
+        try:
+            import shutil
+            if os.path.exists(WEB_DASHBOARD):
+                shutil.copy2(WEB_DASHBOARD, HTML_DASHBOARD)
+        except Exception:
+            pass
+
+    save_optimized_results(
+        hof,
+        best,
+        param_df,
+        param_dict,
+        in_sample,
+        oos,
+        is_mask,
+        is_periods,
+        oos_periods,
+        suffix,
+        oos_mask=oos_mask if 'oos_mask' in locals() else None,
+        csv_progress_callback=_csv_dash_progress,
+    )
+    
+    # ------------------------------------------------------------------
     # DIAGNOSTIC PLOTS  ga_diagnostics/
     # ------------------------------------------------------------------
     # Convergence plots for each objective
@@ -4788,8 +5522,14 @@ def main():
     
     # Parameter evolution (for best solution)
     os.makedirs(f'{DIAG_DIR}/param_evolution', exist_ok=True)
-    for i, pname in enumerate(param_keys):
-        # Get parameter value from best solution
+    n_pe = min(len(param_keys), len(best))
+    if n_pe < len(param_keys):
+        print(
+            f"  WARNING: best genome length ({len(best)}) < param_keys ({len(param_keys)}); "
+            f"param evolution plots only for first {n_pe} params (checkpoint/CSV mismatch)."
+        )
+    for i in range(n_pe):
+        pname = param_keys[i]
         val = best[i]
         plt.figure(figsize=(6, 3))
         plt.axhline(y=val, color='r', linestyle='--', label=f'Final: {val:.4f}')
@@ -4826,10 +5566,12 @@ def main():
         plt.close()
         print(f"Plot  {DIAG_DIR}/oos_win_loss.png")
         
-        trades_oos['duration'] = (trades_oos['exit_time'] - trades_oos['entry_time']).dt.total_seconds() / 60
+        trades_oos = trades_oos.copy()
+        _plot_tf = float(max(1, int(best_params.get('Timeframe (minutes)', 15) or 15)))
+        trades_oos['duration'] = _trade_duration_minutes_bar_aligned(trades_oos, _plot_tf)
         plt.figure(figsize=(8, 4))
         trades_oos['duration'].hist(bins=20)
-        plt.title('OOS Trade Duration (min)')
+        plt.title('OOS trade span (bar-grid minutes)')
         plt.xlabel('Minutes')
         plt.ylabel('Count')
         plt.grid()
@@ -4882,24 +5624,85 @@ def main():
             print("Start time file cleaned up.")
         except:
             pass
-    # ------------------------------------------------------------------
-    # Write optimized CSV
-    # ------------------------------------------------------------------
-    save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_mask, is_periods, oos_periods, suffix, oos_mask=oos_mask if 'oos_mask' in locals() else None)
 
-def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_mask, is_periods, oos_periods, suffix, oos_mask=None):
+def _select_hof_for_csv_export(hof):
+    """
+    CSV export runs split-detail + aggregate backtests per solution and can dominate
+    wall time when the Pareto front is large.
+
+    Environment:
+      TRADING_GA_CSV_MAX_SOLUTIONS  (default: uncapped when unset/blank)
+        - Positive integer: export at most this many solutions (ranked by fitness Sortino).
+        - 0 or negative: export all solutions in HoF (slow).
+
+    Returns:
+        (list of individuals to export, truncated: bool)
+    """
+    if not hof:
+        return [], False
+
+    raw = os.environ.get('TRADING_GA_CSV_MAX_SOLUTIONS', '').strip()
+    if raw == '':
+        max_n = 0
+    else:
+        try:
+            max_n = int(raw)
+        except ValueError:
+            max_n = 0
+
+    if max_n <= 0 or max_n >= len(hof):
+        return list(hof), False
+
+    ranked = sorted(hof, key=lambda ind: ind.fitness.values[0], reverse=True)
+    return ranked[:max_n], True
+
+
+def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_mask, is_periods, oos_periods, suffix, oos_mask=None,
+                           csv_progress_callback=None):
     """
     Generate and save the optimized parameter CSV with robustness metrics and per-split details.
     """
     global param_keys, OUTPUT_CSV, CHECKPOINT_FILE, DIAG_DIR
     
-    # (Removed redundant nested call)
-    
+    hof_export, truncated = _select_hof_for_csv_export(hof)
+    if not hof_export:
+        print("WARNING: No Hall-of-Fame solutions to export; skipping CSV.")
+        return
+
+    if truncated:
+        print(
+            f"  CSV export: using top {len(hof_export)} of {len(hof)} Pareto solutions "
+            f"(by fitness Sortino). Set TRADING_GA_CSV_MAX_SOLUTIONS=0 to export all.",
+            flush=True,
+        )
+    else:
+        print(f"  CSV export: using all {len(hof_export)} Pareto solutions.", flush=True)
+
+    n_export = len(hof_export)
+    _ev_raw = os.environ.get('TRADING_GA_DASH_CSV_PROGRESS_EVERY', '').strip()
+    try:
+        _dash_every = int(_ev_raw) if _ev_raw else 10
+    except ValueError:
+        _dash_every = 10
+    _dash_every = max(1, _dash_every)
+
+    if csv_progress_callback and n_export > 0:
+        try:
+            csv_progress_callback(0, n_export)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
-    # Write optimized CSV with ALL Pareto solutions as columns
+    # Write optimized CSV with Pareto solutions as columns (possibly capped)
     # ------------------------------------------------------------------
     solutions_data = []
-    for i, ind in enumerate(hof):
+    for i, ind in enumerate(hof_export):
+        if len(hof_export) <= 25 or i == 0 or (i + 1) % max(1, len(hof_export) // 10) == 0 or i == len(hof_export) - 1:
+            print(
+                f"    Building CSV rows: solution {i + 1}/{len(hof_export)} "
+                f"(fitness Sortino={ind.fitness.values[0]:.4f})...",
+                flush=True,
+            )
         raw_params = dict(zip(param_keys, ind))
         clamped_params = finalize_ga_solution_params(raw_params, param_dict)
         clamped_params = merge_solution_params_with_template(clamped_params, param_dict, param_df)
@@ -4925,6 +5728,7 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
             'avg_trades_day': float(sol_is_res.get('avg_trades_day', 0)),
             'total_profit': float(sol_is_res.get('total_profit', 0)),
             'avg_profit_per_trade': float(sol_is_res.get('avg_profit_per_trade', 0)),
+            'avg_trade_duration_min': float(sol_is_res.get('avg_trade_duration_min', 0)),
             'fitness_vector': tuple(float(x) for x in fitness),
             'is_selected': (ind == best),
             'robustness': robust,
@@ -4933,7 +5737,15 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
             'is_aggregate': sol_is_res,
             'oos_aggregate': sol_oos_res
         })
-    
+
+        if csv_progress_callback and n_export > 0:
+            done = i + 1
+            if done == 1 or done == n_export or (done % _dash_every) == 0:
+                try:
+                    csv_progress_callback(done, n_export)
+                except Exception:
+                    pass
+
     # Sort by Sortino (descending)
     solutions_data.sort(key=lambda x: x['sortino'], reverse=True)
     
@@ -4975,6 +5787,7 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         ('Avg Trades/Day (IS aggregate)', 'avg_trades_day', '{:.3f}'),
         ('Total Profit ($) (IS aggregate)', 'total_profit', '${:,.2f}'),
         ('Avg Profit/Trade ($) (IS aggregate)', 'avg_profit_per_trade', '${:,.2f}'),
+        ('Avg Trade Span (min, bar grid) (IS aggregate)', 'avg_trade_duration_min', '{:.2f}'),
     ]
     
     for metric_name, metric_key, format_str in metrics:
@@ -4991,6 +5804,7 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         ('Avg Trades/Day (OOS aggregate)', 'avg_trades_day', '{:.3f}'),
         ('Total Profit ($) (OOS aggregate)', 'total_profit', '${:,.2f}'),
         ('Avg Profit/Trade ($) (OOS aggregate)', 'avg_profit_per_trade', '${:,.2f}'),
+        ('Avg Trade Span (min, bar grid) (OOS aggregate)', 'avg_trade_duration_min', '{:.2f}'),
     ]
     for metric_name, metric_key, format_str in oos_metrics:
         row = {'Name': metric_name, 'Type': 'statistic', 'Description': f'{metric_name} for each solution'}
@@ -5116,9 +5930,24 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         
     # Per-Split Detail (In-Sample)
     stats_rows.append({'Name': '--- PER-SPLIT DETAIL (In-Sample) ---', 'Type': ''})
-    split_metrics = ['sortino', 'avg_trades_day', 'profit_factor', 'max_drawdown', 'total_profit', 'avg_profit_per_trade']
-    metric_labels = {'sortino': 'Sortino', 'avg_trades_day': 'Trades/D', 'profit_factor': 'Profit Fac', 
-                     'max_drawdown': 'Max DD', 'total_profit': 'Total PNL', 'avg_profit_per_trade': 'Avg Profit/Tr'}
+    split_metrics = [
+        'sortino',
+        'avg_trades_day',
+        'profit_factor',
+        'max_drawdown',
+        'total_profit',
+        'avg_profit_per_trade',
+        'avg_trade_duration_min',
+    ]
+    metric_labels = {
+        'sortino': 'Sortino',
+        'avg_trades_day': 'Trades/D',
+        'profit_factor': 'Profit Fac',
+        'max_drawdown': 'Max DD',
+        'total_profit': 'Total PNL',
+        'avg_profit_per_trade': 'Avg Profit/Tr',
+        'avg_trade_duration_min': 'Span (min)',
+    }
     
     all_is_periods = sorted(list(set(p['period_name'] for sol in solutions_data for p in sol['is_periods'])), key=lambda x: int(x[1:]))
     for p_name in all_is_periods:
@@ -5133,6 +5962,8 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
                     val = p_res.get(m_key, 0)
                     if m_key in ['max_drawdown', 'total_profit', 'avg_profit_per_trade']:
                         row[col_name] = f"${val:,.2f}"
+                    elif m_key == 'avg_trade_duration_min':
+                        row[col_name] = f"{float(val):.2f}"
                     else:
                         row[col_name] = f"{val:.4f}" if m_key != 'avg_trades_day' else f"{val:.3f}"
                 else: row[col_name] = "N/A"
@@ -5153,6 +5984,8 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
                     val = p_res.get(m_key, 0)
                     if m_key in ['max_drawdown', 'total_profit', 'avg_profit_per_trade']:
                         row[col_name] = f"${val:,.2f}"
+                    elif m_key == 'avg_trade_duration_min':
+                        row[col_name] = f"{float(val):.2f}"
                     else:
                         row[col_name] = f"{val:.4f}" if m_key != 'avg_trades_day' else f"{val:.3f}"
                 else: row[col_name] = "N/A"

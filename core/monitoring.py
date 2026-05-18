@@ -3,15 +3,314 @@ core/monitoring.py - Bar Processing, Indicator Updates, and Data Recording
 Ported from ib_deployment_v4.py lines 1735-2095
 Made strategy-agnostic to support Bollinger, Trend, and future strategies.
 """
+import asyncio
 import os
+import json
 import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import pytz
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.account import add_to_live_tracker
 from core.execution import check_entries, check_exits
+
+# Async bar pipeline: IB calls on_bar_update_handler synchronously; enqueue OHLCV snapshots so the
+# asyncio loop can run dashboard writes and IB I/O while pandas/strategy work runs in a consumer.
+BAR_PIPELINE_QUEUE: Optional[asyncio.Queue] = None
+BAR_PIPELINE_CTX: Optional[Dict[str, Any]] = None
+
+
+def configure_bar_pipeline(queue: asyncio.Queue, ctx: Dict[str, Any]) -> None:
+    global BAR_PIPELINE_QUEUE, BAR_PIPELINE_CTX
+    BAR_PIPELINE_QUEUE = queue
+    BAR_PIPELINE_CTX = ctx
+
+
+async def _async_process_bar_snapshot(
+    snap: List[Tuple[Any, float, float, float, float, float]],
+    has_new: bool,
+    ctx: Dict[str, Any],
+) -> None:
+    strategy = ctx["strategy"]
+    ib = ctx["ib"]
+    contract = ctx["contract"]
+    data_ref = ctx["data_ref"]
+    positions = ctx["positions"]
+    completed_trades = ctx["completed_trades"]
+    live_tracker = ctx["live_tracker"]
+    bar_log = ctx["bar_log"]
+    dashboard_state = ctx.get("dashboard_state")
+    send_email_fn = ctx["send_email_fn"]
+    output_dir = ctx["output_dir"]
+
+    await asyncio.sleep(0)
+    try:
+        df = pd.DataFrame(
+            snap, columns=["datetime", "open", "high", "low", "close", "volume"]
+        )
+        if df.empty:
+            return
+
+        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_convert("US/Eastern")
+        df.set_index("datetime", inplace=True)
+        data = df[["open", "high", "low", "close", "volume"]].copy()
+        data_ref["data"] = data
+
+        bar_time = data.index[-1]
+        latest_row = data.iloc[-1]
+
+        current_time = datetime.now(pytz.timezone("US/Eastern"))
+        delay = (current_time - bar_time).total_seconds()
+        delay_tag = " [LIVE]" if delay < 10 else (" [DELAYED]" if delay > 900 else "")
+
+        update_type = " [NEW]" if has_new else " [UPD]"
+        log_msg = (
+            f"[1-min bar]{update_type} {bar_time.strftime('%H:%M:%S')}{delay_tag} | "
+            f"O: {latest_row['open']:.2f} H: {latest_row['high']:.2f} "
+            f"L: {latest_row['low']:.2f} C: {latest_row['close']:.2f} | "
+            f"Vol: {latest_row['volume']:,.0f}"
+        )
+        if has_new:
+            logging.info(log_msg)
+        else:
+            logging.debug(log_msg)
+
+        if dashboard_state:
+            dashboard_state.current_price = latest_row["close"]
+
+        should_check = False
+        if strategy.timeframe == 1:
+            should_check = has_new
+        elif strategy.timeframe > 1 and has_new:
+            total_min = bar_time.hour * 60 + bar_time.minute
+            should_check = total_min % strategy.timeframe == 0
+
+        await asyncio.sleep(0)
+        update_indicators(strategy, data)
+
+        min_bars = strategy.min_bars_required
+
+        await asyncio.sleep(0)
+        if should_check and len(data) >= 2:
+            resampled_df = resample_data(data, strategy.timeframe)
+            if len(resampled_df) < 2:
+                return
+
+            resampled_ind = strategy.calculate_indicators(resampled_df.copy())
+            try:
+                resampled_filt = strategy.apply_filters(resampled_ind)
+            except Exception:
+                resampled_filt = resampled_ind
+
+            completed_idx = resampled_filt.index[-2]
+            completed_row = resampled_filt.iloc[-2]
+
+            bar_info = (
+                f"[{strategy.timeframe}-min] {completed_idx.strftime('%H:%M:%S')} | "
+                f"O: {completed_row.get('open', 0):.2f} H: {completed_row.get('high', 0):.2f} "
+                f"L: {completed_row.get('low', 0):.2f} C: {completed_row.get('close', 0):.2f} | "
+                f"Vol: {completed_row.get('volume', 0):,.0f}"
+            )
+            logging.info(bar_info)
+
+            # Record bar history before entry/exit work so a trading exception cannot
+            # freeze the dashboard bar log while the live chart keeps updating.
+            bar_log.append({
+                "timestamp": completed_idx.strftime("%H:%M:%S"),
+                "bar_info": bar_info,
+                "entry_criteria": "",
+            })
+            if len(bar_log) > 20:
+                del bar_log[:-20]
+
+            entry_criteria = ""
+            if _indicators_ready(data):
+                try:
+                    entry_criteria = log_entry_criteria_status(
+                        strategy, positions, completed_row, resampled_filt, output_dir=output_dir
+                    )
+                    save_live_data_row(output_dir, completed_idx, completed_row, resampled_filt)
+                    check_entries(
+                        strategy, ib, contract, data, positions, {},
+                        live_tracker, dashboard_state, send_email_fn, completed_idx, completed_row
+                    )
+                    check_exits(
+                        strategy, ib, contract, data, positions, completed_trades,
+                        live_tracker, send_email_fn, completed_idx, completed_row,
+                        allow_strategy_exit=True
+                    )
+                    append_open_trade_timeline(output_dir, completed_idx, completed_row, positions)
+                except Exception as e:
+                    logging.error(
+                        "Bar %s: entry/exit processing failed (bar log still recorded): %s",
+                        completed_idx,
+                        e,
+                        exc_info=True,
+                    )
+            if bar_log:
+                bar_log[-1]["entry_criteria"] = entry_criteria
+
+        await asyncio.sleep(0)
+        if len(data) >= min_bars and _indicators_ready(data):
+            check_exits(
+                strategy, ib, contract, data, positions, completed_trades,
+                live_tracker, send_email_fn, data.index[-1], data.iloc[-1],
+                allow_strategy_exit=False
+            )
+
+    except Exception as e:
+        bar_time_str = "unknown"
+        try:
+            bar_time_str = snap[-1][0].strftime("%H:%M:%S")
+        except Exception:
+            pass
+        logging.error(
+            f"Error in on_bar_update at {bar_time_str}: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
+
+
+def _sync_on_bar_update_legacy(
+    snap, has_new, *, strategy, ib, contract, data_ref,
+    positions, completed_trades, live_tracker, bar_log,
+    dashboard_state, send_email_fn, output_dir, last_data_receipt,
+):
+    try:
+        df = pd.DataFrame(
+            snap, columns=["datetime", "open", "high", "low", "close", "volume"]
+        )
+        if df.empty:
+            return
+
+        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_convert("US/Eastern")
+        df.set_index("datetime", inplace=True)
+        data = df[["open", "high", "low", "close", "volume"]].copy()
+        data_ref["data"] = data
+
+        bar_time = data.index[-1]
+        latest_row = data.iloc[-1]
+
+        current_time = datetime.now(pytz.timezone("US/Eastern"))
+        delay = (current_time - bar_time).total_seconds()
+        delay_tag = " [LIVE]" if delay < 10 else (" [DELAYED]" if delay > 900 else "")
+
+        update_type = " [NEW]" if has_new else " [UPD]"
+        log_msg = (
+            f"[1-min bar]{update_type} {bar_time.strftime('%H:%M:%S')}{delay_tag} | "
+            f"O: {latest_row['open']:.2f} H: {latest_row['high']:.2f} "
+            f"L: {latest_row['low']:.2f} C: {latest_row['close']:.2f} | "
+            f"Vol: {latest_row['volume']:,.0f}"
+        )
+        if has_new:
+            logging.info(log_msg)
+        else:
+            logging.debug(log_msg)
+
+        if dashboard_state:
+            dashboard_state.current_price = latest_row["close"]
+
+        should_check = False
+        if strategy.timeframe == 1:
+            should_check = has_new
+        elif strategy.timeframe > 1 and has_new:
+            total_min = bar_time.hour * 60 + bar_time.minute
+            should_check = total_min % strategy.timeframe == 0
+
+        update_indicators(strategy, data)
+
+        min_bars = strategy.min_bars_required
+
+        if should_check and len(data) >= 2:
+            resampled_df = resample_data(data, strategy.timeframe)
+            if len(resampled_df) < 2:
+                return
+
+            resampled_ind = strategy.calculate_indicators(resampled_df.copy())
+            try:
+                resampled_filt = strategy.apply_filters(resampled_ind)
+            except Exception:
+                resampled_filt = resampled_ind
+
+            completed_idx = resampled_filt.index[-2]
+            completed_row = resampled_filt.iloc[-2]
+
+            bar_info = (
+                f"[{strategy.timeframe}-min] {completed_idx.strftime('%H:%M:%S')} | "
+                f"O: {completed_row.get('open', 0):.2f} H: {completed_row.get('high', 0):.2f} "
+                f"L: {completed_row.get('low', 0):.2f} C: {completed_row.get('close', 0):.2f} | "
+                f"Vol: {completed_row.get('volume', 0):,.0f}"
+            )
+            logging.info(bar_info)
+
+            bar_log.append({
+                "timestamp": completed_idx.strftime("%H:%M:%S"),
+                "bar_info": bar_info,
+                "entry_criteria": "",
+            })
+            if len(bar_log) > 20:
+                del bar_log[:-20]
+
+            entry_criteria = ""
+            if _indicators_ready(data):
+                try:
+                    entry_criteria = log_entry_criteria_status(
+                        strategy, positions, completed_row, resampled_filt, output_dir=output_dir
+                    )
+                    save_live_data_row(output_dir, completed_idx, completed_row, resampled_filt)
+                    check_entries(
+                        strategy, ib, contract, data, positions, {},
+                        live_tracker, dashboard_state, send_email_fn, completed_idx, completed_row
+                    )
+                    check_exits(
+                        strategy, ib, contract, data, positions, completed_trades,
+                        live_tracker, send_email_fn, completed_idx, completed_row,
+                        allow_strategy_exit=True
+                    )
+                    append_open_trade_timeline(output_dir, completed_idx, completed_row, positions)
+                except Exception as e:
+                    logging.error(
+                        "Bar %s: entry/exit processing failed (bar log still recorded): %s",
+                        completed_idx,
+                        e,
+                        exc_info=True,
+                    )
+            if bar_log:
+                bar_log[-1]["entry_criteria"] = entry_criteria
+
+        if len(data) >= min_bars and _indicators_ready(data):
+            check_exits(
+                strategy, ib, contract, data, positions, completed_trades,
+                live_tracker, send_email_fn, data.index[-1], data.iloc[-1],
+                allow_strategy_exit=False
+            )
+
+    except Exception as e:
+        bar_time_str = "unknown"
+        try:
+            bar_time_str = snap[-1][0].strftime("%H:%M:%S")
+        except Exception:
+            pass
+        logging.error(
+            f"Error in on_bar_update at {bar_time_str}: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
+
+
+async def bar_pipeline_consumer() -> None:
+    if BAR_PIPELINE_QUEUE is None or BAR_PIPELINE_CTX is None:
+        logging.error("bar_pipeline_consumer started without configure_bar_pipeline")
+        return
+    while True:
+        job = await BAR_PIPELINE_QUEUE.get()
+        try:
+            snap, has_new = job
+            await _async_process_bar_snapshot(snap, has_new, BAR_PIPELINE_CTX)
+        except Exception as e:
+            logging.error("Bar pipeline consumer error: %s", e, exc_info=True)
+        finally:
+            BAR_PIPELINE_QUEUE.task_done()
 
 
 def resample_data(df, timeframe_mins):
@@ -121,6 +420,54 @@ def save_live_data_row(output_dir, timestamp, row, full_df):
             row_series.to_frame().T.to_csv(csv_path, mode='a', header=False)
     except Exception as e:
         logging.error(f"Failed to save live data row: {e}")
+
+
+def append_open_trade_timeline(output_dir, timestamp, row, positions):
+    """Append per-bar diagnostics for each open tracked trade (for forensic reconstruction)."""
+    if not output_dir or not positions:
+        return
+    try:
+        path = os.path.join(output_dir, "open_trade_timeline.jsonl")
+        ts = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
+        close_px = float(row.get('close', 0) or 0)
+        for b in positions:
+            direction = b.get('direction', 0)
+            stop_order = b.get('stopLoss')
+            tp_order = b.get('takeProfit')
+            stop_px = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None)) if stop_order else None
+            tp_px = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+            entry_px = float(b.get('entry_price', 0) or 0)
+            qty = 1
+            if stop_order is not None and hasattr(stop_order, 'totalQuantity'):
+                qty = abs(stop_order.totalQuantity)
+            elif b.get('entry') is not None and hasattr(b.get('entry'), 'totalQuantity'):
+                qty = abs(b.get('entry').totalQuantity)
+            rec = {
+                "ts": ts,
+                "symbol": getattr(b.get('contract', None), 'localSymbol', 'ES'),
+                "direction": "LONG" if direction == 1 else "SHORT" if direction == -1 else "N/A",
+                "entry_time": b.get('entry_time').isoformat() if hasattr(b.get('entry_time'), "isoformat") else None,
+                "entry_price": entry_px,
+                "close": close_px,
+                "stop": float(stop_px) if stop_px is not None else None,
+                "tp": float(tp_px) if tp_px is not None else None,
+                "qty": qty,
+                "unrealized": ((close_px - entry_px) * direction * 50 * qty) if (entry_px and direction) else None,
+                "bar": {
+                    "open": float(row.get('open', 0) or 0),
+                    "high": float(row.get('high', 0) or 0),
+                    "low": float(row.get('low', 0) or 0),
+                    "close": close_px,
+                    "volume": float(row.get('volume', 0) or 0),
+                    "donchian_high": float(row.get('donchian_high')) if row.get('donchian_high') is not None and not pd.isna(row.get('donchian_high')) else None,
+                    "donchian_low": float(row.get('donchian_low')) if row.get('donchian_low') is not None and not pd.isna(row.get('donchian_low')) else None,
+                    "atr": float(row.get('atr')) if row.get('atr') is not None and not pd.isna(row.get('atr')) else None,
+                },
+            }
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        logging.debug(f"Failed to append open trade timeline: {e}")
 
 def save_shadow_audit(output_dir, timestamp, action_log):
     """Save rejection events to daily shadow_audit_YYYYMMDD.json."""
@@ -260,35 +607,55 @@ def log_entry_criteria_status(strategy, positions, resampled_row, data_with_filt
         parts.append(f"MaxTr: {'✅' if max_ok else '❌'}")
         parts.append(f"RTH: {'✅' if in_rth else '❌'}")
         parts.append(f"Maint: {'✅' if not in_maint else '❌'}")
+        if hasattr(strategy, 'enable_long'):
+            parts.append(f"EnL: {'✅' if strategy.enable_long else '❌'}")
+        if hasattr(strategy, 'enable_short'):
+            parts.append(f"EnS: {'✅' if strategy.enable_short else '❌'}")
         
-        # Numerical Filter Details
+        # Numerical Filter Details (Trend.get_indicator_status and similar)
         if num_status:
-            # Target columns for display
+            if 'ATR' in num_status:
+                s = num_status['ATR']
+                parts.append(
+                    f"ATRfl: {'✅' if s['pass'] else '❌'} "
+                    f"({s['value']:.2f}/{s['threshold']:.2f})"
+                )
             if 'ADX' in num_status:
                 s = num_status['ADX']
                 parts.append(f"ADX: {'✅' if s['pass'] else '❌'} ({s['value']:.1f}/{s['threshold']:.1f})")
-            
             if 'Volume' in num_status:
                 s = num_status['Volume']
-                # Compact volume display (k)
-                parts.append(f"Vol: {'✅' if s['pass'] else '❌'} ({s['value']/1000:.1f}k/{s['threshold']/1000:.1f}k)")
-                
+                parts.append(
+                    f"Vol: {'✅' if s['pass'] else '❌'} "
+                    f"({s['value']/1000:.1f}k/{s['threshold']/1000:.1f}k)"
+                )
             if 'RSI' in num_status:
                 s = num_status['RSI']
                 val = s['value']
-                target = s['buy_threshold'] if not enter_short else s['sell_threshold']
                 icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
-                parts.append(f"RSI: {icon} ({val:.1f})")
-
+                parts.append(
+                    f"RSI: {icon} ({val:.1f} / buy≤{s['buy_threshold']:.1f} sell≥{s['sell_threshold']:.1f})"
+                )
+            if 'SMA' in num_status:
+                s = num_status['SMA']
+                icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
+                sm_l = '✅' if s['pass_long'] else '❌'
+                sm_s = '✅' if s['pass_short'] else '❌'
+                parts.append(
+                    f"SMA: {icon} (C:{s['price']:.2f}/SMA:{s['sma']:.2f} L:{sm_l} S:{sm_s})"
+                )
             if 'VWAP' in num_status:
                 s = num_status['VWAP']
                 icon = '✅' if (s['pass_long'] or s['pass_short']) else '❌'
-                parts.append(f"VWAP: {icon}")
-
+                parts.append(
+                    f"VWAP: {icon} (C:{s['price']:.2f}/VWAP:{s['vwap']:.2f})"
+                )
         else:
-            # Fallback to simple emojis if no numerical status available
             parts.append(f"ATR: {'✅' if atr_filter else '❌'}")
             parts.append(f"Vol: {'✅' if vol_filter else '❌'}")
+        # Row-level volume gate when strategy has no Volume in num_status (e.g. filter off)
+        if num_status and 'Volume' not in num_status:
+            parts.append(f"VolFlt: {'✅' if vol_filter else '❌'}")
 
         # Final Signal Status
         parts.append(f"Long: {'✅' if enter_long else '❌'} ({long_reason})")
@@ -310,118 +677,39 @@ def log_entry_criteria_status(strategy, positions, resampled_row, data_with_filt
 def on_bar_update_handler(bars, hasNewBar, *, strategy, ib, contract, data_ref,
                           positions, completed_trades, live_tracker, bar_log,
                           dashboard_state, send_email_fn, output_dir, last_data_receipt):
-    """Full bar update handler with resampling, liveness detection, and signal checking.
-    data_ref is a dict {'data': DataFrame} so we can mutate the reference.
-    last_data_receipt is a dict {'time': datetime} for liveness tracking.
-    Strategy-agnostic: works with any strategy implementing the base Strategy interface.
-    """
-    last_data_receipt['time'] = datetime.now()
-    try:
-        df = pd.DataFrame([(b.date, b.open, b.high, b.low, b.close, b.volume) for b in bars],
-                          columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-        if df.empty:
+    """IB callback: liveness + snapshot; heavy work runs on the bar pipeline consumer."""
+    last_data_receipt["time"] = datetime.now()
+    snap = [(b.date, b.open, b.high, b.low, b.close, b.volume) for b in bars]
+
+    if BAR_PIPELINE_QUEUE is not None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+
+            def _enqueue() -> None:
+                try:
+                    BAR_PIPELINE_QUEUE.put_nowait((snap, hasNewBar))
+                except asyncio.QueueFull:
+                    try:
+                        BAR_PIPELINE_QUEUE.get_nowait()
+                        BAR_PIPELINE_QUEUE.task_done()
+                    except (asyncio.QueueEmpty, ValueError):
+                        pass
+                    try:
+                        BAR_PIPELINE_QUEUE.put_nowait((snap, hasNewBar))
+                    except asyncio.QueueFull:
+                        logging.warning(
+                            "Bar pipeline queue saturated; dropping a bar update tick"
+                        )
+
+            loop.call_soon(_enqueue)
             return
 
-        df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_convert('US/Eastern')
-        df.set_index('datetime', inplace=True)
-        data = df[['open', 'high', 'low', 'close', 'volume']].copy()
-        data_ref['data'] = data
-
-        bar_time = data.index[-1]
-        latest_row = data.iloc[-1]
-
-        # Live vs delayed detection
-        current_time = datetime.now(pytz.timezone('US/Eastern'))
-        delay = (current_time - bar_time).total_seconds()
-        delay_tag = " [LIVE]" if delay < 10 else (" [DELAYED]" if delay > 900 else "")
-
-        update_type = " [NEW]" if hasNewBar else " [UPD]"
-        log_msg = (f"[1-min bar]{update_type} {bar_time.strftime('%H:%M:%S')}{delay_tag} | "
-                   f"O: {latest_row['open']:.2f} H: {latest_row['high']:.2f} "
-                   f"L: {latest_row['low']:.2f} C: {latest_row['close']:.2f} | "
-                   f"Vol: {latest_row['volume']:,.0f}")
-        if hasNewBar:
-            logging.info(log_msg)
-        else:
-            logging.debug(log_msg)
-
-        # Dashboard price update
-        if dashboard_state:
-            dashboard_state.current_price = latest_row['close']
-
-        # Resampled bar check
-        should_check = False
-        if strategy.timeframe == 1:
-            should_check = hasNewBar
-        elif strategy.timeframe > 1 and hasNewBar:
-            total_min = bar_time.hour * 60 + bar_time.minute
-            should_check = (total_min % strategy.timeframe == 0)
-
-        # Update indicators
-        update_indicators(strategy, data)
-
-        min_bars = strategy.min_bars_required
-
-        # Process completed bar
-        if should_check and len(data) >= 2:
-            # IMPORTANT: Re-calculate HTF indicators and filters to get the CORRECT aggregated OHLCV
-            # for the reporting and signal boundary
-            resampled_df = resample_data(data, strategy.timeframe)
-            if len(resampled_df) < 2:
-                return
-
-            # Apply strategy logic to resampled data
-            resampled_ind = strategy.calculate_indicators(resampled_df.copy())
-            try:
-                resampled_filt = strategy.apply_filters(resampled_ind)
-            except Exception:
-                resampled_filt = resampled_ind
-
-            # Use COMPLETED HTF bar (index -2) for signal checks and reporting
-            completed_idx = resampled_filt.index[-2]
-            completed_row = resampled_filt.iloc[-2]
-
-            bar_info = (f"[{strategy.timeframe}-min] {completed_idx.strftime('%H:%M:%S')} | "
-                       f"O: {completed_row.get('open', 0):.2f} H: {completed_row.get('high', 0):.2f} "
-                       f"L: {completed_row.get('low', 0):.2f} C: {completed_row.get('close', 0):.2f} | "
-                       f"Vol: {completed_row.get('volume', 0):,.0f}")
-            logging.info(bar_info)
-
-            # Signal check on the proper HTF bar
-            entry_criteria = ""
-            if _indicators_ready(data): # Data already has indicators mapped back from update_indicators above
-                # Note: We pass the resampled_filt to signal checker to ensure it sees HTF context
-                entry_criteria = log_entry_criteria_status(strategy, positions, completed_row, resampled_filt, output_dir=output_dir)
-                
-                # Save data for audit (use the resampled row)
-                save_live_data_row(output_dir, completed_idx, completed_row, resampled_filt)
-                
-                # Check entries using HTF bar
-                check_entries(strategy, ib, contract, data, positions, {},
-                             live_tracker, dashboard_state, send_email_fn, completed_idx, completed_row)
-                
-                # Check exits using HTF bar (for boundary exit signals)
-                check_exits(strategy, ib, contract, data, positions, completed_trades,
-                           live_tracker, send_email_fn, completed_idx, completed_row, allow_strategy_exit=True)
-
-            # Bar log for dashboard
-            bar_log.append({
-                'timestamp': completed_idx.strftime('%H:%M:%S'),
-                'bar_info': bar_info,
-                'entry_criteria': entry_criteria
-            })
-            if len(bar_log) > 20:
-                del bar_log[:-20]
-
-        # Realtime safety exits (using latest bar, not resampled)
-        if len(data) >= min_bars and _indicators_ready(data):
-            check_exits(strategy, ib, contract, data, positions, completed_trades,
-                       live_tracker, send_email_fn, data.index[-1], data.iloc[-1], allow_strategy_exit=False)
-
-    except Exception as e:
-        bar_time_str = "unknown"
-        try:
-            bar_time_str = bars[-1].date.strftime('%H:%M:%S')
-        except:
-            pass
-        logging.error(f"Error in on_bar_update at {bar_time_str}: {type(e).__name__}: {e}", exc_info=True)
+    _sync_on_bar_update_legacy(
+        snap, hasNewBar, strategy=strategy, ib=ib, contract=contract, data_ref=data_ref,
+        positions=positions, completed_trades=completed_trades, live_tracker=live_tracker,
+        bar_log=bar_log, dashboard_state=dashboard_state, send_email_fn=send_email_fn,
+        output_dir=output_dir, last_data_receipt=last_data_receipt,
+    )

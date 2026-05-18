@@ -2,6 +2,7 @@
 import unittest
 import os
 import json
+import re
 import sys
 from datetime import datetime
 
@@ -74,9 +75,16 @@ class TestDashboardGeneration(unittest.TestCase):
             self.assertIn("RSI Period", html)
             
         with open(self.json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            self.assertEqual(data['net_liquidation'], 100000.0)
-            self.assertTrue(data['connected'])
+            raw_js = f.read()
+        m = re.match(
+            r"window\.updateStatus\('(?:live|paper)',\s*(\{.*\})\);\s*\Z",
+            raw_js.strip(),
+            re.DOTALL,
+        )
+        self.assertIsNotNone(m, "status file should be JSONP from update_dashboard")
+        data = json.loads(m.group(1))
+        self.assertEqual(data['net_liquidation'], 100000.0)
+        self.assertTrue(data['connected'])
 
 if __name__ == '__main__':
     unittest.main()

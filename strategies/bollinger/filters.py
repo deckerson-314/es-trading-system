@@ -6,7 +6,34 @@ All implementations use identical logic.
 """
 
 import pandas as pd
-from datetime import time, timedelta
+from datetime import datetime, time, timedelta
+
+
+def parse_clock_time_string(val):
+    """
+    Parse time-of-day strings from CSV/params into datetime.time.
+
+    Accepts 24-hour (HH:MM, HH:MM:SS), 12-hour with AM/PM (e.g. 05:00:00 PM),
+    or an existing datetime.time. Raises ValueError if parsing fails.
+    """
+    if isinstance(val, time):
+        return val
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        raise ValueError('Missing time value')
+    s = str(val).strip()
+    if not s:
+        raise ValueError('Empty time string')
+    for fmt in ('%H:%M:%S', '%H:%M', '%I:%M:%S %p', '%I:%M %p'):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            continue
+    try:
+        ts = pd.to_datetime(s, format='mixed')
+        return ts.time()
+    except Exception:
+        pass
+    raise ValueError(f'Could not parse time string: {s!r}')
 
 
 def apply_rth_filter(df, enable_rth_filter, rth_start, rth_end, rth_exit_buffer_minutes=0):
@@ -34,9 +61,9 @@ def apply_rth_filter(df, enable_rth_filter, rth_start, rth_end, rth_exit_buffer_
     if enable_rth_filter:
         # Parse time strings if needed
         if isinstance(rth_start, str):
-            rth_start = pd.to_datetime(rth_start, format='%H:%M').time()
+            rth_start = parse_clock_time_string(rth_start)
         if isinstance(rth_end, str):
-            rth_end = pd.to_datetime(rth_end, format='%H:%M').time()
+            rth_end = parse_clock_time_string(rth_end)
         
         # Get time series from index
         time_series = pd.Series([t.time() for t in df.index], index=df.index)
@@ -185,24 +212,24 @@ def apply_maintenance_filter(df, enable_maintenance_filter,
         df['force_exit'] = False
         return df
     
-    # Parse time strings
+    # Parse time strings (CSV may use 24h or 12h with seconds, e.g. 05:00:00 PM)
     if isinstance(daily_start_str, str):
-        daily_start = pd.to_datetime(daily_start_str, format='%H:%M').time()
+        daily_start = parse_clock_time_string(daily_start_str)
     else:
         daily_start = daily_start_str
-    
+
     if isinstance(daily_end_str, str):
-        daily_end = pd.to_datetime(daily_end_str, format='%H:%M').time()
+        daily_end = parse_clock_time_string(daily_end_str)
     else:
         daily_end = daily_end_str
-    
+
     if isinstance(weekend_start_time_str, str):
-        weekend_start_time = pd.to_datetime(weekend_start_time_str, format='%H:%M').time()
+        weekend_start_time = parse_clock_time_string(weekend_start_time_str)
     else:
         weekend_start_time = weekend_start_time_str
-    
+
     if isinstance(weekend_end_time_str, str):
-        weekend_end_time = pd.to_datetime(weekend_end_time_str, format='%H:%M').time()
+        weekend_end_time = parse_clock_time_string(weekend_end_time_str)
     else:
         weekend_end_time = weekend_end_time_str
     

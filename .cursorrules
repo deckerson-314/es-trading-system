@@ -1,0 +1,14 @@
+# Trading project — Cursor agent rules
+
+## Market data and worktrees (critical)
+
+- **Never move** (`Move-Item`, `shutil.move`, `mv`, drag-and-drop that removes the source) files out of `C:\Trading\` into a worktree, experiment folder, or temp copy of the repo. That silently empties the main tree (e.g. `Bollinger\data\`) and breaks GA/backtests for everyone.
+- **Always copy** (`Copy-Item`, `cp`, `robocopy /E` without `/MOV`) when duplicating data for another directory. Prefer **junctions/symlinks** for read-only OHLC in secondary roots, or pass **`--data-csv`** / **`TRADING_DATA_CSV`** so one canonical file on disk is shared.
+- Canonical ES 1m file name: `Bollinger/data/ES_full_1min_continuous_ratio_adjusted.csv` (hundreds of MB). Treat it as **precious, immovable infrastructure** unless the user explicitly asks to relocate it.
+- **Never `Remove-Item -Recurse -Force` on a worktree’s `Bollinger\data`** until you know it is **not** a junction/symlink to `C:\Trading\Bollinger\data`. On Windows, recurse-removing a directory junction can **delete the target folder’s contents** and wipe the main repo’s OHLC. To replace a junction, remove the **link only** (e.g. `cmd /c rmdir Bollinger\data` when it is a reparse-point directory), then recreate the junction or use `--data-csv`.
+
+## Production parameters (do not edit)
+
+- **Never modify** `strategies/trend/parameters/trend_strategy_params.csv` (absolute: `C:\Trading\strategies\trend\parameters\trend_strategy_params.csv`).
+- This file is the **paper and live production** Trend strategy parameter set.
+- For experiments, optimization output, or copies: use a **different path or filename** (e.g. under `Trend/diagnostics/`, a dated CSV, or a branch-specific file) and wire that path explicitly in scripts or CLI args—do not overwrite or edit the production CSV.

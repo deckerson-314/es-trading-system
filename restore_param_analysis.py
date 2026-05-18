@@ -6,23 +6,46 @@ import json
 import re
 
 def extract_chart_html(html_str):
-    """Extract div and script from plotly html string using regex."""
-    # Find the main div
-    # Plotly output usually has id="param_interactive_plot" (or whatever was passed)
-    div_match = re.search(r'(<div id="[^"]+".*?</div>)', html_str, re.DOTALL)
-    div_part = div_match.group(1) if div_match else ""
-    
-    # Find the script part
-    script_match = re.search(r'(<script type="text/javascript">.*?</script>)', html_str, re.DOTALL)
-    script_part = script_match.group(1) if script_match else ""
-    
-    if not div_part and 'param_interactive_plot' in html_str:
-        # Fallback if regex fails but ID exists (maybe simple split)
-        parts = html_str.split('<script')
-        div_part = parts[0]
+    """Extract div and script from plotly html string.
+
+    Split on the first <script> (JSON can contain '</div>' substrings). Use the
+    first literal </script> close tag (not regex .*?) so JSON cannot truncate the
+    script. Append Plotly's trailing </div> after </script> to the div block.
+    """
+    if not html_str:
+        return "", ""
+
+    script_at = html_str.find("<script")
+    if script_at != -1:
+        div_part = html_str[:script_at].strip()
+        tail = html_str[script_at:]
+    else:
+        div_part = html_str.strip()
+        tail = ""
+
+    script_part = ""
+    if tail:
+        end_tag = tail.find("</script>")
+        if end_tag != -1:
+            script_part = tail[: end_tag + 9]
+            remainder = tail[end_tag + 9 :].strip()
+            if remainder.startswith("</div>"):
+                close_end = remainder.find(">") + 1
+                div_part = (div_part + remainder[:close_end]).strip()
+
+    if not div_part and "param_interactive_plot" in html_str:
+        parts = html_str.split("<script", 1)
+        div_part = parts[0].strip()
         if len(parts) > 1:
-            script_part = '<script' + parts[1]
-            
+            s0 = "<script" + parts[1]
+            end = s0.find("</script>")
+            script_part = s0[: end + 9] if end != -1 else s0
+            if end != -1:
+                rem2 = s0[end + 9 :].strip()
+                if rem2.startswith("</div>"):
+                    c2 = rem2.find(">") + 1
+                    div_part = (div_part + rem2[:c2]).strip()
+
     return div_part, script_part
 
 def clamp_params(params, param_dict):

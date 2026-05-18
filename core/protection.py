@@ -9,8 +9,191 @@ from datetime import datetime
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 
 from core.account import get_account_summary, add_to_live_tracker
-import pandas as pd
 import pytz
+
+
+def _ib_refresh_open_orders(ib):
+    """Ensure ib.trades() includes working orders after reconnect/restart."""
+    try:
+        ib.reqOpenOrders()
+        ib.sleep(0.15)
+    except Exception:
+        pass
+
+
+# IB "Inactive" (e.g. rejected bracket TP after OCA replace) is NOT in OrderStatus.DoneStates,
+# but isActive() is often False — code that only scans isActive() leaves these on the blotter forever.
+_IB_TERMINAL_BLOTTER = frozenset({"Filled", "Cancelled", "ApiCancelled"})
+
+
+def trade_order_needs_flat_book_cancel(trade) -> bool:
+    """True if we should send cancelOrder when intentionally flattening the book for a contract/account."""
+    st = (getattr(trade.orderStatus, "status", None) or "").strip()
+    if st in _IB_TERMINAL_BLOTTER:
+        return False
+    return True
+
+
+def cancel_residual_orders_when_flat_on_contract(ib, contract, live_tracker=None) -> int:
+    """
+    When position size is 0 for ``contract``, cancel every non-terminal order on that conId.
+
+    Catches **Inactive** take-profit / OCA legs that ``trade.isActive()`` skips.
+    Returns number of cancelOrder calls issued (may include already-dead orders; errors swallowed).
+    """
+    if contract is None or not ib.isConnected():
+        return 0
+    try:
+        _ib_refresh_open_orders(ib)
+        pos = 0.0
+        for p in ib.positions():
+            if p.contract.conId == contract.conId:
+                pos = float(p.position)
+                break
+        if abs(pos) > 1e-9:
+            return 0
+        n = 0
+        for trade in list(ib.trades()):
+            if trade.contract.conId != contract.conId:
+                continue
+            if not trade_order_needs_flat_book_cancel(trade):
+                continue
+            try:
+                ib.cancelOrder(trade.order)
+                n += 1
+                logging.info(
+                    "Flat-book cleanup (%s): cancelled %s %s permId=%s status=%s",
+                    contract.localSymbol,
+                    getattr(trade.order, "orderType", "?"),
+                    getattr(trade.order, "action", "?"),
+                    getattr(trade.order, "permId", 0),
+                    getattr(trade.orderStatus, "status", ""),
+                )
+            except Exception as e:
+                logging.debug(
+                    "Flat-book cleanup skip permId=%s: %s",
+                    getattr(trade.order, "permId", 0),
+                    e,
+                )
+        if n and live_tracker:
+            add_to_live_tracker(
+                live_tracker,
+                "info",
+                f"Flat cleanup: removed {n} residual order(s) on {contract.localSymbol}",
+            )
+        return n
+    except Exception as e:
+        logging.error("cancel_residual_orders_when_flat_on_contract: %s", e)
+        return 0
+
+
+def cancel_residual_es_orders_when_no_es_position(ib, live_tracker=None) -> int:
+    """When no ES contract has non-zero size, cancel every non-terminal ES order (any expiry)."""
+    if not ib.isConnected():
+        return 0
+    try:
+        _ib_refresh_open_orders(ib)
+        if any(abs(float(p.position)) > 1e-9 for p in ib.positions() if p.contract.symbol == "ES"):
+            return 0
+        n = 0
+        for trade in list(ib.trades()):
+            if getattr(trade.contract, "symbol", None) != "ES":
+                continue
+            if not trade_order_needs_flat_book_cancel(trade):
+                continue
+            try:
+                ib.cancelOrder(trade.order)
+                n += 1
+            except Exception:
+                pass
+        if n:
+            logging.warning("No ES position: cancelled %s residual ES order(s)", n)
+            if live_tracker:
+                add_to_live_tracker(
+                    live_tracker,
+                    "warning",
+                    f"No ES exposure: removed {n} residual ES order(s)",
+                )
+        return n
+    except Exception as e:
+        logging.error("cancel_residual_es_orders_when_no_es_position: %s", e)
+        return 0
+
+
+def _trade_non_terminal(trade) -> bool:
+    try:
+        if hasattr(trade, "isDone") and trade.isDone():
+            return False
+    except Exception:
+        pass
+    st = getattr(trade.orderStatus, "status", "") or ""
+    return st not in ("Filled", "Cancelled", "Inactive", "ApiCancelled")
+
+
+def _order_looks_like_protective_stop(order) -> bool:
+    """IB often delivers STP as generic Order(orderType='STP'), not StopOrder."""
+    if isinstance(order, StopOrder):
+        return True
+    ot = str(getattr(order, "orderType", "") or "").upper()
+    if "STP" in ot or ot in ("TRAIL", "TRAIL LIMIT", "TRAIL MIT"):
+        return True
+    try:
+        ap = float(getattr(order, "auxPrice", 0) or 0)
+        lp = float(getattr(order, "lmtPrice", 0) or 0)
+        sp = float(getattr(order, "stopPrice", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if sp > 0 and abs(lp) < 1e-9:
+        return True
+    return ap > 0 and abs(lp) < 1e-9
+
+
+def es_position_has_protective_exit_orders(ib, pos, refresh: bool = True) -> bool:
+    """True if a working stop matches this ES exposure (used after restart when brackets are not in memory)."""
+    if refresh:
+        _ib_refresh_open_orders(ib)
+    qty = abs(pos.position)
+    direction = 1 if pos.position > 0 else -1
+    need_action = "SELL" if direction == 1 else "BUY"
+    cid = pos.contract.conId
+    for trade in ib.trades():
+        if trade.contract.conId != cid or not _trade_non_terminal(trade):
+            continue
+        order = trade.order
+        if not _order_looks_like_protective_stop(order):
+            continue
+        if getattr(order, "action", "") != need_action:
+            continue
+        try:
+            tq = abs(float(getattr(order, "totalQuantity", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if tq != qty:
+            continue
+        return True
+    return False
+
+
+def _open_position_on_contract(ib, con_id):
+    for p in ib.positions():
+        if p.contract.conId == con_id and p.position != 0:
+            return p
+    return None
+
+
+def _order_likely_bracket_exit_leg(order, open_pos):
+    """STP/LMT with parentId while exposure exists — do not cancel as API orphan."""
+    if open_pos is None:
+        return False
+    pid = int(getattr(order, "parentId", 0) or 0)
+    if pid == 0:
+        return False
+    ot = str(getattr(order, "orderType", "") or "").upper()
+    if "STP" in ot or "TRAIL" in ot:
+        return True
+    if ot in ("LMT", "LIMIT") or float(getattr(order, "lmtPrice", 0) or 0) > 0:
+        return True
+    return False
 
 
 def cancel_all_pending(ib, contract, live_tracker=None):
@@ -21,29 +204,19 @@ def cancel_all_pending(ib, contract, live_tracker=None):
         es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES']
         has_open = any(abs(p.position) > 0 for p in es_positions)
 
-        # 2. Identify all active orders across the portfolio
+        # No ES exposure anywhere: remove ALL non-terminal ES orders (includes **Inactive** legs).
+        if not has_open:
+            cancel_residual_es_orders_when_no_es_position(ib, live_tracker)
+            return
+
+        # 2. Identify working orders when we still have ES risk on the book
         active_trades = [t for t in ib.trades() if t.isActive() or (t.orderStatus and 
                          t.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending'])]
 
         if not active_trades:
             return
 
-        # 3. Surgical Cancellation
-        # Rule: We ONLY 'Global Cancel' if literally no ES position exists anywhere
-        # This prevents the 'Safety Paradox' during roll-overs.
-        if not has_open:
-            # Check if there are any ES orders at all. If so, clear them.
-            es_orders = [t for t in active_trades if t.contract.symbol == 'ES']
-            if es_orders:
-                logging.warning(f"No ES positions found. Surgically cancelling {len(es_orders)} ES orders.")
-                for t in es_orders:
-                    ib.cancelOrder(t.order)
-                if live_tracker:
-                    add_to_live_tracker(live_tracker, 'warning', f"Safety: Cancelled {len(es_orders)} ES orders (No Pos)")
-            return
-
-        # 4. If we DO have open positions, be extremely careful
-        # Only cancel orders for the specific contract if they are NOT protective
+        # 3. Surgical cancellation — only non-protective orders on the traded contract
         for trade in active_trades:
             # We ONLY touch orders for the contract being targeted if it HAS a position
             if contract and trade.contract.conId == contract.conId:
@@ -64,6 +237,8 @@ def cleanup_orphaned_orders(ib, contract, positions):
     """Cancel active ES orders that don't belong to any tracked position."""
     if contract is None:
         return
+
+    _ib_refresh_open_orders(ib)
 
     tracked_perm_ids = set()
     tracked_order_ids = set()
@@ -101,6 +276,14 @@ def cleanup_orphaned_orders(ib, contract, positions):
                     logging.debug(f"Skipping orphan check for new order {order_id} ({(datetime.now(pytz.utc) - creation_time).total_seconds():.1f}s old)")
                     continue
 
+            open_pos = _open_position_on_contract(ib, trade.contract.conId)
+            if open_pos is not None and _order_likely_bracket_exit_leg(trade.order, open_pos):
+                logging.info(
+                    f"Skipping orphan cancel: {trade.order.orderType} perm={perm_id} "
+                    f"parentId={parent_id} (open {trade.contract.localSymbol} — likely pre-restart bracket leg)"
+                )
+                continue
+
             # If no tracking match found, it's an orphan
             orphaned.append(trade)
 
@@ -113,11 +296,15 @@ def cleanup_orphaned_orders(ib, contract, positions):
         except Exception as e:
             logging.warning(f"Error cancelling orphaned order: {e}")
 
+    cancel_residual_orders_when_flat_on_contract(ib, contract, None)
+
 
 def close_orphaned_positions(ib, contract, positions, live_tracker=None, completed_trades=None, data=None):
     """Close positions that don't match any tracked bracket."""
     if contract is None:
         return
+
+    _ib_refresh_open_orders(ib)
 
     # Filter for symbol ES to handle roll periods
     es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES']
@@ -141,12 +328,22 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None, complet
                 break
 
         if not is_tracked:
+            if es_position_has_protective_exit_orders(ib, pos, refresh=False):
+                logging.info(
+                    f"Skipping orphan close: {pos.position} {pos.contract.localSymbol} has working protective "
+                    f"orders on IB but no in-memory bracket (restart). Leaving position intact."
+                )
+                continue
             logging.warning(f"ORPHANED POSITION: {pos.position} contracts, not tracked. Closing...")
             close_action = 'SELL' if pos.position > 0 else 'BUY'
             close_order = MarketOrder(action=close_action, totalQuantity=abs(pos.position), transmit=True)
             try:
-                # CRITICAL: Use the position's OWN contract (March/June/etc)
-                close_trade = ib.placeOrder(pos.contract, close_order)
+                # CRITICAL: Use the position's OWN contract (March/June/etc); IB rejects market orders
+                # without exchange (Error 321).
+                cc = pos.contract
+                if not getattr(cc, 'exchange', None):
+                    cc.exchange = 'CME'
+                close_trade = ib.placeOrder(cc, close_order)
                 ib.sleep(2)  # Wait slightly longer for fill
                 logging.info(f"Orphaned {pos.contract.localSymbol} position closed")
                 if live_tracker:
@@ -168,10 +365,11 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None, complet
                         'direction': 'LONG' if pos.position > 0 else 'SHORT',
                         'qty': abs(pos.position), 'entry_price': entry_price, 'exit_price': exit_price,
                         'pnl': pnl, 'r_multiple': 0, 'reason': 'Orphan Auto-Close',
-                        'duration': 'Auto-Closed'
+                        'duration': 'Auto-Closed',
+                        'stop_at_close': None, 'tp_at_close': None,
                     })
-                    if len(completed_trades) > 50:
-                        del completed_trades[:-50]
+                    if len(completed_trades) > 1000:
+                        del completed_trades[:-1000]
 
             except Exception as e:
                 logging.error(f"Failed to close orphaned position: {e}")
@@ -189,80 +387,101 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
         logging.error(f"Error fetching positions in protect_existing: {e}")
         return
 
+    _ib_refresh_open_orders(ib)
+
     for pos in es_pos_list:
         if pos.position == 0:
             continue
             
         qty = abs(pos.position)
         direction = 1 if pos.position > 0 else -1
-        conId = pos.contract.conId
 
-        # Check if position has an active stop at the exchange level
-        has_stop = False
-        for trade in ib.trades():
-            order = trade.order
-            is_stop = (isinstance(order, StopOrder) or 
-                      (getattr(order, 'auxPrice', 0) > 0 and getattr(order, 'lmtPrice', 0) == 0))
-            if (trade.isActive() and is_stop and trade.contract.conId == conId
-                    and abs(order.totalQuantity) == qty):
-                order_dir = 1 if order.action == 'SELL' else -1
-                if order_dir == direction:
-                    has_stop = True
-                    break
+        if es_position_has_protective_exit_orders(ib, pos, refresh=False):
+            continue
 
-        if not has_stop:
-            logging.warning(f"UNPROTECTED POSITION: {qty} {pos.contract.localSymbol} contracts. Adding stop loss...")
+        logging.warning(f"UNPROTECTED POSITION: {qty} {pos.contract.localSymbol} contracts. Adding stop loss...")
             
-            # baseline for SL: Use position's avgCost if it's a legacy contract, 
-            # otherwise use current market price.
-            avg_cost = getattr(pos, 'avgCost', 0) / 50.0  # Convert to index points
-            if avg_cost <= 0:
-                avg_cost = data['close'].iloc[-1]
+        # baseline for SL: Use position's avgCost if it's a legacy contract, 
+        # otherwise use current market price.
+        avg_cost = getattr(pos, 'avgCost', 0) / 50.0  # Convert to index points
+        if avg_cost <= 0:
+            avg_cost = data['close'].iloc[-1]
+        
+        # Strategy expects current_price to calculate distances
+        pos_dict = strategy.setup_position(avg_cost, direction, data.iloc[-1], data)
+
+        if pd.isna(pos_dict['stop']) or pos_dict['stop'] <= 0:
+            logging.error(f"Cannot recreate stop: Invalid stop price calculated.")
+            continue
+
+        # Clamp stop loss to ensure validity against current market price
+        calc_stop = float(pos_dict['stop'])
+        curr_px = float(data['close'].iloc[-1])
+        if direction == 1:
+            valid_stop = min(calc_stop, curr_px - 0.25)
+        else:
+            valid_stop = max(calc_stop, curr_px + 0.25)
+
+        oca_group = f"bracket_{pos.contract.conId}_{direction}"
+        stop_order = StopOrder(
+            action='SELL' if direction == 1 else 'BUY',
+            totalQuantity=qty,
+            stopPrice=round(valid_stop * 4) / 4,
+            ocaGroup=oca_group, ocaType=1,
+            tif='GTC', transmit=True
+        )
+        
+        # Place on the SPECIFIC contract of the position (March or June)
+        try:
+            # Ensure exchange is set for validation
+            pos.contract.exchange = 'CME'
+            ib.placeOrder(pos.contract, stop_order)
+            sl_px = getattr(stop_order, "stopPrice", None) or getattr(stop_order, "auxPrice", None)
+            logging.info(f"Re-protected {pos.contract.localSymbol} at SL: {sl_px}")
             
-            # Strategy expects current_price to calculate distances
-            pos_dict = strategy.setup_position(avg_cost, direction, data.iloc[-1], data)
+            # Update internal tracking
+            positions.append({
+                'entry': MarketOrder(action='BUY' if direction == 1 else 'SELL', totalQuantity=qty),
+                'stopLoss': stop_order, 'takeProfit': None,
+                'direction': direction, 'position_dict': pos_dict,
+                'entry_time': datetime.now(), 'entry_price': avg_cost,
+                'contract': pos.contract # Store the specific contract
+            })
+            if live_tracker:
+                add_to_live_tracker(live_tracker, 'warning',
+                    f"Added protective stop for {pos.contract.localSymbol} at ${float(sl_px):,.2f}")
+        except Exception as e:
+            logging.error(f"Failed to place protective order for legacy contract: {e}")
 
-            if pd.isna(pos_dict['stop']) or pos_dict['stop'] <= 0:
-                logging.error(f"Cannot recreate stop: Invalid stop price calculated.")
-                continue
 
-            # Clamp stop loss to ensure validity against current market price
-            calc_stop = float(pos_dict['stop'])
-            curr_px = float(data['close'].iloc[-1])
-            if direction == 1:
-                valid_stop = min(calc_stop, curr_px - 0.25)
-            else:
-                valid_stop = max(calc_stop, curr_px + 0.25)
+def enforce_stop_invariant(ib, positions, strategy, data, live_tracker=None):
+    """
+    Hard safety invariant:
+    Every open ES position must have at least one active stop order on the same contract/side/qty.
+    """
+    if not ib.isConnected() or data is None or data.empty:
+        return
+    try:
+        es_open = [p for p in ib.positions() if p.contract.symbol == 'ES' and p.position != 0]
+    except Exception as e:
+        logging.error(f"Failed to fetch positions for stop invariant: {e}")
+        return
 
-            oca_group = f"bracket_{pos.contract.conId}_{direction}"
-            stop_order = StopOrder(
-                action='SELL' if direction == 1 else 'BUY',
-                totalQuantity=qty,
-                stopPrice=round(valid_stop * 4) / 4,
-                ocaGroup=oca_group, ocaType=1,
-                tif='GTC', transmit=True
-            )
-            
-            # Place on the SPECIFIC contract of the position (March or June)
-            try:
-                # Ensure exchange is set for validation
-                pos.contract.exchange = 'CME'
-                ib.placeOrder(pos.contract, stop_order)
-                logging.info(f"Re-protected {pos.contract.localSymbol} at SL: {stop_order.auxPrice}")
-                
-                # Update internal tracking
-                positions.append({
-                    'entry': MarketOrder(action='BUY' if direction == 1 else 'SELL', totalQuantity=qty),
-                    'stopLoss': stop_order, 'takeProfit': None,
-                    'direction': direction, 'position_dict': pos_dict,
-                    'entry_time': datetime.now(), 'entry_price': avg_cost,
-                    'contract': pos.contract # Store the specific contract
-                })
-                if live_tracker:
-                    add_to_live_tracker(live_tracker, 'warning',
-                        f"Added protective stop for {pos.contract.localSymbol} at ${stop_order.auxPrice:.2f}")
-            except Exception as e:
-                logging.error(f"Failed to place protective order for legacy contract: {e}")
+    if not es_open:
+        return
+
+    _ib_refresh_open_orders(ib)
+
+    for pos in es_open:
+        qty = abs(pos.position)
+        direction = 1 if pos.position > 0 else -1
+        if es_position_has_protective_exit_orders(ib, pos, refresh=False):
+            continue
+
+        logging.error(
+            f"STOP INVARIANT BREACH: {qty} {pos.contract.localSymbol} has no active stop. Re-protecting now."
+        )
+        protect_existing_positions(ib, pos.contract, positions, strategy, data, live_tracker=live_tracker)
 
 
 def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker=None):
@@ -462,13 +681,16 @@ def reconcile_positions(ib, contract, positions, live_tracker=None,
 
 async def periodic_protection_check(ib, contract, positions, strategy, data, live_tracker=None, 
                                  send_email_fn=None, close_all_fn=None, completed_trades=None):
-    """Every-60s async task: maintenance -> cleanup -> protect -> recreate TP."""
+    """Every-20s async task: maintenance -> cleanup -> protect -> stop invariant -> recreate TP."""
+    from core.execution import prune_dead_brackets
+
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(20)
         if not ib.isConnected() or contract is None:
             continue
             
         try:
+            prune_dead_brackets(ib, contract, positions, live_tracker)
             # --- 1. Maintenance & RTH Force Exit Check (Robust Safety) ---
             # We recreate a dummy single-row DF to check current filters
             if strategy and hasattr(strategy, 'apply_filters'):
@@ -498,8 +720,11 @@ async def periodic_protection_check(ib, contract, positions, strategy, data, liv
                                 if close_all_fn and send_email_fn:
                                     logging.warning(f"⚠️ {reason.upper()} APPROACHING (Periodic Check) - Closing all ES positions")
                                     acct_fn = lambda: get_account_summary(ib, data, contract)
-                                    close_all_fn(reason, ib, contract, positions, data, 
-                                                 live_tracker, send_email_fn, strategy=strategy, account_fn=acct_fn)
+                                    close_all_fn(
+                                        reason, ib, contract, positions, data,
+                                        live_tracker, send_email_fn, strategy=strategy,
+                                        account_fn=acct_fn, completed_trades=completed_trades,
+                                    )
                 except Exception as e:
                     logging.error(f"Error checking maintenance in periodic loop: {e}")
 
@@ -507,6 +732,7 @@ async def periodic_protection_check(ib, contract, positions, strategy, data, liv
             cleanup_orphaned_orders(ib, contract, positions)
             close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
             protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
+            enforce_stop_invariant(ib, positions, strategy, data, live_tracker)
             check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
         except Exception as e:
             logging.error(f"Error in periodic protection check: {e}")
@@ -522,5 +748,6 @@ def run_reconnection_safety_sequence(ib, contract, positions, strategy, data, li
     cleanup_orphaned_orders(ib, contract, positions)
     close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
     protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
+    enforce_stop_invariant(ib, positions, strategy, data, live_tracker)
     check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
     logging.info("Safety sequence complete")

@@ -22,7 +22,7 @@ def test_stale_data_ui():
         mode='PAPER',
         is_connected=True,
         connection_start_time=datetime.now() - timedelta(hours=1),
-        last_data_receipt_time=datetime.now() - timedelta(seconds=70) # Stale
+        last_data_receipt_time=datetime.now() - timedelta(seconds=130)  # Stale vs server threshold
     )
     stale_path = os.path.join(web_dir, 'test_stale.html')
     update_dashboard(state_stale, html_path=stale_path)
@@ -40,7 +40,7 @@ def test_stale_data_ui():
 
     with open(stale_path, 'r', encoding='utf-8') as f:
         content = f.read()
-        if 'DATA: STALE (60s+)' in content and 'class="status-bar stale"' in content:
+        if 'DATA: STALE (120s+)' in content and 'class="status-bar stale"' in content:
             print("Verification SUCCESS: Stale dashboard looks correct.")
         else:
             print("Verification FAILED: Stale dashboard status incorrect.")
