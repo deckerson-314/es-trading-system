@@ -1,6 +1,7 @@
 import os
 import html
 import json
+import math
 from types import SimpleNamespace
 
 import pandas as pd
@@ -49,6 +50,148 @@ def _segment_for_trade(df, entry_time, exit_time, bars=60):
     start = max(0, min(e_idx, x_idx) - bars)
     end = min(len(df) - 1, max(e_idx, x_idx) + bars)
     return df.iloc[start:end + 1]
+
+
+def _timeframe_mins_from_params(params_snapshot: dict) -> int:
+    for key in ("Timeframe (minutes)", "timeframe"):
+        if key not in params_snapshot:
+            continue
+        v = params_snapshot[key]
+        if isinstance(v, dict) and "value" in v:
+            v = v["value"]
+        try:
+            return max(1, int(round(float(v))))
+        except (TypeError, ValueError):
+            continue
+    return 1
+
+
+def _resample_segment_htf(seg_1m: pd.DataFrame, tf_mins: int) -> pd.DataFrame:
+    """Align OHLCV + indicator columns to strategy HTF (same rule as live monitoring)."""
+    if seg_1m.empty or tf_mins <= 1:
+        return seg_1m
+    cols = list(seg_1m.columns)
+    logic = {}
+    for c in cols:
+        if c == "open":
+            logic[c] = "first"
+        elif c == "high":
+            logic[c] = "max"
+        elif c == "low":
+            logic[c] = "min"
+        elif c == "close":
+            logic[c] = "last"
+        elif c == "volume":
+            logic[c] = "sum"
+        else:
+            logic[c] = "last"
+    out = seg_1m.resample(f"{tf_mins}min", closed="right", label="right").agg(logic)
+    return out.dropna(subset=["open", "high", "low", "close"])
+
+
+def _pair_align_entry_exit(et, xt):
+    """Make entry/exit comparable (same naive vs tz-aware convention)."""
+    et = pd.Timestamp(et)
+    xt = pd.Timestamp(xt)
+    if et.tzinfo is None and xt.tzinfo is not None:
+        xt = pd.Timestamp(xt.to_pydatetime().replace(tzinfo=None))
+    elif et.tzinfo is not None and xt.tzinfo is None:
+        xt = xt.tz_localize(et.tz, ambiguous="infer", nonexistent="shift_forward")
+    return et, xt
+
+
+def _align_ts_to_trade_ref(ts, et):
+    """
+    Align *ts* to *et*'s clock convention (naive vs aware), matching core/charting.py
+    rules for mixing tz-aware bar indices with naive trade datetimes.
+    """
+    t = pd.Timestamp(ts)
+    et = pd.Timestamp(et)
+    if et.tzinfo is None and t.tzinfo is not None:
+        return pd.Timestamp(t.to_pydatetime().replace(tzinfo=None))
+    if et.tzinfo is not None and t.tzinfo is None:
+        try:
+            return t.tz_localize(et.tz, ambiguous="infer", nonexistent="shift_forward")
+        except (TypeError, ValueError):
+            return t
+    return t
+
+
+def _timeline_search_dirs() -> list:
+    dirs = []
+    env = os.environ.get("IB_BOT_OUTPUT_DIR", "").strip()
+    if env:
+        dirs.append(os.path.abspath(env))
+    root = os.getcwd()
+    dirs.extend([os.path.join(root, "paper_logs"), os.path.join(root, "live_logs")])
+    return [d for d in dirs if d and os.path.isdir(d)]
+
+
+def _load_timeline_traces(entry_time, exit_time, dir_int):
+    """
+    Read open_trade_timeline.jsonl for this trade; returns (xs, stops, tps) for Plotly or (None,None,None).
+    """
+    et = pd.Timestamp(entry_time)
+    xt = pd.Timestamp(exit_time)
+    et, xt = _pair_align_entry_exit(et, xt)
+    want = "LONG" if dir_int == 1 else "SHORT" if dir_int == -1 else ""
+    if not want:
+        return None, None, None
+    by_ts = {}
+    for d in _timeline_search_dirs():
+        path = os.path.join(d, "open_trade_timeline.jsonl")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(rec.get("direction", "")).upper() != want:
+                        continue
+                    ets = rec.get("entry_time")
+                    if not ets:
+                        continue
+                    try:
+                        r_et = _align_ts_to_trade_ref(pd.Timestamp(ets), et)
+                    except Exception:
+                        continue
+                    if abs((r_et - et).total_seconds()) > 900:
+                        continue
+                    ts_raw = rec.get("ts")
+                    if not ts_raw:
+                        continue
+                    try:
+                        tst = _align_ts_to_trade_ref(pd.Timestamp(ts_raw), et)
+                    except Exception:
+                        continue
+                    if tst < et - pd.Timedelta(hours=6) or tst > xt + pd.Timedelta(hours=6):
+                        continue
+                    sp = rec.get("stop")
+                    tp = rec.get("tp")
+                    try:
+                        sp = float(sp) if sp is not None and not (isinstance(sp, float) and math.isnan(sp)) else None
+                    except (TypeError, ValueError):
+                        sp = None
+                    try:
+                        tp = float(tp) if tp is not None and not (isinstance(tp, float) and math.isnan(tp)) else None
+                    except (TypeError, ValueError):
+                        tp = None
+                    by_ts[tst] = (sp, tp)
+        except OSError:
+            continue
+    if not by_ts:
+        return None, None, None
+    ordered = sorted(by_ts.items(), key=lambda kv: kv[0])
+    xs = [k for k, _ in ordered]
+    stops = [v[0] for _, v in ordered]
+    tps = [v[1] for _, v in ordered]
+    return xs, stops, tps
 
 
 def generate_unified_trade_report(
@@ -101,25 +244,34 @@ def generate_unified_trade_report(
         params_snapshot = {}
 
     df = _ensure_df_datetime_index(df)
-    seg = _segment_for_trade(df, entry_time, exit_time, bars=60) if not df.empty else df
+    tf_mins = _timeframe_mins_from_params(params_snapshot)
+    bar_window = max(60, min(600, 24 * int(tf_mins)))
+    seg_1m = _segment_for_trade(df, entry_time, exit_time, bars=bar_window) if not df.empty else df
+    seg_plot = _resample_segment_htf(seg_1m, tf_mins) if tf_mins > 1 else seg_1m
+    tl_x, tl_stop, tl_tp = _load_timeline_traces(entry_time, exit_time, dir_int)
 
+    price_title = (
+        f"Price ({tf_mins}-min HTF — matches live signal aggregation)"
+        if tf_mins > 1
+        else "Price + Context (1m; indicators ffill from HTF in live)"
+    )
     fig = make_subplots(
         rows=3,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.04,
         row_heights=[0.62, 0.18, 0.2],
-        subplot_titles=("Price + Context", "RSI/ADX", "Volume"),
+        subplot_titles=(price_title, "RSI/ADX", "Volume"),
     )
 
-    if not seg.empty and all(c in seg.columns for c in ("open", "high", "low", "close")):
+    if not seg_plot.empty and all(c in seg_plot.columns for c in ("open", "high", "low", "close")):
         fig.add_trace(
             go.Candlestick(
-                x=seg.index,
-                open=seg["open"],
-                high=seg["high"],
-                low=seg["low"],
-                close=seg["close"],
+                x=seg_plot.index,
+                open=seg_plot["open"],
+                high=seg_plot["high"],
+                low=seg_plot["low"],
+                close=seg_plot["close"],
                 name="Price",
             ),
             row=1,
@@ -134,31 +286,47 @@ def generate_unified_trade_report(
             ("vwap", "orange", "solid", "VWAP"),
             ("sma_regime", "gray", "solid", "SMA"),
         ]:
-            if col in seg.columns:
+            if col in seg_plot.columns:
                 fig.add_trace(
-                    go.Scatter(x=seg.index, y=seg[col], line=dict(color=color, dash=dash, width=1.4), name=name),
-                    row=1, col=1
+                    go.Scatter(
+                        x=seg_plot.index,
+                        y=seg_plot[col],
+                        line=dict(color=color, dash=dash, width=1.4),
+                        name=name,
+                    ),
+                    row=1,
+                    col=1,
                 )
 
         fig.add_trace(
             go.Scatter(
-                x=[entry_time], y=[entry_price], mode="markers+text",
+                x=[entry_time],
+                y=[entry_price],
+                mode="markers+text",
                 marker=dict(symbol="triangle-up", size=14, color="green" if dir_int == 1 else "red"),
-                text=["ENTRY"], textposition="top center", name="Entry",
+                text=["ENTRY"],
+                textposition="top center",
+                name="Entry",
             ),
-            row=1, col=1
+            row=1,
+            col=1,
         )
         fig.add_trace(
             go.Scatter(
-                x=[exit_time], y=[exit_price], mode="markers+text",
+                x=[exit_time],
+                y=[exit_price],
+                mode="markers+text",
                 marker=dict(symbol="x", size=13, color="lime" if pnl >= 0 else "darkred"),
-                text=["EXIT"], textposition="bottom center", name="Exit",
+                text=["EXIT"],
+                textposition="bottom center",
+                name="Exit",
             ),
-            row=1, col=1
+            row=1,
+            col=1,
         )
 
-        x0 = seg.index.min()
-        x1 = seg.index.max()
+        x0 = seg_plot.index.min()
+        x1 = seg_plot.index.max()
         for val, name, color in [
             (stop_open, "SL@open", "red"),
             (tp_open, "TP@open", "purple"),
@@ -168,21 +336,68 @@ def generate_unified_trade_report(
             if val is not None:
                 y = float(val)
                 fig.add_trace(
-                    go.Scatter(x=[x0, x1], y=[y, y], mode="lines", line=dict(color=color, dash="dot", width=1.2), name=name),
-                    row=1, col=1
+                    go.Scatter(
+                        x=[x0, x1],
+                        y=[y, y],
+                        mode="lines",
+                        line=dict(color=color, dash="dot", width=1.2),
+                        name=name,
+                    ),
+                    row=1,
+                    col=1,
                 )
 
-        if "rsi" in seg.columns:
-            fig.add_trace(go.Scatter(x=seg.index, y=seg["rsi"], line=dict(color="purple", width=1.5), name="RSI"), row=2, col=1)
+        if tl_x and tl_stop:
+            has_tp = any(v is not None for v in tl_tp)
+            fig.add_trace(
+                go.Scatter(
+                    x=tl_x,
+                    y=tl_stop,
+                    mode="lines",
+                    line=dict(color="#e65100", width=2, shape="hv"),
+                    connectgaps=False,
+                    name="SL trail (timeline)",
+                ),
+                row=1,
+                col=1,
+            )
+            if has_tp:
+                fig.add_trace(
+                    go.Scatter(
+                        x=tl_x,
+                        y=tl_tp,
+                        mode="lines",
+                        line=dict(color="#6a1b9a", width=1.5, dash="dash", shape="hv"),
+                        connectgaps=False,
+                        name="TP trail (timeline)",
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+        if "rsi" in seg_plot.columns:
+            fig.add_trace(
+                go.Scatter(x=seg_plot.index, y=seg_plot["rsi"], line=dict(color="purple", width=1.5), name="RSI"),
+                row=2,
+                col=1,
+            )
             fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
             fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
-        if "adx" in seg.columns:
-            fig.add_trace(go.Scatter(x=seg.index, y=seg["adx"], line=dict(color="steelblue", width=1.5), name="ADX"), row=2, col=1)
+        if "adx" in seg_plot.columns:
+            fig.add_trace(
+                go.Scatter(x=seg_plot.index, y=seg_plot["adx"], line=dict(color="steelblue", width=1.5), name="ADX"),
+                row=2,
+                col=1,
+            )
             fig.add_hline(y=25, line_dash="dot", line_color="gray", row=2, col=1)
 
-        if "volume" in seg.columns:
-            colors = ["green" if c >= o else "red" for c, o in zip(seg["close"], seg["open"])]
-            fig.add_trace(go.Bar(x=seg.index, y=seg["volume"], marker_color=colors, name="Volume"), row=3, col=1)
+        if "volume" in seg_plot.columns:
+            colors = ["green" if c >= o else "red" for c, o in zip(seg_plot["close"], seg_plot["open"])]
+            fig.add_trace(
+                go.Bar(x=seg_plot.index, y=seg_plot["volume"], marker_color=colors, name="Volume"),
+                row=3,
+                col=1,
+            )
     else:
         # Fallback for historical trades when OHLC context is unavailable.
         x_vals = [entry_time, exit_time]

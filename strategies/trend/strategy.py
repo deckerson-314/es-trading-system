@@ -164,7 +164,9 @@ class TrendStrategy(Strategy):
                 version=self.params_dict.get("version", "trend-live"),
                 params_snapshot=trade.get("params_snapshot") if isinstance(trade, dict) else None,
             )
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.error("generate_trade_report failed: %s", e, exc_info=True)
             return ""
 
     @staticmethod

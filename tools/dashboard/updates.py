@@ -1,3 +1,4 @@
+import html as html_lib
 
 import os
 import json
@@ -6,9 +7,12 @@ import math
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pytz
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tools.safety.guards import SecurityGuard
 
 try:
     import pandas as pd
@@ -20,6 +24,25 @@ EASTERN = pytz.timezone('US/Eastern')
 # Constants
 WEB_DIR = "web"
 WEB_DASHBOARD = os.path.join(WEB_DIR, "dashboard.html")
+
+# Stale thresholds: 1m bar streams can go ~60s between receipts; background browser
+# tabs throttle meta-refresh, which falsely inflates "snapshot age" in client JS.
+DASHBOARD_DATA_STALE_SERVER_SEC = 120
+DASHBOARD_FILE_STALE_CLIENT_SEC = 180
+DASHBOARD_DATA_STALL_CLIENT_SEC = 150
+
+
+def _format_dashboard_order_price(val) -> str:
+    """Format a single IB price field for the orders table (handles unset / NaN)."""
+    if val is None:
+        return "-"
+    try:
+        x = float(val)
+        if not math.isfinite(x) or abs(x) > 1e12:
+            return "-"
+        return f"${x:,.2f}"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def _write_text_file_robust(path: str, content: str, encoding: str = 'utf-8', attempts: int = 6) -> None:
@@ -98,6 +121,9 @@ class DashboardState:
     
     # Parameters
     params: Dict[str, Any] = field(default_factory=dict)
+
+    # Populated after startup: blocks `check_entries` when daily emergency flatten latched.
+    security_guard: Optional["SecurityGuard"] = None
 
     # Live chart (OHLC + Donchian + optional SL/TP overlay); built in main / update_ui
     chart_payload: Optional[Dict[str, Any]] = None
@@ -296,6 +322,54 @@ def build_chart_payload_from_df(
     return payload
 
 
+def _sanitize_json_for_browser(obj: Any) -> Any:
+    """
+    Ensure values are JSON-serializable per RFC 7159 so browsers' JSON.parse works.
+    Python's json.dumps(allow_nan=True) emits NaN/Infinity which JSON.parse rejects.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, int) and not isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_json_for_browser(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json_for_browser(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return None
+    if pd is not None:
+        try:
+            if isinstance(obj, pd.Timestamp):
+                return pd.Timestamp(obj).isoformat()
+        except Exception:
+            pass
+    try:
+        import numpy as np
+
+        if isinstance(obj, np.ndarray):
+            return _sanitize_json_for_browser(obj.tolist())
+        if isinstance(obj, np.generic):
+            return _sanitize_json_for_browser(obj.item())
+    except ImportError:
+        pass
+    try:
+        x = float(obj)
+        if math.isfinite(x):
+            return x
+    except (TypeError, ValueError):
+        pass
+    return str(obj)
+
+
 def _chart_json_for_page(state: DashboardState) -> str:
     """JSON for embedded chart (safe inside HTML)."""
     merged = None
@@ -303,8 +377,16 @@ def _chart_json_for_page(state: DashboardState) -> str:
         merged = dict(state.chart_payload)
         if state.trade_overlay:
             merged['overlay'] = state.trade_overlay
-    raw = json.dumps(merged) if merged else 'null'
-    return raw.replace('</', '<\\/')
+    if not merged:
+        return "null"
+    try:
+        safe = _sanitize_json_for_browser(merged)
+        raw = json.dumps(safe, allow_nan=False)
+        return raw.replace("</", "<\\/")
+    except (TypeError, ValueError) as e:
+        logging.warning("chart JSON encode failed: %s", e)
+        return "null"
+
 
 def group_params_for_display(params_dict):
     """
@@ -373,10 +455,11 @@ def generate_dashboard_html(state: DashboardState) -> str:
         last_receipt = EASTERN.localize(last_receipt)
         
     time_since_data = (now_eastern - last_receipt).total_seconds() if last_receipt else 0
-    is_stale = time_since_data > 60
-    
+    is_stale = time_since_data > DASHBOARD_DATA_STALE_SERVER_SEC
+
     status_class = "disconnected" if not state.is_connected else "stale" if is_stale else "online"
-    status_text = "CONNECTION: OFFLINE" if not state.is_connected else "DATA: STALE (60s+)" if is_stale else "CONNECTION: ONLINE"
+    stale_lbl = f"DATA: STALE ({DASHBOARD_DATA_STALE_SERVER_SEC}s+)"
+    status_text = "CONNECTION: OFFLINE" if not state.is_connected else stale_lbl if is_stale else "CONNECTION: ONLINE"
     
     # Choose icon based on mode
     icon_emoji = "📈" if state.mode.upper() == "LIVE" else "🧪"
@@ -388,7 +471,8 @@ def generate_dashboard_html(state: DashboardState) -> str:
     <title>IB {state.mode.capitalize()} Dashboard</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>{icon_emoji}</text></svg>">
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="12">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="refresh" content="30">
     <style>
         body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; background: #eaeff2; color: #333; }}
         .container {{ max-width: 1600px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
@@ -465,7 +549,7 @@ def generate_dashboard_html(state: DashboardState) -> str:
         .stale-warning {{ display: none; background: #f1c40f; color: #000; text-align: center; padding: 10px; font-weight: bold; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
         .stale-data .stale-warning {{ display: block; }}
         .stale-data .status-bar {{ background: #95a5a6 !important; opacity: 0.8; }}
-        #live-chart {{ width: 100%; height: 520px; min-height: 360px; }}
+        #live-chart {{ width: 100%; height: 620px; min-height: 420px; }}
         .sub-metric {{ font-size: 0.75em; color: #7f8c8d; margin-top: 6px; }}
     </style>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js" charset="utf-8"></script>
@@ -474,7 +558,7 @@ def generate_dashboard_html(state: DashboardState) -> str:
     <div class="container">
         <a href="index.html" class="return-button">← Back to Index</a>
         
-        <div class="stale-warning">⚠️ WARNING: THIS DASHBOARD IS SHOWING STALE DATA (BOT MAY BE OFFLINE)</div>
+        <div class="stale-warning">⚠️ WARNING: THIS DASHBOARD MAY BE OUT OF DATE</div>
 
         <div class="status-bar {status_class}">
             <div>
@@ -564,45 +648,63 @@ def generate_dashboard_html(state: DashboardState) -> str:
         html += """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active positions</div>"""
 
     html += """
-        <h2>Active Orders</h2>
+        <h2>Active Orders (all symbols, non-terminal)</h2>
 """
     if state.active_orders:
-        html += """        <table>
+        html += """        <div style="overflow-x:auto;">
+        <table>
             <thead>
                 <tr>
-                    <th>Check</th>
+                    <th>Contract</th>
+                    <th>PermID</th>
+                    <th>Parent</th>
                     <th>Order ID</th>
                     <th>Type</th>
                     <th>Action</th>
                     <th>Size</th>
-                    <th>Lmt Price</th>
-                    <th>Aux Price</th>
+                    <th>Lmt</th>
+                    <th>Stop</th>
+                    <th>Aux</th>
+                    <th>Trig*</th>
+                    <th>TIF</th>
                     <th>Status</th>
+                    <th>Why held</th>
                 </tr>
             </thead>
             <tbody>
 """
         for order in state.active_orders:
+            sym = html_lib.escape(str(order.get("localSymbol") or order.get("symbol") or "-"))
+            why = html_lib.escape(str(order.get("whyHeld") or ""))
             html += f"""                <tr>
-                    <td><input type="checkbox" disabled></td>
-                    <td>{order.get('orderId')}</td>
-                    <td>{order.get('orderType')}</td>
-                    <td>{order.get('action')}</td>
+                    <td>{sym}</td>
+                    <td>{order.get('permId') or '-'}</td>
+                    <td>{order.get('parentId') or '-'}</td>
+                    <td>{order.get('orderId') or '-'}</td>
+                    <td>{html_lib.escape(str(order.get('orderType') or ''))}</td>
+                    <td>{html_lib.escape(str(order.get('action') or ''))}</td>
                     <td>{order.get('totalQuantity')}</td>
-                    <td>{f"${order.get('lmtPrice'):.2f}" if order.get('lmtPrice') else '-'}</td>
-                    <td>{f"${order.get('auxPrice'):.2f}" if order.get('auxPrice') else '-'}</td>
-                    <td><span class="log-type INFO" style="width: auto; padding: 2px 8px;">{order.get('status')}</span></td>
+                    <td>{_format_dashboard_order_price(order.get('lmtPrice'))}</td>
+                    <td>{_format_dashboard_order_price(order.get('stopPrice'))}</td>
+                    <td>{_format_dashboard_order_price(order.get('auxPrice'))}</td>
+                    <td>{_format_dashboard_order_price(order.get('triggerPrice'))}</td>
+                    <td>{html_lib.escape(str(order.get('tif') or ''))}</td>
+                    <td><span class="log-type INFO" style="width: auto; padding: 2px 8px;">{html_lib.escape(str(order.get('status') or ''))}</span></td>
+                    <td style="max-width:220px;font-size:0.85em">{why}</td>
                 </tr>
 """
         html += """            </tbody>
         </table>
+        </div>
+        <p style="font-size:0.85em;color:#64748b;margin-top:6px">*Trig = first of Stop / Aux / Lmt (IB populates different fields per order type).</p>
 """
     else:
         html += """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active orders</div>"""
 
     # === BAR LOG SECTION ===
     html += """
-        <h2>Bar Log (Last 20 Aggregated Bars)</h2>
+        <h2>Bar Log (Last 20 {chart_tf}-minute bars)</h2>
+        <p style="font-size:0.85em;color:#64748b;margin:-8px 0 12px 0">Updates when a completed strategy bar closes (not every 1-minute chart tick). Newest entry at top.</p>
 """
     if state.bar_log:
         html += """        <div class="log-container" style="max-height: 300px;">
@@ -749,32 +851,39 @@ def generate_dashboard_html(state: DashboardState) -> str:
     </div>
     
     <script>
+"""
+    html += f"        const DASH_FILE_STALE_SEC = {DASHBOARD_FILE_STALE_CLIENT_SEC};\n"
+    html += f"        const DASH_DATA_STALL_SEC = {DASHBOARD_DATA_STALL_CLIENT_SEC};\n"
+    html += """
         function checkStaleData() {
             const lastUpdateElem = document.getElementById('last-update');
             const lastDataElem = document.getElementById('last-data-receipt');
             const warningElem = document.querySelector('.stale-warning');
             if (!lastUpdateElem || !lastDataElem || !warningElem) return;
-            
+            // Background tabs throttle timers and meta-refresh; do not escalate while hidden.
+            if (document.visibilityState !== 'visible') return;
+
             const now = new Date();
             const fileUpdateTs = new Date(lastUpdateElem.dataset.timestamp);
             const fileDiff = (now - fileUpdateTs) / 1000;
-            
+
             const dataTs = lastDataElem.dataset.timestamp ? new Date(lastDataElem.dataset.timestamp) : null;
             const dataDiff = dataTs ? (now - dataTs) / 1000 : 0;
-            
-            if (fileDiff > 30) {
+
+            if (fileDiff > DASH_FILE_STALE_SEC) {
                 document.body.classList.add('stale-data');
-                warningElem.innerText = '⚠️ CRITICAL: BOT OFFLINE (No dashboard updates for ' + Math.round(fileDiff) + 's)';
-            } else if (dataDiff > 45) {
+                warningElem.innerText = '⚠️ No fresh dashboard snapshot in ' + Math.round(fileDiff)
+                    + 's (bot stopped, writes failing, or tab was backgrounded — reload or open via http://localhost if serving web/)';
+            } else if (dataDiff > DASH_DATA_STALL_SEC) {
                 document.body.classList.add('stale-data');
-                warningElem.innerText = '⚠️ WARNING: DATA STALLED (No market bars for ' + Math.round(dataDiff) + 's)';
+                warningElem.innerText = '⚠️ No recent market bar timestamp in HTML (' + Math.round(dataDiff)
+                    + 's) — possible data stall or quiet session';
             } else {
                 document.body.classList.remove('stale-data');
-                warningElem.innerText = ''; // Clear text
+                warningElem.innerText = '';
             }
         }
-        
-        // Check immediately and then every 2 seconds
+
         checkStaleData();
         setInterval(checkStaleData, 2000);
 
@@ -797,7 +906,7 @@ def generate_dashboard_html(state: DashboardState) -> str:
                 return;
             }
             var tfm = p.timeframe_mins || 1;
-            var zoomKey = 'dashboard_live_chart_zoom_v1';
+            var zoomKey = 'dashboard_live_chart_zoom_v2';
             var savedZoom = null;
             try {
                 var saved = localStorage.getItem(zoomKey);
@@ -833,10 +942,10 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     line: { color: '#a78bfa', width: 1, dash: 'dot' }, mode: 'lines', xaxis: 'x3', yaxis: 'y3' });
             if (anyNonNull(p.adx))
                 traces.push({ type: 'scatter', x: p.times, y: p.adx, name: 'ADX',
-                    line: { color: '#0891b2', width: 1.5 }, mode: 'lines', xaxis: 'x3', yaxis: 'y3' });
+                    line: { color: '#0891b2', width: 1.5 }, mode: 'lines', xaxis: 'x4', yaxis: 'y4' });
             if (anyNonNull(p.rsi))
                 traces.push({ type: 'scatter', x: p.times, y: p.rsi, name: 'RSI',
-                    line: { color: '#7c3aed', width: 1.5 }, mode: 'lines', xaxis: 'x4', yaxis: 'y4' });
+                    line: { color: '#7c3aed', width: 1.5 }, mode: 'lines', xaxis: 'x5', yaxis: 'y5' });
             if (p.trade_markers && p.trade_markers.length) {
                 var entX = [], entY = [], entTxt = [];
                 var exX = [], exY = [], exTxt = [];
@@ -893,15 +1002,15 @@ def generate_dashboard_html(state: DashboardState) -> str:
                         line: { color: '#8b5cf6', width: 1, dash: 'dash' } });
                 }
                 if (p.thresholds.min_adx != null) {
-                    shapes.push({ type: 'line', xref: 'x3', yref: 'y3', x0: x0, x1: x1, y0: p.thresholds.min_adx, y1: p.thresholds.min_adx,
+                    shapes.push({ type: 'line', xref: 'x4', yref: 'y4', x0: x0, x1: x1, y0: p.thresholds.min_adx, y1: p.thresholds.min_adx,
                         line: { color: '#0891b2', width: 1, dash: 'dot' } });
                 }
                 if (p.thresholds.rsi_max_buy != null) {
-                    shapes.push({ type: 'line', xref: 'x4', yref: 'y4', x0: x0, x1: x1, y0: p.thresholds.rsi_max_buy, y1: p.thresholds.rsi_max_buy,
+                    shapes.push({ type: 'line', xref: 'x5', yref: 'y5', x0: x0, x1: x1, y0: p.thresholds.rsi_max_buy, y1: p.thresholds.rsi_max_buy,
                         line: { color: '#7c3aed', width: 1, dash: 'dot' } });
                 }
                 if (p.thresholds.rsi_min_sell != null) {
-                    shapes.push({ type: 'line', xref: 'x4', yref: 'y4', x0: x0, x1: x1, y0: p.thresholds.rsi_min_sell, y1: p.thresholds.rsi_min_sell,
+                    shapes.push({ type: 'line', xref: 'x5', yref: 'y5', x0: x0, x1: x1, y0: p.thresholds.rsi_min_sell, y1: p.thresholds.rsi_min_sell,
                         line: { color: '#7c3aed', width: 1, dash: 'dot' } });
                 }
             }
@@ -911,11 +1020,13 @@ def generate_dashboard_html(state: DashboardState) -> str:
                 xaxis: { domain:[0,1], anchor:'y', rangeslider: { visible: false }, type: 'date', showticklabels:false },
                 yaxis: { title: 'Price', domain:[0.46,1.0], autorange: true },
                 xaxis2: { domain:[0,1], anchor:'y2', type:'date', showticklabels:false, matches:'x' },
-                yaxis2: { title: 'Vol', domain:[0.31,0.44], autorange:true },
+                yaxis2: { title: 'Vol', domain:[0.34,0.44], autorange: true },
                 xaxis3: { domain:[0,1], anchor:'y3', type:'date', showticklabels:false, matches:'x' },
-                yaxis3: { title: 'ATR/ADX', domain:[0.16,0.29], autorange:true },
-                xaxis4: { domain:[0,1], anchor:'y4', type:'date', matches:'x' },
-                yaxis4: { title: 'RSI', domain:[0.0,0.14], range:[0,100] },
+                yaxis3: { title: 'ATR', domain:[0.23,0.33], autorange: true },
+                xaxis4: { domain:[0,1], anchor:'y4', type:'date', showticklabels:false, matches:'x' },
+                yaxis4: { title: 'ADX', domain:[0.12,0.22], autorange: true },
+                xaxis5: { domain:[0,1], anchor:'y5', type:'date', matches:'x' },
+                yaxis5: { title: 'RSI', domain:[0.0,0.11], autorange: true },
                 shapes: shapes, annotations: ann, margin: { t: 40, r: 20, b: 36, l: 56 }
             };
             if (p.active_trade_lines && p.active_trade_lines.times && p.active_trade_lines.times.length) {
@@ -947,6 +1058,10 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     layout.yaxis4.range = [savedZoom.y40, savedZoom.y41];
                     layout.yaxis4.autorange = false;
                 }
+                if (savedZoom.y50 != null && savedZoom.y51 != null) {
+                    layout.yaxis5.range = [savedZoom.y50, savedZoom.y51];
+                    layout.yaxis5.autorange = false;
+                }
             } else {
                 var right = new Date(p.times[p.times.length - 1]);
                 if (!isNaN(right.getTime())) {
@@ -969,11 +1084,13 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     var y31 = ev['yaxis3.range[1]'];
                     var y40 = ev['yaxis4.range[0]'];
                     var y41 = ev['yaxis4.range[1]'];
-                    if (ev['xaxis.autorange'] || ev['yaxis.autorange'] || ev['yaxis2.autorange'] || ev['yaxis3.autorange'] || ev['yaxis4.autorange']) {
+                    var y50 = ev['yaxis5.range[0]'];
+                    var y51 = ev['yaxis5.range[1]'];
+                    if (ev['xaxis.autorange'] || ev['yaxis.autorange'] || ev['yaxis2.autorange'] || ev['yaxis3.autorange'] || ev['yaxis4.autorange'] || ev['yaxis5.autorange']) {
                         try { localStorage.removeItem(zoomKey); } catch (_) {}
                         return;
                     }
-                    if (x0 || x1 || y0 != null || y1 != null || y20 != null || y21 != null || y30 != null || y31 != null || y40 != null || y41 != null) {
+                    if (x0 || x1 || y0 != null || y1 != null || y20 != null || y21 != null || y30 != null || y31 != null || y40 != null || y41 != null || y50 != null || y51 != null) {
                         try {
                             localStorage.setItem(zoomKey, JSON.stringify({
                                 x0: x0 || (savedZoom && savedZoom.x0) || null,
@@ -985,7 +1102,9 @@ def generate_dashboard_html(state: DashboardState) -> str:
                                 y30: (y30 != null) ? y30 : ((savedZoom && savedZoom.y30) || null),
                                 y31: (y31 != null) ? y31 : ((savedZoom && savedZoom.y31) || null),
                                 y40: (y40 != null) ? y40 : ((savedZoom && savedZoom.y40) || null),
-                                y41: (y41 != null) ? y41 : ((savedZoom && savedZoom.y41) || null)
+                                y41: (y41 != null) ? y41 : ((savedZoom && savedZoom.y41) || null),
+                                y50: (y50 != null) ? y50 : ((savedZoom && savedZoom.y50) || null),
+                                y51: (y51 != null) ? y51 : ((savedZoom && savedZoom.y51) || null)
                             }));
                         } catch (_) {}
                     }
@@ -1041,7 +1160,10 @@ def update_dashboard(state: DashboardState, html_path: str = WEB_DASHBOARD, json
                 'position': total_pos,
                 'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
-            js_content = f"window.updateStatus('{prefix}', {json.dumps(status_data)});"
+            js_content = (
+                f"window.updateStatus('{prefix}', "
+                f"{json.dumps(_sanitize_json_for_browser(status_data), allow_nan=False)});"
+            )
             _write_text_file_robust(json_path, js_content, encoding='utf-8')
 
     except Exception as e:

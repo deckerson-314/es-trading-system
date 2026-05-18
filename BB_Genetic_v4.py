@@ -96,6 +96,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from plotly.io._utils import plotly_cdn_url
 import plotly.offline as pyo
 import webbrowser
 from deap import base, creator, tools, algorithms
@@ -1515,58 +1516,18 @@ def clamp_params(raw_params, param_dict_local):
 def extract_chart_html(html_snippet):
     if not html_snippet or len(html_snippet) == 0:
         return "", ""
-    
-    # Find the inner chart div with id attribute (the actual chart container)
-    chart_div_start = html_snippet.find('<div id=')
-    if chart_div_start == -1:
-        # Fallback: find any div
-        chart_div_start = html_snippet.find('<div')
-    if chart_div_start == -1:
-        return "", ""
-    
-    # Find the closing tag for the chart div
-    chart_div_end = html_snippet.find('>', chart_div_start)
-    if chart_div_end == -1:
-        return "", ""
-    
-    # Check if it's self-closing
-    if html_snippet[chart_div_end-1] == '/':
-        # Self-closing: <div ... />
-        div_part = html_snippet[chart_div_start:chart_div_end + 1]
-    else:
-        # Regular div: find matching closing tag
-        div_end_pos = chart_div_start
-        depth = 0
-        i = chart_div_start
-        while i < len(html_snippet):
-            if html_snippet[i:i+4] == '<div':
-                tag_end = html_snippet.find('>', i)
-                if tag_end != -1:
-                    if html_snippet[tag_end-1] != '/':
-                        depth += 1
-                    i = tag_end + 1
-                else:
-                    i += 1
-            elif html_snippet[i:i+6] == '</div>':
-                depth -= 1
-                if depth == 0:
-                    div_end_pos = i + 6
-                    break
-                i += 6
-            else:
-                i += 1
-        div_part = html_snippet[chart_div_start:div_end_pos] if div_end_pos > chart_div_start else ""
-    
-    # Extract script separately
-    script_start = html_snippet.find('<script')
+    script_start = html_snippet.find("<script")
     if script_start == -1:
-        return div_part, ""
-    
-    script_end = html_snippet.find('</script>', script_start)
+        return html_snippet.strip(), ""
+    div_part = html_snippet[:script_start].strip()
+    script_end = html_snippet.find("</script>", script_start)
     if script_end == -1:
         return div_part, ""
-    
-    script_part = html_snippet[script_start:script_end + 9]
+    script_part = html_snippet[script_start : script_end + 9]
+    remainder = html_snippet[script_end + 9 :].strip()
+    if remainder.startswith("</div>"):
+        close_end = remainder.find(">") + 1
+        div_part = (div_part + remainder[:close_end]).strip()
     return div_part, script_part
 
 # ----------------------------------------------------------------------
@@ -2507,10 +2468,10 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     summary_html += "</tbody></table>"
     
     # Generate HTML snippets for charts
-    conv_html = fig_convergence.to_html(include_plotlyjs=False, div_id='conv_chart')
-    pareto3d_html = fig_pareto_3d.to_html(include_plotlyjs=False, div_id='pareto3d_chart')
-    pareto2d_html = fig_pareto_2d.to_html(include_plotlyjs=False, div_id='pareto2d_chart')
-    paretosize_html = fig_pareto_size.to_html(include_plotlyjs=False, div_id='paretosize_chart')
+    conv_html = fig_convergence.to_html(include_plotlyjs=False, full_html=False, div_id='conv_chart')
+    pareto3d_html = fig_pareto_3d.to_html(include_plotlyjs=False, full_html=False, div_id='pareto3d_chart')
+    pareto2d_html = fig_pareto_2d.to_html(include_plotlyjs=False, full_html=False, div_id='pareto2d_chart')
+    paretosize_html = fig_pareto_size.to_html(include_plotlyjs=False, full_html=False, div_id='paretosize_chart')
     
     # Extract div and script from each chart (extract_chart_html is defined earlier)
     conv_div, conv_script = extract_chart_html(conv_html)
@@ -2640,7 +2601,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
     html_content = "<!DOCTYPE html>\n"
     html_content += "<html><head><title>GA Dashboard v4.0</title>\n"
     html_content += f"{refresh_script}\n"
-    html_content += "<script src='https://cdn.plot.ly/plotly-latest.min.js'></script>\n"
+    html_content += f"<script src='{plotly_cdn_url()}' charset='utf-8'></script>\n"
     html_content += "<style> body { font-family: Arial; margin: 0; padding: 0; background: #f5f5f5; padding-top: 60px; } .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; } h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; } h2 { color: #555; margin-top: 30px; border-bottom: 2px solid #ddd; position: relative; } h2 .tooltip-icon { display: inline-block; width: 18px; height: 18px; background: #4CAF50; color: white; border-radius: 50%; text-align: center; line-height: 18px; font-size: 12px; margin-left: 8px; cursor: help; vertical-align: middle; } h2 .tooltip { visibility: hidden; width: 300px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 1; bottom: 125%; left: 0; font-size: 12px; line-height: 1.4; box-shadow: 0 2px 8px rgba(0,0,0,0.3); } h2 .tooltip-icon:hover + .tooltip { visibility: visible; } table { width: 100%; border-collapse: collapse; margin: 15px 0; } th { background: #4CAF50; color: white; padding: 10px; text-align: left; position: relative; } th .tooltip-icon { display: inline-block; width: 16px; height: 16px; background: rgba(255,255,255,0.3); color: white; border-radius: 50%; text-align: center; line-height: 16px; font-size: 11px; margin-left: 5px; cursor: help; vertical-align: middle; } th .tooltip { visibility: hidden; width: 280px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 8px; position: absolute; z-index: 1; bottom: 125%; left: 0; font-size: 11px; line-height: 1.3; box-shadow: 0 2px 8px rgba(0,0,0,0.3); } th .tooltip-icon:hover + .tooltip { visibility: visible; } td { padding: 8px; border: 1px solid #ddd; } tr:nth-child(even) { background: #f9f9f9; } .selected-row { background: #fff3cd !important; font-weight: bold; } .positive { color: green; } .negative { color: red; } .metric-box { display: inline-block; background: #4CAF50; color: white; padding: 10px 20px; margin: 5px; border-radius: 5px; font-weight: bold; position: relative; cursor: help; } .metric-box .tooltip { visibility: hidden; width: 250px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 8px; position: absolute; z-index: 1; bottom: 125%; left: 50%; transform: translateX(-50%); font-size: 11px; line-height: 1.3; box-shadow: 0 2px 8px rgba(0,0,0,0.3); } .metric-box:hover .tooltip { visibility: visible; } .info-section { background: #e3f2fd; border-left: 4px solid #2196F3; padding: 12px; margin: 15px 0; border-radius: 4px; font-size: 0.9em; line-height: 1.5; } .chart-container { margin: 20px 0; padding: 20px 0; border-top: 1px solid #ddd; border-bottom: 1px solid #ddd; } .chart-container .plotly-graph-div { margin: 20px 0; display: block; min-height: 400px; } .return-button { display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #667eea; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; } .return-button:hover { background: #5568d3; } </style></head><body>\n"
     html_content += f"{progress_html}\n"
     html_content += "<div class='container'>\n"

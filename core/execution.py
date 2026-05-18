@@ -4,16 +4,184 @@ Ported from ib_deployment_v4.py lines 2250-3185
 """
 import logging
 import traceback
+import time
 import pandas as pd
 import numpy as np
 import os
 import copy
+from typing import Any, Optional
 from datetime import datetime, timedelta, date
 from core.charting import create_trade_chart
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 import pytz
 
 from core.account import get_account_summary, format_duration, add_to_live_tracker
+from core.protection import cancel_residual_orders_when_flat_on_contract
+
+
+def _finite_stop_scalar(x):
+    try:
+        v = float(x)
+        if not np.isfinite(v):
+            return None
+        return v
+    except (TypeError, ValueError):
+        return None
+
+
+def _quantize_es_tick(price):
+    """Quarter-tick price for ES; ``None`` if not finite (avoids ``int(inf)`` inside IB)."""
+    v = _finite_stop_scalar(price)
+    if v is None:
+        return None
+    return round(float(v) * 4) / 4
+
+
+def _es_synthetic_pnl_usd(entry_price, exit_price, direction, qty):
+    """Gross futures PnL in USD from ES price move (× $50/pt × qty × direction)."""
+    try:
+        ep = float(entry_price or 0)
+        xp = float(exit_price or 0)
+        q = float(qty or 0)
+        d = int(direction) if direction is not None else 1
+        if ep <= 0 or xp <= 0 or q <= 0:
+            return 0.0
+        return (xp - ep) * float(d) * 50.0 * q
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pnl_from_fills_or_synthetic(fills, entry_price, exit_price, direction, qty, log_label="trade"):
+    """
+    Prefer sum(commissionReport.realizedPNL) when it matches price-based economics.
+    Paper / FIFO / single-leg reports sometimes disagree with the open→close price path;
+    in that case use synthetic gross minus commissions on these fills.
+    """
+    synthetic = _es_synthetic_pnl_usd(entry_price, exit_price, direction, qty)
+    if not fills:
+        return synthetic
+
+    ib_parts = []
+    comm = 0.0
+    for f in fills:
+        cr = getattr(f, "commissionReport", None)
+        if cr is None:
+            continue
+        try:
+            if getattr(cr, "commission", None) is not None:
+                comm += float(cr.commission or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if getattr(cr, "realizedPNL", None) is not None:
+                ib_parts.append(float(cr.realizedPNL))
+        except (TypeError, ValueError):
+            pass
+
+    if not ib_parts:
+        return synthetic - comm if comm else synthetic
+
+    ib_net = float(sum(ib_parts))
+    if not np.isfinite(ib_net):
+        return synthetic - comm if comm else synthetic
+
+    tol = max(35.0, 0.2 * max(abs(synthetic), abs(ib_net), 1.0))
+    same_sign = (synthetic == 0.0) or (ib_net * synthetic >= 0.0)
+    close_enough = abs(ib_net - synthetic) <= tol
+
+    if same_sign and close_enough:
+        return ib_net
+
+    logging.warning(
+        "%s PnL: IB realizedPNL sum (%.2f) vs price-based (%.2f); using synthetic minus "
+        "commissions on this order (%.2f)",
+        log_label,
+        ib_net,
+        synthetic,
+        comm,
+    )
+    return synthetic - comm if comm else synthetic
+
+
+def _wait_oca_pair_cancelled(ib, perm_stop: int, perm_tp: int, timeout: float = 5.0) -> str:
+    """
+    After ``cancelOrder`` on both legs of an OCA exit pair, wait until both are gone/cancelled
+    or one fills. IB often cancels the sibling when only one leg is cancelled; we cancel both
+    explicitly then wait here.
+    """
+    terminal = ("Cancelled", "Inactive", "ApiCancelled")
+
+    def _status(perm: int):
+        if perm <= 0:
+            return None
+        tr = next((t for t in ib.trades() if t.order.permId == perm), None)
+        if not tr or not tr.orderStatus:
+            return "missing"
+        return getattr(tr.orderStatus, "status", "") or ""
+
+    def _leg_done(perm: int, st):
+        if perm <= 0:
+            return True
+        if st is None:
+            return False
+        if st == "Filled":
+            return False  # handled separately
+        return st in terminal or st == "missing"
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ss, ts = _status(perm_stop), _status(perm_tp)
+        if ss == "Filled" or ts == "Filled":
+            return "filled"
+        if _leg_done(perm_stop, ss) and _leg_done(perm_tp, ts):
+            return "cancelled"
+        ib.sleep(0.12)
+    return "timeout"
+
+
+def _broker_stop_trigger_price(stop_order):
+    """
+    Stop trigger level as IB reports on the order object (auxPrice / stopPrice).
+
+    Do not merge with ``position_dict['stop']``: after a failed trail modify (e.g. IB
+    10326) strategy memory can ratchet while the working order still shows the prior
+    level — using the max for breach / PreSubmitted checks caused false manual closes.
+    """
+    if not stop_order:
+        return None
+    for attr in ("auxPrice", "stopPrice"):
+        v = _finite_stop_scalar(getattr(stop_order, attr, None))
+        if v is not None and v > 0:
+            return v
+    return None
+
+
+def _effective_bracket_stop(stop_order, bracket, direction: int):
+    """
+    Single working stop level for live logic, snapshots, and reporting.
+
+    Strategy exits use ``position_dict['stop']`` (includes trailing ratchet). IB
+    ``StopOrder`` updates often land on ``stopPrice`` while ``auxPrice`` can stay
+    at the original submission value — reading aux first made reports show the
+    initial stop even when the strategy had trailed and exited near the true level.
+    """
+    candidates = []
+    pd = (bracket or {}).get("position_dict") or {}
+    v = _finite_stop_scalar(pd.get("stop"))
+    if v is not None:
+        candidates.append(v)
+    if stop_order:
+        for attr in ("stopPrice", "auxPrice"):
+            v = _finite_stop_scalar(getattr(stop_order, attr, None))
+            if v is not None:
+                candidates.append(v)
+    if not candidates:
+        return None
+    if direction == 1:
+        return max(candidates)
+    if direction == -1:
+        return min(candidates)
+    return candidates[0]
 
 
 def _snapshot_strategy_params(strategy) -> dict:
@@ -91,6 +259,110 @@ def _find_entry_trade(ib, contract, order_id: int, perm_id: int):
     return None
 
 
+def _entry_trade_for_bracket(ib, contract, bracket) -> Optional[Any]:
+    entry = bracket.get('entry')
+    if not entry:
+        return None
+    oid = int(bracket.get('entryOrderId') or getattr(entry, 'orderId', 0) or 0)
+    perm = int(getattr(entry, 'permId', 0) or 0)
+    return _find_entry_trade(ib, contract, oid, perm)
+
+
+def _ib_open_position_matches_bracket(ib, contract, bracket) -> bool:
+    """
+    True when IB still reports an open futures position consistent with this bracket.
+
+    Used so we never prune a bracket just because ib.trades() no longer lists the entry
+    leg (cache/eviction) while the portfolio row is still non-flat.
+    """
+    direction = int(bracket.get('direction') or 0)
+    if direction == 0 or contract is None:
+        return False
+    bc = bracket.get('contract') or contract
+    try:
+        want_id = int(getattr(bc, 'conId', 0) or getattr(contract, 'conId', 0) or 0)
+    except (TypeError, ValueError):
+        want_id = int(getattr(contract, 'conId', 0) or 0)
+    if not want_id:
+        return False
+    try:
+        for p in ib.positions():
+            if getattr(p.contract, 'conId', 0) != want_id:
+                continue
+            pos = float(p.position or 0)
+            if pos == 0:
+                continue
+            if (direction > 0 and pos > 0) or (direction < 0 and pos < 0):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _cancel_bracket_working_orders(ib, contract, bracket) -> None:
+    """Best-effort cancel entry/SL/TP legs for a bracket being torn down."""
+    targets = []
+    for key in ('entry', 'stopLoss', 'takeProfit'):
+        order = bracket.get(key)
+        if order:
+            targets.append((getattr(order, 'permId', 0), getattr(order, 'orderId', 0)))
+    for trade in ib.trades():
+        if trade.contract.conId != contract.conId:
+            continue
+        o = trade.order
+        op, oid = getattr(o, 'permId', 0), getattr(o, 'orderId', 0)
+        if not any((op and op == t[0]) or (oid and oid == t[1]) for t in targets):
+            continue
+        st = getattr(trade.orderStatus, 'status', '') or ''
+        if trade.isActive() or st in ('Inactive', 'PreSubmitted', 'Submitted', 'PendingSubmit'):
+            try:
+                ib.cancelOrder(o)
+            except Exception:
+                pass
+
+
+def prune_dead_brackets(ib, contract, positions, live_tracker=None) -> int:
+    """
+    Drop in-memory brackets whose entry never filled (cancelled/rejected parent).
+
+    Without this, check_entries can append a bracket before fill, the entry is cancelled
+    (e.g. flat-book cleanup), and the bot still thinks max_open_trades is reached while IB is flat.
+    """
+    if not contract or not positions:
+        return 0
+    now = datetime.now(pytz.utc)
+    pruned = 0
+    for bracket in positions[:]:
+        try:
+            trade = _entry_trade_for_bracket(ib, contract, bracket)
+            if trade and trade.filled():
+                continue
+            if bracket.get('position_verified') or _ib_open_position_matches_bracket(ib, contract, bracket):
+                continue
+            guard_until = bracket.get('guard_until')
+            if guard_until is not None:
+                gu = guard_until if guard_until.tzinfo else pytz.utc.localize(guard_until)
+                if now < gu:
+                    continue
+            if trade and trade.isActive():
+                continue
+            st = getattr(trade.orderStatus, 'status', 'no_trade') if trade else 'no_trade'
+            _cancel_bracket_working_orders(ib, contract, bracket)
+            positions.remove(bracket)
+            pruned += 1
+            d = bracket.get('direction')
+            logging.warning(
+                "Pruned dead bracket: entry never filled (status=%s, dir=%s)",
+                st,
+                'LONG' if d == 1 else 'SHORT' if d == -1 else d,
+            )
+            if live_tracker is not None:
+                add_to_live_tracker(live_tracker, 'warning', f"Pruned unfilled bracket ({st})")
+        except Exception as e:
+            logging.warning("prune_dead_brackets: skipped one bracket (%s)", e, exc_info=True)
+    return pruned
+
+
 def _ohlcv_resample_for_timeframe(df: pd.DataFrame, timeframe_mins: int) -> pd.DataFrame:
     """Resample 1-minute OHLCV to strategy timeframe (same rules as core.monitoring.resample_data)."""
     base_cols = ['open', 'high', 'low', 'close', 'volume']
@@ -116,6 +388,13 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
     
     if getattr(check_entries, 'last_idx', None) == idx:
         logging.debug(f"Already processed bar {idx} for entries. Skipping.")
+        return
+
+    sg = getattr(dashboard_state, "security_guard", None) if dashboard_state else None
+    if sg is not None and getattr(sg, "flattened_today", False):
+        logging.info(
+            "Entry blocked: daily PnL emergency flatten active (no new trades until next session day)"
+        )
         return
 
     # Extra Safety: Check for active orders for this contract to prevent double entry
@@ -325,6 +604,7 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
             "Entry parent not filled yet/rejected; suppressing TRADE OPEN email/log until confirmed fill "
             f"(orderId={entry_order_id if 'entry_order_id' in locals() else 0}, permId={entry_perm})"
         )
+        prune_dead_brackets(ib, contract, positions, live_tracker)
     
     # Double check order placement success
     ib.sleep(0.5)
@@ -362,13 +642,9 @@ def _record_flatten_close_from_market_order(
             exit_price = float(close_trade.fills[-1].execution.price)
         except Exception:
             exit_price = 0.0
-        for f in close_trade.fills:
-            cr = getattr(f, 'commissionReport', None)
-            if cr is not None and hasattr(cr, 'realizedPNL') and cr.realizedPNL is not None:
-                pnl = float(cr.realizedPNL)
-                break
-        if pnl == 0 and entry_price > 0 and exit_price > 0:
-            pnl = (exit_price - entry_price) * dir_ * 50 * qty
+        pnl = _pnl_from_fills_or_synthetic(
+            close_trade.fills, entry_price, exit_price, dir_, qty, log_label="flatten_close"
+        )
     else:
         expected_side = 'SLD' if dir_ == 1 else 'BOT'
         is_aware = entry_time and getattr(entry_time, 'tzinfo', None) is not None
@@ -388,10 +664,9 @@ def _record_flatten_close_from_market_order(
             if abs(f.execution.shares) < qty:
                 continue
             exit_price = float(f.execution.price)
-            if f.commissionReport and hasattr(f.commissionReport, 'realizedPNL'):
-                pnl = float(f.commissionReport.realizedPNL or 0)
-            if pnl == 0 and entry_price > 0:
-                pnl = (exit_price - entry_price) * dir_ * 50 * qty
+            pnl = _pnl_from_fills_or_synthetic(
+                [f], entry_price, exit_price, dir_, qty, log_label="flatten_scan"
+            )
             break
 
     if exit_price <= 0 and data is not None and not data.empty:
@@ -463,13 +738,7 @@ def _record_flatten_close_from_market_order(
         del completed_trades[:-1000]
 
     try:
-        active_for_contract = [t for t in ib.trades() if t.contract.conId == bracket_contract.conId and t.isActive()]
-        for trade in active_for_contract:
-            perm_id = trade.order.permId
-            if entry_trade and perm_id == getattr(entry_trade.order, 'permId', 0):
-                continue
-            logging.info(f"Cleanup: Cancelling active order {trade.order.orderType} {trade.order.action} (PermID: {perm_id}) for {bracket_contract.localSymbol}")
-            ib.cancelOrder(trade.order)
+        cancel_residual_orders_when_flat_on_contract(ib, bracket_contract, live_tracker)
     except Exception as e:
         logging.error(f"Error during flatten orphan cleanup: {e}")
 
@@ -504,17 +773,8 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
 
             stop_order = bracket.get('stopLoss')
             tp_order = bracket.get('takeProfit')
-            stop_snap = None
+            stop_snap = _effective_bracket_stop(stop_order, bracket, dir_)
             tp_snap = None
-            if stop_order:
-                raw_sl = getattr(stop_order, 'auxPrice', None)
-                if raw_sl is None:
-                    raw_sl = getattr(stop_order, 'stopPrice', None)
-                if raw_sl is not None:
-                    try:
-                        stop_snap = float(raw_sl)
-                    except (TypeError, ValueError):
-                        stop_snap = None
             if tp_order:
                 raw_tp = getattr(tp_order, 'lmtPrice', None)
                 if raw_tp is not None:
@@ -533,7 +793,9 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
             if bracket in positions:
                 positions.remove(bracket)
 
-            close_mkt = MarketOrder(action=close_action, totalQuantity=actual_qty, transmit=True)
+            close_mkt = MarketOrder(
+                action=close_action, totalQuantity=actual_qty, transmit=True, tif="DAY"
+            )
             close_trade = ib.placeOrder(bracket_contract, close_mkt)
             ib.sleep(3)
             if not close_trade.fills:
@@ -566,7 +828,9 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
             if not active_for_this:
                 logging.warning(f"UNTRACKED ES POSITION FOUND during {reason_label} exit: {pos.position} {pos.contract.localSymbol}. Closing...")
                 close_action = 'SELL' if pos.position > 0 else 'BUY'
-                close_order = MarketOrder(action=close_action, totalQuantity=abs(pos.position), transmit=True)
+                close_order = MarketOrder(
+                    action=close_action, totalQuantity=abs(pos.position), transmit=True, tif="DAY"
+                )
                 ib.placeOrder(pos.contract, close_order)
                 if live_tracker:
                     add_to_live_tracker(live_tracker, 'warning', f"Closed untracked {pos.contract.localSymbol} ({reason_label})")
@@ -586,7 +850,8 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
 
 
 def check_exits(strategy, ib, contract, data, positions, completed_trades,
-                live_tracker, send_email_fn, idx, latest_row, allow_strategy_exit=False):
+                live_tracker, send_email_fn, idx, latest_row, allow_strategy_exit=False,
+                skip_trailing=False):
     """Comprehensive exit logic: RTH, maintenance, trailing stop, opposite BB TP, trade close detection."""
     
     # --- RTH Force Exit ---
@@ -639,6 +904,8 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                     delattr(check_exits, '_maint_warned')
             return
 
+    prune_dead_brackets(ib, contract, positions, live_tracker)
+
     # --- Per-bracket exit checks ---
     for bracket in positions[:]:
         entry_order = bracket['entry']
@@ -689,16 +956,26 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
             continue
 
         current_price = latest_row['close']
-        stop_price = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0))
+        live_stop_order = stop_trade.order if stop_trade else stop_order
+        broker_px = _broker_stop_trigger_price(live_stop_order)
+        stop_price_for_breach = (
+            broker_px
+            if (broker_px is not None and broker_px > 0)
+            else (_effective_bracket_stop(stop_order, bracket, dir_) or 0.0)
+        )
 
         # --- PreSubmitted stop force-close ---
-        stop_should_trigger = (current_price <= stop_price) if dir_ == 1 else (current_price >= stop_price)
+        stop_should_trigger = (
+            (current_price <= stop_price_for_breach) if dir_ == 1 else (current_price >= stop_price_for_breach)
+        )
         if stop_should_trigger:
             stop_status = stop_trade.orderStatus.status if stop_trade and stop_trade.orderStatus else None
             why_held = getattr(stop_trade.orderStatus, 'whyHeld', '') if stop_trade and stop_trade.orderStatus else ''
 
             if stop_status == 'PreSubmitted' and 'trigger' in why_held.lower():
-                logging.warning(f"CRITICAL: Stop {stop_price:.2f} breached, order PreSubmitted. Manual close.")
+                logging.warning(
+                    f"CRITICAL: Stop {stop_price_for_breach:.2f} breached, order PreSubmitted. Manual close."
+                )
                 _force_close_position(ib, bracket_contract, bracket, positions, completed_trades,
                                       live_tracker, send_email_fn, entry_trade, current_price,
                                       "Manual Close (PreSubmitted Stop)", data=data, strategy=strategy)
@@ -750,7 +1027,8 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
         if position_still_open:
             position_dict = bracket.get('position_dict', {})
             if not position_dict:
-                current_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0))
+                eff = _effective_bracket_stop(stop_order, bracket, dir_)
+                current_stop = float(eff) if eff is not None else 0.0
                 position_dict = {
                     'direction': dir_, 'bars_held': 0, 'stop': current_stop,
                     'max_high': latest_row['high'] if dir_ == 1 else None,
@@ -758,29 +1036,204 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 }
                 bracket['position_dict'] = position_dict
 
-            # FIX: Use strat_pos which was already extracted or get it again
-            strat_pos = bracket.get('position_dict', position_dict)
-            stop_updated = strategy.update_trailing_stop(strat_pos, latest_row, data)
+            if not skip_trailing:
+                # FIX: Use strat_pos which was already extracted or get it again
+                strat_pos = bracket.get('position_dict', position_dict)
+                _sb = _finite_stop_scalar(strat_pos.get("stop"))
+                if _sb is None:
+                    _sb = _finite_stop_scalar(bracket.get("entry_stop_price"))
+                if _sb is None:
+                    _sb = _effective_bracket_stop(stop_order, bracket, dir_)
+                stop_before_trail_update = float(_sb) if _sb is not None else 0.0
 
-            # Check if stop order is active
-            stop_active = False
-            if stop_trade:
-                stop_active = stop_trade.isActive() or (stop_trade.orderStatus and 
-                            stop_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending'])
+                stop_updated = strategy.update_trailing_stop(strat_pos, latest_row, data)
 
-            if stop_updated and stop_active:
-                new_stop = round(float(position_dict['stop']) * 4) / 4
-                curr_stop = getattr(stop_order, 'stopPrice', getattr(stop_order, 'auxPrice', 0))
-                should_update = (dir_ == 1 and new_stop > curr_stop) or (dir_ == -1 and new_stop < curr_stop)
-                if should_update:
-                    try:
-                        stop_order.stopPrice = new_stop
-                        stop_order.transmit = True
-                        ib.placeOrder(bracket_contract, stop_order)
-                        logging.info(f"Trailing stop modified: {curr_stop:.2f} -> {new_stop:.2f}")
-                        add_to_live_tracker(live_tracker, 'order', f"Trailing stop -> ${new_stop:.2f}")
-                    except Exception as e:
-                        logging.error(f"Error modifying trailing stop: {e}")
+                # Strategy may write NaN/inf into stop on bad bar data; clamp before IB / round().
+                _trail_raw = _finite_stop_scalar(strat_pos.get("stop"))
+                if _trail_raw is None:
+                    _trail_raw = _finite_stop_scalar(position_dict.get("stop"))
+                if _trail_raw is None:
+                    _trail_raw = _effective_bracket_stop(stop_order, bracket, dir_)
+                if _trail_raw is not None:
+                    q = _quantize_es_tick(_trail_raw)
+                    if q is not None:
+                        strat_pos["stop"] = q
+                        position_dict["stop"] = q
+
+                # Check if stop order is active
+                stop_active = False
+                if stop_trade:
+                    stop_active = stop_trade.isActive() or (stop_trade.orderStatus and 
+                                stop_trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending'])
+
+                if stop_updated and stop_active:
+                    new_stop = _quantize_es_tick(position_dict.get("stop"))
+                    if new_stop is None:
+                        logging.error(
+                            "Trailing: stop is not finite after update_trailing_stop; skipping broker update"
+                        )
+                    else:
+                        live_ord = (stop_trade.order if stop_trade else stop_order)
+                        brk_lv = _broker_stop_trigger_price(live_ord)
+                        curr_working = (
+                            float(brk_lv)
+                            if brk_lv is not None
+                            else float(_effective_bracket_stop(stop_order, bracket, dir_) or 0.0)
+                        )
+                        if not np.isfinite(curr_working):
+                            curr_working = float(new_stop)
+                        should_update = (dir_ == 1 and new_stop > curr_working) or (
+                            dir_ == -1 and new_stop < curr_working
+                        )
+                        if stop_updated and not should_update:
+                            logging.debug(
+                                "Trailing: model stop=%.4f vs working=%.4f (dir=%s); no broker tighten",
+                                new_stop,
+                                curr_working,
+                                dir_,
+                            )
+                        if should_update:
+                            stop_action = "SELL" if dir_ == 1 else "BUY"
+                            qty_trail = float(getattr(stop_order, "totalQuantity", 1) or 1)
+                            parent_id = int(bracket.get("entryOrderId") or 0)
+                            og = bracket.get("ocaGroup")
+                            # IB rejects in-place modify on OCA-linked exits (error 10326). Replace: cancel + new child.
+                            use_oc_replace = bool(tp_order and og)
+                            try:
+                                if use_oc_replace:
+                                    if parent_id <= 0:
+                                        raise RuntimeError("missing entryOrderId for OCA stop replace")
+                                    tp_lmt = _finite_stop_scalar(
+                                        getattr(tp_order, "lmtPrice", None)
+                                    )
+                                    if tp_lmt is None:
+                                        tp_lmt = _finite_stop_scalar(bracket.get("entry_tp_price"))
+                                    if tp_lmt is None:
+                                        raise RuntimeError("missing TP price for OCA stop replace")
+                                    tp_lmt = _quantize_es_tick(tp_lmt)
+                                    if tp_lmt is None:
+                                        raise RuntimeError("non-finite TP price for OCA stop replace")
+                                    old_stop_perm = int(getattr(stop_order, "permId", 0) or 0)
+                                    old_tp_perm = int(getattr(tp_order, "permId", 0) or 0)
+                                    # Canceling only the stop cancels the OCA sibling (TP). Replace both legs.
+                                    ib.cancelOrder(stop_order)
+                                    ib.cancelOrder(tp_order)
+                                    outcome = _wait_oca_pair_cancelled(
+                                        ib, old_stop_perm, old_tp_perm, timeout=5.0
+                                    )
+                                    if outcome == "filled":
+                                        logging.info(
+                                            "Trailing (OCA): SL or TP filled during cancel/replace; "
+                                            "skipping new exit orders."
+                                        )
+                                        strat_pos["stop"] = stop_before_trail_update
+                                    elif outcome != "cancelled":
+                                        strat_pos["stop"] = stop_before_trail_update
+                                        logging.error(
+                                            "Trailing (OCA): cancel wait outcome=%s stop_perm=%s tp_perm=%s; "
+                                            "reverted strategy stop %.2f -> %.2f",
+                                            outcome,
+                                            old_stop_perm,
+                                            old_tp_perm,
+                                            new_stop,
+                                            stop_before_trail_update,
+                                        )
+                                    else:
+                                        tp_action = "SELL" if dir_ == 1 else "BUY"
+                                        new_stop_order = StopOrder(
+                                            action=stop_action,
+                                            totalQuantity=qty_trail,
+                                            stopPrice=new_stop,
+                                            parentId=parent_id,
+                                            tif="GTC",
+                                            ocaGroup=og,
+                                            ocaType=1,
+                                            transmit=False,
+                                        )
+                                        new_tp_order = LimitOrder(
+                                            action=tp_action,
+                                            totalQuantity=qty_trail,
+                                            lmtPrice=tp_lmt,
+                                            parentId=parent_id,
+                                            tif="GTC",
+                                            ocaGroup=og,
+                                            ocaType=1,
+                                            transmit=True,
+                                        )
+                                        ib.placeOrder(bracket_contract, new_stop_order)
+                                        ib.placeOrder(bracket_contract, new_tp_order)
+                                        bracket["stopLoss"] = new_stop_order
+                                        bracket["takeProfit"] = new_tp_order
+                                        logging.info(
+                                            f"Trailing OCA pair replaced: SL {curr_working:.2f} -> {new_stop:.2f}, "
+                                            f"TP {tp_lmt:.2f}"
+                                        )
+                                        add_to_live_tracker(
+                                            live_tracker,
+                                            "order",
+                                            f"Trailing SL+TP (replace) SL ${new_stop:.2f} TP ${tp_lmt:.2f}",
+                                        )
+                                else:
+                                    stop_order.stopPrice = new_stop
+                                    if hasattr(stop_order, "auxPrice"):
+                                        stop_order.auxPrice = new_stop
+                                    if hasattr(stop_order, "ocaGroup"):
+                                        stop_order.ocaGroup = ""
+                                    if hasattr(stop_order, "ocaType"):
+                                        stop_order.ocaType = 0
+                                    stop_order.transmit = True
+                                    ib.placeOrder(bracket_contract, stop_order)
+                                    ib.sleep(0.2)
+                                    logging.info(f"Trailing stop modified: {curr_working:.2f} -> {new_stop:.2f}")
+                                    add_to_live_tracker(live_tracker, "order", f"Trailing stop -> ${new_stop:.2f}")
+                            except Exception as e:
+                                strat_pos["stop"] = stop_before_trail_update
+                                logging.error(f"Error updating trailing stop: {e}")
+                                if use_oc_replace and parent_id > 0 and og:
+                                    try:
+                                        tp_lmt = _finite_stop_scalar(
+                                            getattr(tp_order, "lmtPrice", None)
+                                        )
+                                        if tp_lmt is None:
+                                            tp_lmt = _finite_stop_scalar(bracket.get("entry_tp_price"))
+                                        sl_px = _quantize_es_tick(stop_before_trail_update)
+                                        tp_px = _quantize_es_tick(tp_lmt) if tp_lmt is not None else None
+                                        if sl_px is not None and tp_px is not None:
+                                            tp_action = "SELL" if dir_ == 1 else "BUY"
+                                            restore_sl = StopOrder(
+                                                action=stop_action,
+                                                totalQuantity=qty_trail,
+                                                stopPrice=sl_px,
+                                                parentId=parent_id,
+                                                tif="GTC",
+                                                ocaGroup=og,
+                                                ocaType=1,
+                                                transmit=False,
+                                            )
+                                            restore_tp = LimitOrder(
+                                                action=tp_action,
+                                                totalQuantity=qty_trail,
+                                                lmtPrice=tp_px,
+                                                parentId=parent_id,
+                                                tif="GTC",
+                                                ocaGroup=og,
+                                                ocaType=1,
+                                                transmit=True,
+                                            )
+                                            ib.placeOrder(bracket_contract, restore_sl)
+                                            ib.placeOrder(bracket_contract, restore_tp)
+                                            bracket["stopLoss"] = restore_sl
+                                            bracket["takeProfit"] = restore_tp
+                                            logging.warning(
+                                                "Restored OCA SL+TP after trail replace failure "
+                                                "(SL %.2f TP %.2f)",
+                                                sl_px,
+                                                tp_px,
+                                            )
+                                    except Exception as re:
+                                        logging.critical(
+                                            "Trail replace failed and could not restore OCA pair: %s", re
+                                        )
 
             # --- Opposite BB TP update ---
             if allow_strategy_exit and position_still_open and getattr(strategy, 'opposite_bb_tp', False) and tp_order:
@@ -793,11 +1246,6 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
     try:
         stop_order = bracket.get('stopLoss')
         tp_order = bracket.get('takeProfit')
-        # Cancel existing orders
-        for order in [bracket.get('stopLoss'), bracket.get('takeProfit')]:
-            if order:
-                try: ib.cancelOrder(order)
-                except: pass
 
         # Use bracket's contract for closing
         bracket_contract = bracket.get('contract', contract)
@@ -809,8 +1257,19 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
 
         actual_pos = es_pos[0].position
         dir_ = 1 if actual_pos > 0 else -1
+        stop_at_close_snap = _effective_bracket_stop(stop_order, bracket, dir_)
+        tp_at_close_snap = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+
+        # Cancel existing orders (snapshot SL/TP first for reporting)
+        for order in [bracket.get('stopLoss'), bracket.get('takeProfit')]:
+            if order:
+                try: ib.cancelOrder(order)
+                except: pass
+
         close_action = 'SELL' if actual_pos > 0 else 'BUY'
-        close_order = MarketOrder(action=close_action, totalQuantity=abs(actual_pos), transmit=True)
+        close_order = MarketOrder(
+            action=close_action, totalQuantity=abs(actual_pos), transmit=True, tif="DAY"
+        )
         
         # Remove bracket proactively before sleep yields to event loop to avoid re-entrancy duplications
         if bracket in positions:
@@ -825,14 +1284,9 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
             entry_price = bracket.get('entry_price', 0)
             exit_price = close_trade.fills[0].execution.price if close_trade.fills else current_price
             qty = abs(actual_pos)
-            pnl = (exit_price - entry_price) * dir_ * 50 * qty if entry_price else 0
-
-            # Check commission report for accurate PnL
-            if close_trade.fills:
-                for f in close_trade.fills:
-                    if f.commissionReport and hasattr(f.commissionReport, 'realizedPNL'):
-                        pnl = f.commissionReport.realizedPNL
-                        break
+            pnl = _pnl_from_fills_or_synthetic(
+                close_trade.fills, entry_price, exit_price, dir_, qty, log_label="force_close"
+            )
 
             # Metadata for reporting
             exit_time = datetime.now()
@@ -852,8 +1306,8 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                             'direction': dir_, 'entry_price': entry_price,
                             'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
                             'reason': reason,
-                            'stop_at_close': getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None)) if stop_order else None,
-                            'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
+                            'stop_at_close': stop_at_close_snap,
+                            'tp_at_close': tp_at_close_snap,
                             'stop_at_open': bracket.get('entry_stop_price'),
                             'tp_at_open': bracket.get('entry_tp_price'),
                             'params_snapshot': bracket.get('params_snapshot') or {},
@@ -881,8 +1335,8 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                 'params_snapshot': bracket.get('params_snapshot') or {},
                 'stop_at_open': bracket.get('entry_stop_price'),
                 'tp_at_open': bracket.get('entry_tp_price'),
-                'stop_at_close': getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None)) if stop_order else None,
-                'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
+                'stop_at_close': stop_at_close_snap,
+                'tp_at_close': tp_at_close_snap,
                 'entry_order_id': bracket.get('entryOrderId'),
             })
             if len(completed_trades) > 1000:
@@ -1023,7 +1477,7 @@ def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, p
     entry_time = bracket.get('entry_time')
     stop_order = bracket.get('stopLoss')
     tp_order = bracket.get('takeProfit')
-    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+    curr_stop = _effective_bracket_stop(stop_order, bracket, dir_) or 0
     tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
 
     # Calculate metrics
@@ -1093,7 +1547,7 @@ def send_composite_status_notification(ib, positions, data, account_info, send_e
             duration_str = format_duration((now - entry_time).total_seconds()) if entry_time else "N/A"
             
             tp_order = bracket.get('takeProfit')
-            curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+            curr_stop = _effective_bracket_stop(stop_order, bracket, dir_) or 0
             tp_price = getattr(tp_order, 'lmtPrice', None) if tp_order else None
 
             metrics = _calculate_trade_metrics(entry_time, now, dir_, entry_price, current_price, pnl, qty, data, curr_stop, tp_price)
@@ -1190,12 +1644,9 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     exit_price = 0
     if exit_trade and exit_trade.fills:
         exit_price = exit_trade.fills[0].execution.price
-        pnl = 0
-        for f in exit_trade.fills:
-            if f.commissionReport and hasattr(f.commissionReport, 'realizedPNL'):
-                pnl = f.commissionReport.realizedPNL; break
-        if pnl == 0 and entry_price > 0:
-            pnl = (exit_price - entry_price) * dir_ * 50 * qty
+        pnl = _pnl_from_fills_or_synthetic(
+            exit_trade.fills, entry_price, exit_price, dir_, qty, log_label="bracket_exit"
+        )
     else:
         # Fallback 1: Scan recent fills for this contract to find the actual manual/untracked execution
         fallback_fill = None
@@ -1236,7 +1687,7 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     
     duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
 
-    curr_stop = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', 0)) if stop_order else 0
+    curr_stop = _effective_bracket_stop(stop_order, bracket, dir_) or 0
 
     # Generate HTML report if possible
     report_url = ""
@@ -1296,18 +1747,9 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     if len(completed_trades) > 1000:
         del completed_trades[:-1000]
 
-    # Cancel ALL orphaned orders for this contract from ANY bracket (Safety Catch)
-    # This prevents the 'stranded order' issue like the one at $7177.75
+    # Remove any non-terminal legs on this conId (includes **Inactive** TP after OCA replace races).
     try:
-        active_for_contract = [t for t in ib.trades() if t.contract.conId == contract.conId and t.isActive()]
-        for trade in active_for_contract:
-            perm_id = trade.order.permId
-            # If this trade isn't the entry that just closed (it shouldn't be anyway as entry is done)
-            if entry_trade and perm_id == getattr(entry_trade.order, 'permId', 0):
-                continue
-                
-            logging.info(f"Cleanup: Cancelling active order {trade.order.orderType} {trade.order.action} (PermID: {perm_id}) for {contract.localSymbol}")
-            ib.cancelOrder(trade.order)
+        cancel_residual_orders_when_flat_on_contract(ib, contract, live_tracker)
     except Exception as e:
         logging.error(f"Error during final orphan cleanup: {e}")
 

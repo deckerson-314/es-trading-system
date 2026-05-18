@@ -9,7 +9,7 @@ def test_enhanced_stale_ui():
         mode='PAPER',
         is_connected=True,
         connection_start_time=datetime.now() - timedelta(hours=1),
-        last_data_receipt_time=datetime.now() - timedelta(seconds=70) # Stale
+        last_data_receipt_time=datetime.now() - timedelta(seconds=130)  # Stale vs server threshold
     )
     
     web_dir = os.path.join(os.getcwd(), 'web')
@@ -26,7 +26,7 @@ def test_enhanced_stale_ui():
     
     with open(stale_path, 'r', encoding='utf-8') as f:
         content = f.read()
-        if 'id="last-data-receipt"' in content and 'DATA: STALE (60s+)' in content:
+        if 'id="last-data-receipt"' in content and 'DATA: STALE (120s+)' in content:
             print("Verification SUCCESS: Dashboard contains data-receipt element and Python-side status.")
         else:
             print("Verification FAILED: Dashboard missing elements.")

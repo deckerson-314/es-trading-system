@@ -32,6 +32,8 @@ import numpy as np
 import logging
 import json
 import re
+import shutil
+import uuid
 from datetime import datetime, time
 from ib_insync import IB, Future, util, MarketOrder, StopOrder, LimitOrder
 from dotenv import load_dotenv
@@ -58,12 +60,24 @@ from tools.notifications.email_service import send_email
 # Core modules (ported from ib_deployment_v4.py)
 from core.connection import get_front_es_contract, connect_with_retry, request_historical_data_with_retry
 from core.account import get_account_summary, format_duration, add_to_live_tracker, add_error
-from core.execution import check_entries, check_exits, _close_all_positions, send_composite_status_notification
+from core.execution import (
+    check_entries,
+    check_exits,
+    _close_all_positions,
+    send_composite_status_notification,
+    prune_dead_brackets,
+    _entry_trade_for_bracket,
+)
 from core.protection import (cancel_all_pending, cleanup_orphaned_orders, close_orphaned_positions,
                               protect_existing_positions, check_and_recreate_tp_orders,
                               periodic_protection_check, run_reconnection_safety_sequence,
                               reconcile_positions)
-from core.monitoring import update_indicators, on_bar_update_handler
+from core.monitoring import (
+    update_indicators,
+    on_bar_update_handler,
+    configure_bar_pipeline,
+    bar_pipeline_consumer,
+)
 
 EASTERN = pytz.timezone('US/Eastern')
 
@@ -127,6 +141,9 @@ if not os.path.exists(args.output_dir):
     except OSError as e:
         print(f"Error creating output directory: {e}")
         exit(1)
+
+# Trade reports (unified_trade_report) resolve open_trade_timeline.jsonl from this path
+os.environ["IB_BOT_OUTPUT_DIR"] = os.path.abspath(args.output_dir)
 
 # =============================================================================
 # Setup Logging
@@ -211,6 +228,19 @@ disconnect_start_time = None
 disconnect_email_sent = False
 DISCONNECT_ALERT_THRESHOLD = 30
 
+# Throttle expensive per-trade HTML report sweeps — they must not block dashboard file writes.
+_last_trade_report_sweep_mono = 0.0
+TRADE_REPORT_SWEEP_INTERVAL_SEC = 30.0
+_trade_report_sweep_task = None  # asyncio.Task while background sweep runs
+
+# reqOpenOrders() every second can eventually stall IB Gateway; refresh at most this often.
+_OPEN_ORDERS_REQ_MIN_SEC = 5.0
+_last_req_open_orders_mono = 0.0
+
+# Throttle SecurityGuard in the UI loop so orphan scans do not run every second.
+_LAST_GUARD_UI_MONO = 0.0
+_GUARD_UI_MIN_SEC = 5.0
+
 # Web directory
 WEB_DIR = os.path.join(os.getcwd(), 'web')
 if not os.path.exists(WEB_DIR):
@@ -219,6 +249,68 @@ if not os.path.exists(WEB_DIR):
 
 COMPLETED_TRADES_PATH = os.path.join(args.output_dir, "completed_trades.json")
 _completed_trades_persist_sig = None
+
+
+def _ib_finite_price(x):
+    try:
+        v = float(x)
+        if not np.isfinite(v) or abs(v) > 1e12:
+            return None
+        return v
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_all_ib_open_orders(ib):
+    """
+    All working (non-terminal) orders visible to this IB session, every symbol.
+    Includes stopPrice/auxPrice so STP legs are visible on the dashboard.
+    """
+    global _last_req_open_orders_mono
+    out = []
+    now = time_module.monotonic()
+    try:
+        if now - _last_req_open_orders_mono >= _OPEN_ORDERS_REQ_MIN_SEC:
+            ib.reqOpenOrders()
+            _last_req_open_orders_mono = now
+    except Exception:
+        pass
+    try:
+        for t in ib.trades():
+            if t.isDone():
+                continue
+            o = t.order
+            c = t.contract
+            lmt = _ib_finite_price(getattr(o, "lmtPrice", float("nan")))
+            aux = _ib_finite_price(getattr(o, "auxPrice", float("nan")))
+            stp = _ib_finite_price(getattr(o, "stopPrice", float("nan")))
+            trig = stp or aux or lmt
+            ost = t.orderStatus
+            status = getattr(ost, "status", "") or ""
+            why = (getattr(ost, "whyHeld", "") or "")[:120]
+            out.append(
+                {
+                    "conId": getattr(c, "conId", 0),
+                    "localSymbol": getattr(c, "localSymbol", None) or getattr(c, "symbol", ""),
+                    "permId": getattr(o, "permId", 0) or 0,
+                    "orderId": getattr(o, "orderId", 0) or 0,
+                    "parentId": getattr(o, "parentId", 0) or 0,
+                    "orderType": getattr(o, "orderType", ""),
+                    "action": getattr(o, "action", ""),
+                    "totalQuantity": getattr(o, "totalQuantity", 0),
+                    "tif": getattr(o, "tif", ""),
+                    "lmtPrice": lmt,
+                    "auxPrice": aux,
+                    "stopPrice": stp,
+                    "triggerPrice": trig,
+                    "status": status,
+                    "whyHeld": why,
+                }
+            )
+    except Exception as e:
+        logging.debug(f"collect_all_ib_open_orders: {e}")
+    out.sort(key=lambda r: (str(r.get("localSymbol") or ""), int(r.get("orderId") or 0)))
+    return out
 
 
 def _trade_overlay_from_open_brackets(open_brackets):
@@ -315,6 +407,66 @@ def _active_trade_stop_tp_series(open_brackets, output_dir: str, max_points: int
     if not times:
         return None
     return {"times": times, "stop": stop_vals, "tp": tp_vals}
+
+
+def _bracket_position_rows_for_dashboard(ib, contract, brackets, current_price: float, multiplier: float = 50.0):
+    """Filled bot brackets when IB portfolio() is empty or lagging."""
+    rows = []
+    if not contract or not brackets:
+        return rows
+    cp = float(current_price or 0)
+    local_sym = getattr(contract, 'localSymbol', None) or getattr(contract, 'symbol', 'ES')
+    sym = getattr(contract, 'symbol', 'ES')
+    for bracket in brackets:
+        trade = _entry_trade_for_bracket(ib, contract, bracket)
+        if not trade or not trade.filled():
+            continue
+        direction = int(bracket.get('direction') or 0)
+        if direction == 0:
+            continue
+        entry = bracket.get('entry')
+        qty = abs(float(getattr(entry, 'totalQuantity', 0) or 0))
+        if qty <= 0:
+            qty = 1.0
+        ep = float(bracket.get('entry_price') or 0)
+        if trade.fills:
+            try:
+                ep = float(trade.fills[0].execution.price)
+            except (TypeError, ValueError, IndexError, AttributeError):
+                pass
+        if ep <= 0:
+            continue
+        mkt = cp if cp > 0 else ep
+        unreal = (mkt - ep) * direction * multiplier * qty
+        rows.append({
+            'symbol': sym,
+            'localSymbol': local_sym,
+            'position': direction * qty,
+            'avgCost': ep,
+            'avgPrice': ep,
+            'marketPrice': mkt,
+            'marketValue': mkt * multiplier * qty * direction,
+            'realizedPNL': 0.0,
+            'unrealizedPNL': unreal,
+            'source': 'bot',
+        })
+    return rows
+
+
+def _merge_positions_for_dashboard(ib, contract, brackets, portfolio_rows, current_price: float):
+    """IB portfolio rows plus bot-tracked fills missing from portfolio()."""
+    merged = list(portfolio_rows)
+    ib_by_sym = {}
+    for row in portfolio_rows:
+        if abs(float(row.get('position') or 0)) > 0:
+            key = row.get('localSymbol') or row.get('symbol') or ''
+            ib_by_sym[key] = float(row['position'])
+    for row in _bracket_position_rows_for_dashboard(ib, contract, brackets, current_price):
+        key = row.get('localSymbol') or row.get('symbol') or ''
+        if key in ib_by_sym and abs(ib_by_sym[key]) >= 1:
+            continue
+        merged.append(row)
+    return merged
 
 
 def _portfolio_row_for_dashboard(p, current_price: float, multiplier: float = 50.0) -> dict:
@@ -688,12 +840,44 @@ def merge_completed_trade_lists(primary: list, secondary: list, max_keep: int = 
 
 
 def persist_completed_trades(path: str, trades: list, max_keep: int = 1000) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """
+    Write completed trades atomically when possible. On Windows, antivirus or another
+    handle on the destination can make os.replace fail with WinError 5; we retry and
+    fall back to shutil.copyfile so the bot does not crash on shutdown persist.
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
     payload = [_serialize_trade_record(t) for t in trades[-max_keep:]]
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    basename = os.path.basename(path)
+    tmp = os.path.join(d, f".{basename}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        last_err = None
+        for attempt in range(25):
+            try:
+                os.replace(tmp, path)
+                return
+            except (PermissionError, OSError) as e:
+                win = getattr(e, "winerror", None)
+                if isinstance(e, PermissionError) or win in (5, 32) or getattr(e, "errno", None) in (13, 16):
+                    last_err = e
+                    time_module.sleep(min(0.03 * (attempt + 1), 0.35))
+                    continue
+                raise
+        try:
+            shutil.copyfile(tmp, path)
+        except Exception:
+            if last_err:
+                raise last_err from None
+            raise
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def maybe_persist_completed_trades(path: str, trades: list) -> None:
@@ -832,82 +1016,197 @@ def check_disconnect_status():
         disconnect_email_sent = False
 
 
+async def _write_dashboard_files_async(state, html_path, status_path, label: str, timeout: float = 90.0):
+    """
+    Run HTML/JS generation and disk writes on a worker thread. The UI coroutine awaits this, but
+    the event loop can still run IB socket I/O and on_bar_update_handler while the thread works,
+    which prevents the dashboard from appearing frozen when chart/HTML work is slow.
+    """
+    if state is None:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(update_dashboard, state, html_path, status_path),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logging.error("Dashboard write timed out (%.0fs): %s", timeout, label)
+    except Exception as e:
+        logging.error("Dashboard write failed (%s): %s", label, e, exc_info=True)
+
+
 async def update_ui_periodically():
     """Periodically update the dashboard files."""
+    global _last_trade_report_sweep_mono, _trade_report_sweep_task, _LAST_GUARD_UI_MONO
     while True:
-        if not ib.isConnected():
-            await asyncio.sleep(5)
-            continue
+        connected = ib.isConnected()
         try:
             if dashboard_state:
-                # Latest print for PnL + chart (before account summary uses data_ref)
-                if data_ref['data'] is not None and not data_ref['data'].empty:
-                    dashboard_state.current_price = float(data_ref['data']['close'].iloc[-1])
-                else:
-                    dashboard_state.current_price = 0.0
-
-                dashboard_state.account_info = get_account_summary(
-                    ib, data=data_ref['data'], contract=contract,
-                    portfolio_realized_pnl=portfolio_realized_pnl
-                )
-
-                cp = dashboard_state.current_price
-                pos_data = []
-                for p in ib.portfolio():
-                    if not contract or p.contract.symbol == contract.symbol:
-                        pos_data.append(_portfolio_row_for_dashboard(p, cp))
-                dashboard_state.positions = pos_data
-
-                # Update orders
-                orders_data = []
-                for t in ib.trades():
-                    if not t.isDone():
-                        orders_data.append({
-                            'orderId': t.order.orderId, 'orderType': t.order.orderType,
-                            'action': t.order.action, 'totalQuantity': t.order.totalQuantity,
-                            'lmtPrice': t.order.lmtPrice, 'auxPrice': t.order.auxPrice,
-                            'status': t.orderStatus.status
-                        })
-                dashboard_state.active_orders = orders_data
-
-                # Update state common fields
-                dashboard_state.is_connected = ib.isConnected()
-                dashboard_state.total_uptime_seconds = total_uptime_seconds
-                dashboard_state.connection_start_time = connection_start_time
-                dashboard_state.last_data_receipt_time = last_data_receipt['time']
-
-                # Always update live tracker and completed trades on dashboard
-                dashboard_state.live_tracker = live_tracker[-200:]
-                dashboard_state.bar_log = bar_log[-20:]
-                dashboard_state.completed_trades = list(completed_trades[-1000:])
-
-                _chart_tf = dashboard_timeframe_minutes(dashboard_state.params)
-                dashboard_state.chart_payload = build_chart_payload_from_df(
-                    data_ref['data'], max_bars=480, timeframe_mins=_chart_tf,
-                    completed_trades=completed_trades, params=dashboard_state.params
-                )
-                if dashboard_state.chart_payload:
-                    tp_sl_series = _active_trade_stop_tp_series(positions, args.output_dir)
-                    if tp_sl_series:
-                        dashboard_state.chart_payload['active_trade_lines'] = tp_sl_series
-                dashboard_state.trade_overlay = _trade_overlay_from_open_brackets(positions)
-                ensure_completed_trade_reports(completed_trades, strategy, data_ref['data'])
-                maybe_persist_completed_trades(COMPLETED_TRADES_PATH, completed_trades)
-
                 dash_path = os.path.join(WEB_DIR, args.dashboard)
                 status_path = os.path.join(WEB_DIR, f"{args.mode.lower()}_status.js")
-                update_dashboard(dashboard_state, dash_path, status_path)
+                # Refresh HTML + status.js first so embedded `last-update` advances even if IB
+                # calls below stall; avoids a silent disk freeze when the gateway wedges.
+                dashboard_state.is_connected = connected
+                dashboard_state.bar_log = bar_log[-20:]
+                await _write_dashboard_files_async(
+                    dashboard_state, dash_path, status_path, "pre-IB heartbeat"
+                )
 
-            # Security guard checks (only if connected)
-            if guard and ib.isConnected():
-                guard.check_connection(ib, positions)
-                if contract:
-                    guard.check_orphaned_orders(ib, contract, positions)
+                if connected:
+                    # IB is often flaky for a few seconds right after reconnect; any exception
+                    # here used to skip the second update_dashboard with fresh fields.
+                    try:
+                        # Latest print for PnL + chart (before account summary uses data_ref)
+                        if data_ref['data'] is not None and not data_ref['data'].empty:
+                            dashboard_state.current_price = float(data_ref['data']['close'].iloc[-1])
+                        else:
+                            dashboard_state.current_price = 0.0
+
+                        dashboard_state.account_info = get_account_summary(
+                            ib, data=data_ref['data'], contract=contract,
+                            portfolio_realized_pnl=portfolio_realized_pnl
+                        )
+
+                        if guard and contract:
+                            try:
+                                flattened = guard.check_daily_pnl(
+                                    ib, contract, dashboard_state.account_info, positions
+                                )
+                                if flattened:
+                                    add_to_live_tracker(
+                                        live_tracker, 'ERROR',
+                                        "EMERGENCY FLATTEN - Limits Breached",
+                                    )
+                            except Exception as e:
+                                logging.error("check_daily_pnl failed: %s", e, exc_info=True)
+
+                        cp = dashboard_state.current_price
+                        # Isolate risky bits so one failure does not skip chart / completed-trades refresh.
+                        if contract and positions:
+                            try:
+                                prune_dead_brackets(ib, contract, positions, live_tracker)
+                            except Exception as e:
+                                logging.warning(
+                                    "Dashboard prune_dead_brackets skipped: %s", e, exc_info=True
+                                )
+
+                        pos_data = []
+                        try:
+                            for p in ib.portfolio():
+                                if not contract or p.contract.symbol == contract.symbol:
+                                    pos_data.append(_portfolio_row_for_dashboard(p, cp))
+                        except Exception as e:
+                            logging.warning("ib.portfolio() snapshot failed for dashboard: %s", e)
+
+                        try:
+                            dashboard_state.positions = _merge_positions_for_dashboard(
+                                ib, contract, positions, pos_data, cp,
+                            )
+                        except Exception as e:
+                            logging.warning("merge dashboard positions failed: %s", e)
+                            dashboard_state.positions = pos_data
+
+                        try:
+                            dashboard_state.active_orders = collect_all_ib_open_orders(ib)
+                        except Exception as e:
+                            logging.warning("collect_all_ib_open_orders failed: %s", e)
+                        await asyncio.sleep(0.06)
+
+                        # Update state common fields
+                        dashboard_state.is_connected = ib.isConnected()
+                        dashboard_state.total_uptime_seconds = total_uptime_seconds
+                        dashboard_state.connection_start_time = connection_start_time
+                        dashboard_state.last_data_receipt_time = last_data_receipt['time']
+
+                        # Always update live tracker and completed trades on dashboard
+                        dashboard_state.live_tracker = live_tracker[-200:]
+                        dashboard_state.bar_log = bar_log[-20:]
+                        dashboard_state.completed_trades = list(completed_trades[-1000:])
+
+                        _chart_tf = dashboard_timeframe_minutes(dashboard_state.params)
+                        try:
+                            dashboard_state.chart_payload = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    build_chart_payload_from_df,
+                                    data_ref['data'],
+                                    480,
+                                    _chart_tf,
+                                    completed_trades,
+                                    dashboard_state.params,
+                                ),
+                                timeout=45.0,
+                            )
+                        except (asyncio.TimeoutError, Exception) as e:
+                            logging.warning(
+                                "Chart payload build skipped (%s): %s",
+                                type(e).__name__,
+                                e,
+                            )
+                            dashboard_state.chart_payload = None
+                        if dashboard_state.chart_payload:
+                            tp_sl_series = _active_trade_stop_tp_series(positions, args.output_dir)
+                            if tp_sl_series:
+                                dashboard_state.chart_payload['active_trade_lines'] = tp_sl_series
+                        dashboard_state.trade_overlay = _trade_overlay_from_open_brackets(positions)
+                    except Exception as e:
+                        logging.error(
+                            "Dashboard state refresh failed after connect/reconnect (writing last-good snapshot): %s",
+                            e,
+                            exc_info=True,
+                        )
+
+                    await _write_dashboard_files_async(
+                        dashboard_state, dash_path, status_path, "post-IB refresh"
+                    )
+
+                    try:
+                        maybe_persist_completed_trades(COMPLETED_TRADES_PATH, completed_trades)
+                    except Exception as e:
+                        logging.error("completed_trades persist failed: %s", e, exc_info=True)
+
+                    now_mono = time_module.monotonic()
+                    if now_mono - _last_trade_report_sweep_mono >= TRADE_REPORT_SWEEP_INTERVAL_SEC:
+                        _last_trade_report_sweep_mono = now_mono
+                        if _trade_report_sweep_task is None or _trade_report_sweep_task.done():
+
+                            def _sweep_trade_reports_blocking():
+                                try:
+                                    ensure_completed_trade_reports(
+                                        completed_trades, strategy, data_ref['data']
+                                    )
+                                    maybe_persist_completed_trades(
+                                        COMPLETED_TRADES_PATH, completed_trades
+                                    )
+                                except Exception as ex:
+                                    logging.error(
+                                        "Trade report sweep failed: %s", ex, exc_info=True
+                                    )
+
+                            _trade_report_sweep_task = asyncio.create_task(
+                                asyncio.to_thread(_sweep_trade_reports_blocking)
+                            )
+                        else:
+                            logging.debug(
+                                "Trade-report sweep skipped (previous background sweep still running)"
+                            )
+
+            now_g = time_module.monotonic()
+            if guard and connected and (now_g - _LAST_GUARD_UI_MONO >= _GUARD_UI_MIN_SEC):
+                _LAST_GUARD_UI_MONO = now_g
+                try:
+                    guard.check_connection(ib, positions)
+                    if contract:
+                        guard.check_orphaned_orders(ib, contract, positions)
+                except Exception as e:
+                    logging.error("Security guard UI check failed: %s", e, exc_info=True)
 
         except Exception as e:
-            logging.error(f"UI update / Guard check failed: {e}")
-
-        await asyncio.sleep(1)
+            logging.error("UI update / Guard check failed: %s", e, exc_info=True)
+        finally:
+            try:
+                await asyncio.sleep(1 if ib.isConnected() else 5)
+            except asyncio.CancelledError:
+                raise
 
 
 def ensure_connected_and_subscribed():
@@ -1051,6 +1350,26 @@ async def main():
 
         # Initialize Security Guard
         guard = SecurityGuard(params_dict)
+        dashboard_state.security_guard = guard
+
+        bar_pipeline_q = asyncio.Queue(maxsize=512)
+        configure_bar_pipeline(
+            bar_pipeline_q,
+            {
+                "strategy": strategy,
+                "ib": ib,
+                "contract": contract,
+                "data_ref": data_ref,
+                "positions": positions,
+                "completed_trades": completed_trades,
+                "live_tracker": live_tracker,
+                "bar_log": bar_log,
+                "dashboard_state": dashboard_state,
+                "send_email_fn": custom_send_email,
+                "output_dir": args.output_dir,
+            },
+        )
+        asyncio.create_task(bar_pipeline_consumer())
 
         # Subscribe to account updates
         ib.reqAccountSummary()
@@ -1059,17 +1378,18 @@ async def main():
             if dashboard_state:
                 try:
                     v = val.value
+                    # Do NOT merge RealizedPNL / UnrealizedPNL here: accountSummaryEvent fires **per tag**,
+                    # so mixing one fresh tag with stale others makes total_pnl nonsense and false flatten.
+                    # Those fields come from `get_account_summary()` in `update_ui_periodically` instead.
                     if val.tag in ['NetLiquidation', 'TotalCashValue', 'BuyingPower',
-                                   'EquityWithLoanValue', 'RealizedPNL', 'UnrealizedPNL']:
-                        try: v = float(v)
-                        except: pass
-                    dashboard_state.account_info[val.tag] = v
-
-                    if guard and contract and ib.isConnected():
-                        flattened = guard.check_daily_pnl(ib, contract, dashboard_state.account_info, positions)
-                        if flattened:
-                            add_to_live_tracker(live_tracker, 'ERROR', "EMERGENCY FLATTEN - Limits Breached")
-                except: pass
+                                   'EquityWithLoanValue']:
+                        try:
+                            v = float(v)
+                        except Exception:
+                            pass
+                        dashboard_state.account_info[val.tag] = v
+                except Exception:
+                    pass
 
         ib.accountSummaryEvent += on_account_summary
 
@@ -1107,7 +1427,9 @@ async def main():
         dash_path = os.path.join(WEB_DIR, args.dashboard)
         status_path = os.path.join(WEB_DIR, f"{args.mode.lower()}_status.js")
         if dashboard_state:
-            update_dashboard(dashboard_state, dash_path, status_path)
+            await _write_dashboard_files_async(
+                dashboard_state, dash_path, status_path, "startup"
+            )
         add_to_live_tracker(live_tracker, 'info', 'Dashboard initialized')
 
         # Open dashboard in browser
@@ -1165,7 +1487,9 @@ async def main():
                         dashboard_state.last_data_receipt_time = last_data_receipt['time']
                         dash_path = os.path.join(WEB_DIR, args.dashboard)
                         status_path = os.path.join(WEB_DIR, f"{args.mode.lower()}_status.js")
-                        update_dashboard(dashboard_state, dash_path, status_path)
+                        await _write_dashboard_files_async(
+                            dashboard_state, dash_path, status_path, "post-reconnect"
+                        )
                         add_to_live_tracker(live_tracker, 'info', 'Dashboard refreshed after reconnection')
 
                 # 15-Min Heartbeat Status (Enhanced with Charts)
