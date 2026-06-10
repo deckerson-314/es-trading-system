@@ -47,6 +47,19 @@ def group_params_for_display(params_dict_local):
         
     return grouped
 
+
+def _param_display_value(param):
+    """Return scalar value from a strategy param (dict or raw)."""
+    if isinstance(param, dict):
+        return param.get('value', param)
+    return param
+
+
+def _is_internal_param_key(key):
+    key_str = str(key)
+    return key_str.startswith('__') or key_str.startswith('===') or key_str == 'verbose'
+
+
 def calculate_stats(trades_df, equity_series=None):
     """Calculate standard performance metrics."""
     if trades_df.empty:
@@ -267,6 +280,9 @@ def generate_dashboard(solutions_data, output_dir=None, version='5.0', open_brow
             .trade-list {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; margin-top: 15px; }}
             .trade-card {{ border: 1px solid #e9ecef; padding: 15px; border-radius: 8px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
             .btn {{ display: inline-block; padding: 6px 12px; background: #3498db; color: white; text-decoration: none; border-radius: 4px; font-size: 11px; margin-top: 10px; }}
+            .highlight {{ background-color: #fff3cd; font-weight: bold; }}
+            .params-source {{ color: #555; font-size: 13px; margin: 0 0 15px; }}
+            h3.param-group {{ color: #5d6d7e; font-size: 15px; margin: 20px 0 8px; }}
         </style>
     </head>
     <body>
@@ -318,6 +334,48 @@ def generate_dashboard(solutions_data, output_dir=None, version='5.0', open_brow
             html_content += f"<td {style}>{fmt}</td>"
         html_content += "</tr>"
     html_content += "</table>"
+
+    # 3b. Run Parameters
+    html_content += "<h2>Run Parameters</h2>"
+    sources = [s.get('params_source') for s in solutions_data if s.get('params_source')]
+    if sources:
+        unique_sources = list(dict.fromkeys(sources))
+        source_html = "<br>".join(unique_sources)
+        html_content += f'<p class="params-source"><strong>Source:</strong> {source_html}</p>'
+
+    if not any(sol.get('params') for sol in solutions_data):
+        html_content += "<p>No parameters found.</p>"
+    elif is_multi:
+        all_keys = set()
+        for sol in solutions_data:
+            all_keys.update(sol.get('params', {}).keys())
+        sorted_keys = sorted(k for k in all_keys if not _is_internal_param_key(k))
+        if sorted_keys:
+            html_content += "<table><tr><th>Parameter</th>" + "".join(f"<th>{s['name']}</th>" for s in solutions_data) + "</tr>"
+            for k in sorted_keys:
+                vals = [_param_display_value(s.get('params', {}).get(k)) for s in solutions_data]
+                unique_vals = {str(v) for v in vals}
+                row_cls = 'highlight' if len(unique_vals) > 1 else ''
+                html_content += f"<tr class='{row_cls}'><td>{k}</td>"
+                for val in vals:
+                    html_content += f"<td>{val}</td>"
+                html_content += "</tr>"
+            html_content += "</table>"
+        else:
+            html_content += "<p>No parameters found.</p>"
+    else:
+        grouped = group_params_for_display(solutions_data[0].get('params', {}))
+        for group_name, group_params in grouped.items():
+            if not group_params:
+                continue
+            html_content += f"<h3 class='param-group'>{group_name}</h3>"
+            html_content += "<table><tr><th>Parameter</th><th>Value</th></tr>"
+            for k in sorted(group_params.keys()):
+                if _is_internal_param_key(k):
+                    continue
+                val = _param_display_value(group_params[k])
+                html_content += f"<tr><td>{k}</td><td>{val}</td></tr>"
+            html_content += "</table>"
 
     # 4. Equity Curve Comparison
     fig_eq = go.Figure()

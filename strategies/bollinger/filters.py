@@ -326,7 +326,57 @@ def apply_maintenance_filter(df, enable_maintenance_filter,
     
     return df
 
-    return df
+
+def is_in_maintenance_window_now(
+    enable_maintenance_filter,
+    daily_start_str,
+    daily_end_str,
+    weekend_start_day,
+    weekend_start_time_str,
+    weekend_end_day,
+    weekend_end_time_str,
+    buffer_minutes=5,
+    now=None,
+):
+    """True when ``now`` is in the entry-blocked maintenance window (``in_maintenance``)."""
+    if not enable_maintenance_filter:
+        return False
+    if now is None:
+        ts = pd.Timestamp.now(tz='US/Eastern')
+    else:
+        ts = pd.Timestamp(now)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize('US/Eastern')
+        else:
+            ts = ts.tz_convert('US/Eastern')
+    one = pd.DataFrame(index=pd.DatetimeIndex([ts]))
+    one = apply_maintenance_filter(
+        one,
+        enable_maintenance_filter,
+        daily_start_str,
+        daily_end_str,
+        weekend_start_day,
+        weekend_start_time_str,
+        weekend_end_day,
+        weekend_end_time_str,
+        buffer_minutes,
+    )
+    return bool(one['in_maintenance'].iloc[0])
+
+
+def is_strategy_in_maintenance_window(strategy, now=None):
+    """Convenience wrapper using a loaded strategy's maintenance parameters."""
+    return is_in_maintenance_window_now(
+        getattr(strategy, 'enable_maintenance_filter', False),
+        getattr(strategy, 'daily_maintenance_start_str', '16:00'),
+        getattr(strategy, 'daily_maintenance_end_str', '16:30'),
+        getattr(strategy, 'weekend_maintenance_start_day', 4),
+        getattr(strategy, 'weekend_maintenance_start_time_str', '17:00'),
+        getattr(strategy, 'weekend_maintenance_end_day', 6),
+        getattr(strategy, 'weekend_maintenance_end_time_str', '18:00'),
+        int(getattr(strategy, 'maintenance_buffer_minutes', 5)),
+        now=now,
+    )
 
 
 def apply_rsi_filter(df, enable_rsi_filter, rsi_period=14, rsi_overbought=70, rsi_oversold=30):

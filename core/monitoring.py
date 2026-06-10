@@ -28,6 +28,29 @@ def configure_bar_pipeline(queue: asyncio.Queue, ctx: Dict[str, Any]) -> None:
     BAR_PIPELINE_CTX = ctx
 
 
+def seed_data_ref_from_bars(bars_obj, data_ref: Dict[str, Any], max_bars: int = 15000) -> bool:
+    """Populate data_ref immediately after IB historical subscribe (before async bar pipeline runs)."""
+    if bars_obj is None or len(bars_obj) == 0:
+        return False
+    try:
+        snap = [
+            (b.date, b.open, b.high, b.low, b.close, b.volume)
+            for b in list(bars_obj)[-int(max_bars):]
+        ]
+        df = pd.DataFrame(
+            snap, columns=["datetime", "open", "high", "low", "close", "volume"]
+        )
+        if df.empty:
+            return False
+        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_convert("US/Eastern")
+        df.set_index("datetime", inplace=True)
+        data_ref["data"] = df[["open", "high", "low", "close", "volume"]].copy()
+        return True
+    except Exception as e:
+        logging.warning("seed_data_ref_from_bars failed: %s", e)
+        return False
+
+
 async def _async_process_bar_snapshot(
     snap: List[Tuple[Any, float, float, float, float, float]],
     has_new: bool,
@@ -154,10 +177,12 @@ async def _async_process_bar_snapshot(
 
         await asyncio.sleep(0)
         if len(data) >= min_bars and _indicators_ready(data):
+            # Phase 1: monitor-only on 1-min ticks (fills, RTH, PreSubmitted); no trail ratchet.
             check_exits(
                 strategy, ib, contract, data, positions, completed_trades,
                 live_tracker, send_email_fn, data.index[-1], data.iloc[-1],
-                allow_strategy_exit=False
+                allow_strategy_exit=False,
+                skip_trailing=True,
             )
 
     except Exception as e:
@@ -280,10 +305,12 @@ def _sync_on_bar_update_legacy(
                 bar_log[-1]["entry_criteria"] = entry_criteria
 
         if len(data) >= min_bars and _indicators_ready(data):
+            # Phase 1: monitor-only on 1-min ticks (fills, RTH, PreSubmitted); no trail ratchet.
             check_exits(
                 strategy, ib, contract, data, positions, completed_trades,
                 live_tracker, send_email_fn, data.index[-1], data.iloc[-1],
-                allow_strategy_exit=False
+                allow_strategy_exit=False,
+                skip_trailing=True,
             )
 
     except Exception as e:

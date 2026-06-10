@@ -13,6 +13,9 @@ import threading
 import time
 from pathlib import Path
 
+DASHBOARD_DEBUG = os.environ.get('DASHBOARD_DEBUG', '').strip().lower() in ('1', 'true', 'yes', 'on')
+SLOW_REQUEST_SEC = float(os.environ.get('DASHBOARD_HTTP_SLOW_SEC', '1.5'))
+
 # Configuration
 PORT = 8000
 # Startup from /tools/dashboard/server.py -> Root is up 2 levels
@@ -24,6 +27,29 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
+
+    def do_GET(self):
+        t0 = time.perf_counter()
+        try:
+            super().do_GET()
+        finally:
+            dt = time.perf_counter() - t0
+            if dt >= SLOW_REQUEST_SEC or DASHBOARD_DEBUG:
+                size_hint = ''
+                try:
+                    rel = self.path.split('?', 1)[0].lstrip('/')
+                    fp = WEB_DIR / rel
+                    if fp.is_file():
+                        size_hint = f' size={fp.stat().st_size}'
+                except OSError:
+                    pass
+                if dt >= SLOW_REQUEST_SEC:
+                    print(
+                        f"[SLOW HTTP {dt:.2f}s] {self.command} {self.path}{size_hint}",
+                        flush=True,
+                    )
+                elif DASHBOARD_DEBUG:
+                    print(f"[HTTP {dt:.3f}s] {self.path}{size_hint}", flush=True)
     
     def end_headers(self):
         # Explicitly set charset for HTML and JSON to ensure Unicode displays correctly
@@ -359,8 +385,18 @@ def main():
 </body>
 </html>""")
     
-    # Start HTTP server
-    with socketserver.TCPServer(("", PORT), CustomHTTPRequestHandler) as httpd:
+    # Start HTTP server (threaded when debugging — single-threaded server blocks on large HTML reads)
+    handler = CustomHTTPRequestHandler
+    if DASHBOARD_DEBUG:
+        class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            daemon_threads = True
+
+        server_cls = ThreadedHTTPServer
+        print("DASHBOARD_DEBUG=1: threaded HTTP server + per-request timing enabled")
+    else:
+        server_cls = socketserver.TCPServer
+
+    with server_cls(("", PORT), handler) as httpd:
         print("="*60)
         print("Trading Strategy Web Server")
         print("="*60)

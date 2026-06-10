@@ -1,7 +1,7 @@
 # Execution & Trailing Stop Design
 
-**Status:** Draft (reviewed 2026-05-18)  
-**Last updated:** 2026-05-18  
+**Status:** Phase 1–2 implemented in `core/execution.py` (2026-05-19); Phase 3 partial (trail OCA retries, slippage reporting, dashboard `live_exit_type`, 2026-05-20)  
+**Last updated:** 2026-05-19  
 **Scope:** Trend strategy live paper/live execution vs backtest/GA parity — **all exit types**  
 **Decision:** Backtest **keeps** bar OHLC exit logic; live moves to broker-authoritative protective exits (stop/TP) with bar-aligned trailing, and signal exits only where the strategy has no broker leg.
 

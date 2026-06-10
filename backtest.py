@@ -108,7 +108,7 @@ def load_ga_params(ga_file, solution_idx):
         print(f"Error parsing GA params: {e}")
         raise
 
-def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, start_date=None, end_date=None, dashboard_path=None):
+def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, start_date=None, end_date=None, dashboard_path=None, params_source=None):
     """
     Run backtest using StrategyFactory.
     """
@@ -299,6 +299,7 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
                          'name': strategy_name.capitalize(),
                          'stats': calculate_stats(result_package['trades_df'], result_package.get('equity_curve')),
                          'params': params_dict,
+                         'params_source': params_source,
                          'trades_df': result_package['trades_df'],
                          'equity_curve': result_package.get('equity_curve', pd.Series(dtype=float)),
                          'df': result_package.get('df'),
@@ -357,6 +358,7 @@ def main():
     
     # 1. Parameter Loading Logic
     params_dict = {}
+    params_source = None
     
     # 1a. Handle GA File (Explicit or implicit via --params + --solutions)
     ga_file = args.ga_file
@@ -398,6 +400,7 @@ def main():
                     solutions_data.append({
                         'name': f"Sol {idx}",
                         'params': p,
+                        'params_source': f"{ga_file} (solution {idx})",
                         'trades_df': res['trades_df'],
                         'equity_curve': res['equity_curve'],
                         'df': res['df'],
@@ -465,10 +468,12 @@ def main():
             # Single Solution from GA
             print(f"Loading Solution 0 from {ga_file}...")
             params_dict, _ = load_ga_params(ga_file, 0) # Default to 0
+            params_source = f"{ga_file} (solution 0)"
             
     elif args.params:
         print(f"Loading parameters from {args.params}...")
         params_dict = load_params(args.params)
+        params_source = args.params
         if not params_dict:
              print("Warning: Loaded empty parameters. Is the CSV format correct? (Name, Value, Type)")
         else:
@@ -480,6 +485,7 @@ def main():
         if os.path.exists(default_params):
              print(f"Using default parameters: {default_params}")
              params_dict = load_params(default_params)
+             params_source = default_params
         else:
              print(f"Warning: No parameters provided and default not found at {default_params}. Using internal strategy defaults.")
     
@@ -487,7 +493,7 @@ def main():
     if args.verbose:
         params_dict['verbose'] = True
         
-    run_backtest(args.strategy, args.data, params_dict, start_date=args.start, end_date=args.end, dashboard_path=args.dashboard)
+    run_backtest(args.strategy, args.data, params_dict, start_date=args.start, end_date=args.end, dashboard_path=args.dashboard, params_source=params_source)
 
 if __name__ == '__main__':
     main()

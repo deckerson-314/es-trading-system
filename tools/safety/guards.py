@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Tuple
 from ib_insync import IB, MarketOrder, Order, Trade
 
-from core.protection import cancel_residual_orders_when_flat_on_contract
+from core.protection import cancel_residual_orders_when_flat_on_contract, bracket_guard_blocks_flat_cleanup
 
 # Exact CSV `Name` values only — substring matching previously picked up unrelated GA rows
 # (e.g. names containing "daily target") and wrong $ limits.
@@ -264,7 +264,10 @@ class SecurityGuard:
                         except Exception as e:
                             logging.warning(f"Error cancelling orphaned order {order.permId}: {e}")
 
-            cancel_residual_orders_when_flat_on_contract(ib, contract, None)
+            if not bracket_guard_blocks_flat_cleanup(tracked_positions, contract):
+                cancel_residual_orders_when_flat_on_contract(
+                    ib, contract, None, positions=tracked_positions,
+                )
 
         except Exception as e:
             logging.error(f"Error in check_orphaned_orders: {e}")

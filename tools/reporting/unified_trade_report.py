@@ -232,11 +232,15 @@ def generate_unified_trade_report(
     pnl = float(pnl or 0)
 
     reason = str(_trade_get(trade, "reason", "N/A"))
+    live_exit_type = str(_trade_get(trade, "live_exit_type", "") or "")
     duration = str(_trade_get(trade, "duration", "N/A") or "N/A")
     stop_open = _trade_get(trade, "stop_at_open", _trade_get(trade, "stop", None))
     tp_open = _trade_get(trade, "tp_at_open", _trade_get(trade, "tp", None))
     stop_close = _trade_get(trade, "stop_at_close", None)
     tp_close = _trade_get(trade, "tp_at_close", None)
+    slip_pts = _trade_get(trade, "slippage_pts", None)
+    slip_usd = _trade_get(trade, "slippage_usd", None)
+    slip_ref = _trade_get(trade, "slippage_reference", None)
 
     if params_snapshot is None:
         params_snapshot = _trade_get(trade, "params_snapshot", {}) or {}
@@ -442,7 +446,8 @@ def generate_unified_trade_report(
         )
 
     sol_prefix = f"[{sol_name}] " if sol_name else ""
-    title = f"{sol_prefix}{direction_label} | PnL ${pnl:,.2f} | {reason}"
+    exit_label = live_exit_type or reason
+    title = f"{sol_prefix}{direction_label} | PnL ${pnl:,.2f} | {exit_label}"
     fig.update_layout(title=title, height=980, hovermode="x unified", template="plotly_white")
     plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
 
@@ -456,10 +461,14 @@ def generate_unified_trade_report(
         "Qty": f"{qty:g}",
         "Duration": duration,
         "Reason": reason,
+        "Live Exit Type": live_exit_type or "N/A",
         "Stop @ Open": "N/A" if stop_open is None else f"{float(stop_open):,.2f}",
         "TP @ Open": "N/A" if tp_open is None else f"{float(tp_open):,.2f}",
         "Stop @ Close": "N/A" if stop_close is None else f"{float(stop_close):,.2f}",
         "TP @ Close": "N/A" if tp_close is None else f"{float(tp_close):,.2f}",
+        "Slippage (pts)": "N/A" if slip_pts is None else f"{float(slip_pts):+,.2f}",
+        "Slippage ($)": "N/A" if slip_usd is None else f"{float(slip_usd):+,.2f}",
+        "Slippage Ref": str(slip_ref) if slip_ref else "N/A",
     }
     trade_rows = "".join(
         f"<tr><td>{html.escape(k)}</td><td>{html.escape(v)}</td></tr>" for k, v in trade_table.items()

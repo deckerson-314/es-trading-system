@@ -16,7 +16,13 @@ from ib_insync import MarketOrder, StopOrder, LimitOrder
 import pytz
 
 from core.account import get_account_summary, format_duration, add_to_live_tracker
-from core.protection import cancel_residual_orders_when_flat_on_contract
+from core.protection import (
+    cancel_residual_orders_when_flat_on_contract,
+    ensure_bracket_protective_stop,
+    ensure_bracket_stop_armed,
+    replace_oca_exit_pair_zero_gap,
+    stop_order_is_armed,
+)
 
 
 def _finite_stop_scalar(x):
@@ -139,6 +145,62 @@ def _wait_oca_pair_cancelled(ib, perm_stop: int, perm_tp: int, timeout: float = 
     return "timeout"
 
 
+def _wait_oca_pair_cancelled_with_retries(
+    ib, perm_stop: int, perm_tp: int, timeout: float = 5.0, max_attempts: int = 3,
+) -> str:
+    """Retry cancel-wait when IB is slow to acknowledge OCA leg cancellation."""
+    last = "timeout"
+    for attempt in range(1, max_attempts + 1):
+        last = _wait_oca_pair_cancelled(ib, perm_stop, perm_tp, timeout=timeout)
+        if last in ("cancelled", "filled"):
+            return last
+        if attempt < max_attempts:
+            logging.warning(
+                "OCA cancel wait attempt %s/%s outcome=%s; retrying",
+                attempt, max_attempts, last,
+            )
+            ib.sleep(0.35)
+    return last
+
+
+def _exit_slippage_metrics(
+    dir_: int,
+    exit_price: float,
+    working_stop: Optional[float],
+    working_tp: Optional[float],
+    reason: str,
+    qty: float = 1.0,
+) -> dict:
+    """
+    Compare fill vs last known broker protective level (§9.3 reporting).
+    Positive slippage_pts = better than reference for the position direction.
+    """
+    out = {
+        "slippage_pts": None,
+        "slippage_usd": None,
+        "slippage_reference": None,
+        "model_stop_at_exit": working_stop,
+    }
+    if exit_price <= 0:
+        return out
+    ref = None
+    rlow = str(reason or "").lower()
+    if working_stop and ("stop" in rlow or "broker stop" in rlow or "software" in rlow):
+        ref = float(working_stop)
+        out["slippage_reference"] = (
+            "broker_stop" if "broker stop" in rlow else "model_stop"
+        )
+    elif working_tp and ("profit" in rlow or "broker take" in rlow):
+        ref = float(working_tp)
+        out["slippage_reference"] = "broker_tp"
+    if ref is None:
+        return out
+    slip_pts = (exit_price - ref) * int(dir_)
+    out["slippage_pts"] = round(slip_pts, 2)
+    out["slippage_usd"] = round(slip_pts * 50.0 * float(qty or 1), 2)
+    return out
+
+
 def _broker_stop_trigger_price(stop_order):
     """
     Stop trigger level as IB reports on the order object (auxPrice / stopPrice).
@@ -182,6 +244,315 @@ def _effective_bracket_stop(stop_order, bracket, direction: int):
     if direction == -1:
         return min(candidates)
     return candidates[0]
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+  """Read LIVE_* rollback flags from the environment."""
+  raw = os.environ.get(name)
+  if raw is None or str(raw).strip() == "":
+    return default
+  return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def broker_authoritative_exits_enabled() -> bool:
+  """Phase 2: defer SL/TP to broker legs when active (see execution design §6)."""
+  return _env_bool("LIVE_BROKER_AUTHORITATIVE_EXIT", True)
+
+
+def strategy_bar_trailing_only() -> bool:
+  """Phase 1: trail only on strategy bars unless explicitly disabled."""
+  return _env_bool("LIVE_TRAIL_STRATEGY_BAR_ONLY", True)
+
+
+def _protective_order_active(trade) -> bool:
+  if not trade:
+    return False
+  if trade.isActive():
+    return True
+  st = getattr(trade.orderStatus, "status", "") if trade.orderStatus else ""
+  return st in ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending")
+
+
+def _live_exit_type(reason: str) -> str:
+  """Map completed-trade reason strings to reporting vocabulary (§6.6)."""
+  if not reason:
+    return "unknown"
+  r = str(reason)
+  if r in ("Broker Stop", "Broker Take Profit", "Channel Exit (signal)",
+           "Software Stop (backup)", "Maintenance Exit", "RTH Exit"):
+    return r.lower().replace(" ", "_").replace("(", "").replace(")", "")
+  if r.startswith("Strategy Exit ("):
+    inner = r[len("Strategy Exit (") : -1]
+    if inner == "Stop Loss":
+      return "software_stop"
+    if inner == "Take Profit":
+      return "software_tp"
+    if "Channel" in inner:
+      return "channel_signal"
+    return "strategy_signal"
+  if r == "Stop Loss":
+    return "broker_stop"
+  if r == "Take Profit":
+    return "broker_tp"
+  if "Manual Close" in r or "PreSubmitted" in r:
+    return "software_backup"
+  if r.startswith("Maintenance"):
+    return "maintenance"
+  if r.startswith("RTH"):
+    return "rth"
+  return "other"
+
+
+def _canonical_broker_fill_reason(reason: str) -> str:
+  if reason == "Stop Loss":
+    return "Broker Stop"
+  if reason == "Take Profit":
+    return "Broker Take Profit"
+  return reason
+
+
+def _model_stop_breached(dir_: int, price: float, stop_level: float) -> bool:
+  if stop_level <= 0:
+    return False
+  return (price <= stop_level) if dir_ == 1 else (price >= stop_level)
+
+
+def _eval_row_for_exit(bracket, latest_row):
+  """Clamp entry-bar OHLC to close so historical wicks do not instant-stop."""
+  entry_time = bracket.get("entry_time")
+  bar_time = latest_row.name if hasattr(latest_row, "name") else None
+  eval_row = latest_row
+  if entry_time and bar_time:
+    bar_ts = _align_ts_naive_et(bar_time)
+    ent_ts = _align_ts_naive_et(entry_time)
+    if bar_ts is not None and ent_ts is not None:
+      ent_cmp = ent_ts.replace(second=0, microsecond=0) if hasattr(ent_ts, "replace") else ent_ts
+      if bar_ts <= ent_cmp:
+        if isinstance(latest_row, pd.Series):
+          eval_row = latest_row.copy()
+          eval_row["high"] = eval_row["low"] = eval_row["close"]
+        elif isinstance(latest_row, dict):
+          eval_row = latest_row.copy()
+          eval_row["high"] = eval_row["low"] = eval_row["close"]
+  return eval_row
+
+
+def _handle_protective_backup(
+    ib,
+    bracket_contract,
+    bracket,
+    positions,
+    completed_trades,
+    live_tracker,
+    send_email_fn,
+    entry_trade,
+    latest_row,
+    data,
+    strategy,
+    stop_trade,
+    dir_,
+    stop_should_trigger: bool,
+    stop_price_for_breach: float,
+) -> bool:
+  """
+  Backup flatten when model stop is breached but the broker leg cannot protect.
+  Returns True if a close was initiated.
+  """
+  if not stop_should_trigger:
+    return False
+
+  stop_armed = stop_order_is_armed(stop_trade)
+  stop_status = stop_trade.orderStatus.status if stop_trade and stop_trade.orderStatus else None
+  why_held = getattr(stop_trade.orderStatus, "whyHeld", "") if stop_trade and stop_trade.orderStatus else ""
+
+  if broker_authoritative_exits_enabled():
+    breach_px = latest_row.get("low") if dir_ == 1 else latest_row.get("high")
+    if breach_px is None:
+      breach_px = latest_row["close"]
+    if stop_armed:
+      logging.warning(
+        "Software Stop (backup): price %.2f breached stop %.2f; armed leg still open "
+        "(status=%s); forcing market close",
+        breach_px,
+        stop_price_for_breach,
+        stop_status,
+      )
+    else:
+      logging.warning(
+        "Software Stop (backup): price %.2f breached stop %.2f; stop not armed "
+        "(%s / %s); forcing market close",
+        breach_px,
+        stop_price_for_breach,
+        stop_status or "missing",
+        why_held or "no whyHeld",
+      )
+    _force_close_position(
+      ib, bracket_contract, bracket, positions, completed_trades,
+      live_tracker, send_email_fn, entry_trade, latest_row["close"],
+      "Software Stop (backup)", data=data, strategy=strategy,
+    )
+    return True
+
+  # Legacy: PreSubmitted-only manual path
+  if stop_status == "PreSubmitted" and "trigger" in str(why_held).lower():
+    logging.warning(
+      "CRITICAL: Stop %.2f breached, order PreSubmitted. Manual close.",
+      stop_price_for_breach,
+    )
+    _force_close_position(
+      ib, bracket_contract, bracket, positions, completed_trades,
+      live_tracker, send_email_fn, entry_trade, latest_row["close"],
+      "Manual Close (PreSubmitted Stop)", data=data, strategy=strategy,
+    )
+    return True
+  return False
+
+
+def _exit_channel_signal(
+    ib,
+    bracket_contract,
+    bracket,
+    positions,
+    completed_trades,
+    live_tracker,
+    send_email_fn,
+    entry_trade,
+    exit_price_hint,
+    data,
+    strategy,
+    dir_,
+):
+  """Channel / signal exit: cancel bracket legs, prefer limit at hint, else market."""
+  stop_order = bracket.get("stopLoss")
+  tp_order = bracket.get("takeProfit")
+  for order in (stop_order, tp_order):
+    if order:
+      try:
+        ib.cancelOrder(order)
+      except Exception:
+        pass
+  ib.sleep(0.15)
+
+  qty = 1.0
+  if stop_order and hasattr(stop_order, "totalQuantity"):
+    qty = abs(float(stop_order.totalQuantity or 1))
+  close_action = "SELL" if dir_ == 1 else "BUY"
+  hint = _quantize_es_tick(exit_price_hint) if exit_price_hint is not None else None
+  used_limit = False
+  if hint is not None and hint > 0:
+    try:
+      lmt = LimitOrder(action=close_action, totalQuantity=qty, lmtPrice=hint, tif="DAY", transmit=True)
+      ib.placeOrder(bracket_contract, lmt)
+      ib.sleep(1.5)
+      es_pos = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
+      if not es_pos or es_pos[0].position == 0:
+        used_limit = True
+    except Exception as e:
+      logging.warning("Channel limit @ %.2f failed (%s); falling back to market", hint, e)
+
+  if not used_limit:
+    _force_close_position(
+      ib, bracket_contract, bracket, positions, completed_trades,
+      live_tracker, send_email_fn, entry_trade, hint or 0.0,
+      "Channel Exit (signal)", data=data, strategy=strategy,
+    )
+
+
+def _handle_strategy_signal_exit(
+    ib,
+    bracket_contract,
+    bracket,
+    positions,
+    completed_trades,
+    live_tracker,
+    send_email_fn,
+    entry_trade,
+    latest_row,
+    data,
+    strategy,
+    stop_trade,
+    tp_trade,
+    dir_,
+    exit_reason: str,
+    exit_price_hint,
+    stop_active: bool,
+    tp_active: bool,
+) -> bool:
+  """Route check_exit reasons; returns True if position close was initiated."""
+  price = latest_row["close"]
+  logging.info("STRATEGY SIGNAL EXIT: %s triggered @ %.2f", exit_reason, price)
+
+  if broker_authoritative_exits_enabled():
+    stop_armed = stop_active  # caller passes stop_order_is_armed(stop_trade)
+    if exit_reason == "Stop Loss" and stop_armed:
+      broker_px = _broker_stop_trigger_price(
+        stop_trade.order if stop_trade else bracket.get("stopLoss")
+      )
+      stop_level = (
+        broker_px
+        if (broker_px is not None and broker_px > 0)
+        else (_effective_bracket_stop(bracket.get("stopLoss"), bracket, dir_) or 0.0)
+      )
+      breach_px = (
+        float(latest_row.get("low", price))
+        if dir_ == 1
+        else float(latest_row.get("high", price))
+      )
+      if _model_stop_breached(dir_, breach_px, stop_level):
+        logging.warning(
+          "Broker-authoritative: stop breached @ %.2f (stop %.2f) but Submitted leg "
+          "did not fill; forcing software backup",
+          breach_px,
+          stop_level,
+        )
+        _force_close_position(
+          ib, bracket_contract, bracket, positions, completed_trades,
+          live_tracker, send_email_fn, entry_trade, price,
+          "Software Stop (backup)", data=data, strategy=strategy,
+        )
+        return True
+      st = stop_trade.orderStatus.status if stop_trade and stop_trade.orderStatus else "?"
+      logging.info(
+        "Broker-authoritative: deferring Stop Loss to armed stop (status=%s); no soft market exit",
+        st,
+      )
+      return False
+    if exit_reason == "Take Profit" and tp_active:
+      st = tp_trade.orderStatus.status if tp_trade and tp_trade.orderStatus else "?"
+      logging.info(
+        "Broker-authoritative: deferring Take Profit to working limit (status=%s)",
+        st,
+      )
+      return False
+    if exit_reason == "Stop Loss":
+      _force_close_position(
+        ib, bracket_contract, bracket, positions, completed_trades,
+        live_tracker, send_email_fn, entry_trade, price,
+        "Software Stop (backup)", data=data, strategy=strategy,
+      )
+      return True
+    if exit_reason == "Take Profit":
+      _force_close_position(
+        ib, bracket_contract, bracket, positions, completed_trades,
+        live_tracker, send_email_fn, entry_trade, price,
+        "Software Stop (backup)", data=data, strategy=strategy,
+      )
+      return True
+    if exit_reason and "Channel" in exit_reason:
+      _exit_channel_signal(
+        ib, bracket_contract, bracket, positions, completed_trades,
+        live_tracker, send_email_fn, entry_trade, exit_price_hint,
+        data, strategy, dir_,
+      )
+      return True
+
+  # Legacy soft exit for all signals
+  _force_close_position(
+    ib, bracket_contract, bracket, positions, completed_trades,
+    live_tracker, send_email_fn, entry_trade, price,
+    f"Strategy Exit ({exit_reason})", data=data, strategy=strategy,
+  )
+  return True
 
 
 def _snapshot_strategy_params(strategy) -> dict:
@@ -247,6 +618,32 @@ def _align_ts_naive_et(ts):
     return t
 
 
+_completed_trade_persist_hook = None
+
+
+def register_completed_trade_persist_hook(fn) -> None:
+    """Register callback to flush completed_trades to disk immediately after a close."""
+    global _completed_trade_persist_hook
+    _completed_trade_persist_hook = fn
+
+
+def _invoke_completed_trade_persist_hook() -> None:
+    fn = _completed_trade_persist_hook
+    if not fn:
+        return
+    try:
+        fn()
+    except Exception as e:
+        logging.error("completed_trades persist hook failed: %s", e, exc_info=True)
+
+
+def _append_completed_trade_record(completed_trades: list, record: dict, max_keep: int = 1000) -> None:
+    completed_trades.append(record)
+    if len(completed_trades) > max_keep:
+        del completed_trades[:-max_keep]
+    _invoke_completed_trade_persist_hook()
+
+
 def _find_entry_trade(ib, contract, order_id: int, perm_id: int):
     """Locate entry trade by orderId first, then permId."""
     for t in ib.trades():
@@ -257,6 +654,108 @@ def _find_entry_trade(ib, contract, order_id: int, perm_id: int):
         if perm_id and getattr(t.order, 'permId', 0) == perm_id:
             return t
     return None
+
+
+def _wait_for_entry_fill(ib, contract, order_id: int, perm_id: int,
+                         timeout_sec: float = 8.0, poll_sec: float = 0.25):
+    """Poll until parent entry is filled or timeout (fast fills often arrive after first ib.sleep)."""
+    deadline = time.monotonic() + timeout_sec
+    trade = _find_entry_trade(ib, contract, order_id, perm_id)
+    while time.monotonic() < deadline:
+        if trade and trade.filled():
+            return trade
+        ib.sleep(poll_sec)
+        trade = _find_entry_trade(ib, contract, order_id, perm_id)
+    return trade if (trade and trade.filled()) else trade
+
+
+def _send_trade_open_notification(
+    bracket, direction: int, entry_price: float, stop_price: float, tp,
+    qty: float, entry_time, ib, data, contract, send_email_fn, live_tracker,
+    dashboard_state=None, strategy=None, positions=None,
+) -> None:
+    if bracket.get('open_notified'):
+        return
+    account = get_account_summary(ib, data, contract)
+    contract_multiplier = 50
+    risk_dollars = abs(entry_price - stop_price) * contract_multiplier * qty
+    reward_dollars = abs(entry_price - tp) * contract_multiplier * qty if tp else None
+    rr_ratio = reward_dollars / risk_dollars if (tp and risk_dollars > 0) else None
+
+    msg_lines = [
+        f"TRADE OPEN - {'LONG' if direction == 1 else 'SHORT'}",
+        f"{'=' * 50}",
+        f"Entry Price: ${entry_price:.2f}",
+        f"Stop Loss: ${stop_price:.2f} (Risk: ${risk_dollars:,.2f})",
+        f"Take Profit: ${tp:.2f} (Reward: ${reward_dollars:,.2f})" if tp else "Take Profit: None",
+        f"Risk/Reward: {rr_ratio:.2f}:1" if rr_ratio else "Risk/Reward: N/A",
+        f"Position Size: {qty} contract(s)",
+        f"",
+        f"Account: NetLiq=${account.get('NetLiquidation', 'N/A')}, "
+        f"Cash=${account.get('TotalCashValue', 'N/A')}",
+        f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    dir_str = 'L' if direction == 1 else 'S'
+    subj = f"[BB] O: {dir_str} {qty}@{entry_price:.2f}"
+    send_email_fn(subj, "\n".join(msg_lines))
+    tp_str = f"${tp:.2f}" if tp else "None"
+    logging.info(
+        f"TRADE OPEN: {'LONG' if direction == 1 else 'SHORT'} @ {entry_price:.2f}, "
+        f"SL: {stop_price:.2f}, TP: {tp_str}"
+    )
+    if live_tracker is not None:
+        add_to_live_tracker(
+            live_tracker, 'trade',
+            f"TRADE OPEN: {'LONG' if direction == 1 else 'SHORT'} @ ${entry_price:.2f}, SL: ${stop_price:.2f}",
+        )
+    bracket['open_notified'] = True
+    if dashboard_state is not None:
+        dashboard_state.request_full_refresh = True
+    if strategy is not None and positions is not None:
+        _confirm_bracket_stop_after_open(
+            ib, contract, bracket, strategy, data, positions, live_tracker,
+        )
+
+
+def _confirm_bracket_stop_after_open(
+    ib, contract, bracket, strategy, data, positions, live_tracker,
+) -> None:
+    """Verify broker stop leg survived entry; re-protect immediately if flat-book race removed it."""
+    try:
+        ensure_bracket_protective_stop(
+            ib, contract, bracket, strategy, data, positions, live_tracker,
+        )
+    except Exception as e:
+        logging.error("Post-open stop verification failed: %s", e)
+
+
+def _maybe_send_trade_open_for_bracket(
+    bracket, ib, contract, data, send_email_fn, live_tracker, dashboard_state=None,
+    strategy=None, positions=None,
+) -> None:
+    """Deferred TRADE OPEN when fill lands after the entry-placement poll window."""
+    if bracket.get('open_notified'):
+        return
+    entry_trade = _entry_trade_for_bracket(ib, contract, bracket)
+    if not entry_trade or not entry_trade.filled() or not entry_trade.fills:
+        return
+    try:
+        fill_px = float(entry_trade.fills[0].execution.price)
+    except Exception:
+        fill_px = float(bracket.get('entry_price') or 0)
+    if fill_px > 0:
+        bracket['entry_price'] = fill_px
+    _send_trade_open_notification(
+        bracket,
+        int(bracket.get('direction') or 0),
+        float(bracket.get('entry_price') or fill_px),
+        float(bracket.get('entry_stop_price') or bracket.get('position_dict', {}).get('stop') or 0),
+        bracket.get('entry_tp_price'),
+        abs(float(getattr(bracket.get('stopLoss'), 'totalQuantity', 1) or 1)),
+        bracket.get('entry_time') or datetime.now(),
+        ib, data, contract, send_email_fn, live_tracker, dashboard_state,
+        strategy=strategy, positions=positions,
+    )
 
 
 def _entry_trade_for_bracket(ib, contract, bracket) -> Optional[Any]:
@@ -397,6 +896,14 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
         )
         return
 
+    from core.client_id_guard import trading_orders_allowed
+    if not trading_orders_allowed():
+        logging.error(
+            "Entry blocked: clientId integrity halt — %s",
+            getattr(dashboard_state, "client_id_violation_detail", None) or "see logs",
+        )
+        return
+
     # Extra Safety: Check for active orders for this contract to prevent double entry
     active_orders = [t for t in ib.trades() if t.contract.conId == contract.conId and t.isActive()]
     if active_orders:
@@ -498,6 +1005,10 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
         # Explicitly set TIF to GTC to avoid 10349 rejection from IBKR presets
         entry_order = MarketOrder(action=action, totalQuantity=qty, transmit=False, tif='GTC')
         
+        if not trading_orders_allowed():
+            logging.error("Entry aborted: clientId integrity halt")
+            return
+
         # Place entry order
         trade = ib.placeOrder(contract, entry_order)
         
@@ -513,9 +1024,10 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
             'params_snapshot': _snapshot_strategy_params(strategy),
             'ocaGroup': oca_group,  # Store for protection logic
             'contract': contract,
+            'open_notified': False,
             # Guard cleanup logic against race/callback timing for newly submitted bracket.
             'created_at': datetime.now(pytz.utc),
-            'guard_until': datetime.now(pytz.utc) + timedelta(seconds=20),
+            'guard_until': datetime.now(pytz.utc) + timedelta(seconds=30),
         }
         positions.append(bracket)
 
@@ -565,46 +1077,27 @@ def check_entries(strategy, ib, contract, data, positions, params_dict,
     finally:
         check_entries.is_processing = False
 
-    ib.sleep(0.5)
-
-    # Entry notifications are sent only after confirming the parent actually filled.
+    # Entry notifications only after parent fill (poll — fills often land just after first sleep).
     entry_perm = getattr(entry_order, 'permId', 0)
-    confirmed_trade = _find_entry_trade(ib, contract, entry_order_id if 'entry_order_id' in locals() else 0, entry_perm)
-    is_filled = bool(confirmed_trade and confirmed_trade.filled())
-    if is_filled:
-        account = get_account_summary(ib, data, contract)
-        contract_multiplier = 50
-        risk_dollars = abs(entry_price - stop_price) * contract_multiplier * qty
-        reward_dollars = abs(entry_price - tp) * contract_multiplier * qty if tp else None
-        rr_ratio = reward_dollars / risk_dollars if (tp and risk_dollars > 0) else None
-
-        msg_lines = [
-            f"TRADE OPEN - {'LONG' if direction==1 else 'SHORT'}",
-            f"{'='*50}",
-            f"Entry Price: ${entry_price:.2f}",
-            f"Stop Loss: ${stop_price:.2f} (Risk: ${risk_dollars:,.2f})",
-            f"Take Profit: ${tp:.2f} (Reward: ${reward_dollars:,.2f})" if tp else "Take Profit: None",
-            f"Risk/Reward: {rr_ratio:.2f}:1" if rr_ratio else "Risk/Reward: N/A",
-            f"Position Size: {qty} contract(s)",
-            f"",
-            f"Account: NetLiq=${account.get('NetLiquidation', 'N/A')}, "
-            f"Cash=${account.get('TotalCashValue', 'N/A')}",
-            f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
-        ]
-        dir_str = 'L' if direction == 1 else 'S'
-        subj = f"[BB] O: {dir_str} {qty}@{entry_price:.2f}"
-        send_email_fn(subj, "\n".join(msg_lines))
-        tp_str = f"${tp:.2f}" if tp else "None"
-        logging.info(f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} @ {entry_price:.2f}, "
-                     f"SL: {stop_price:.2f}, TP: {tp_str}")
-        add_to_live_tracker(live_tracker, 'trade',
-            f"TRADE OPEN: {'LONG' if direction==1 else 'SHORT'} @ ${entry_price:.2f}, SL: ${stop_price:.2f}")
+    oid = entry_order_id if 'entry_order_id' in locals() else 0
+    confirmed_trade = _wait_for_entry_fill(ib, contract, oid, entry_perm, timeout_sec=8.0)
+    if confirmed_trade and confirmed_trade.filled():
+        if confirmed_trade.fills:
+            try:
+                entry_price = float(confirmed_trade.fills[0].execution.price)
+                bracket['entry_price'] = entry_price
+            except Exception:
+                pass
+        _send_trade_open_notification(
+            bracket, direction, entry_price, stop_price, tp, qty, entry_time,
+            ib, data, contract, send_email_fn, live_tracker, dashboard_state,
+            strategy=strategy, positions=positions,
+        )
     else:
         logging.warning(
-            "Entry parent not filled yet/rejected; suppressing TRADE OPEN email/log until confirmed fill "
-            f"(orderId={entry_order_id if 'entry_order_id' in locals() else 0}, permId={entry_perm})"
+            "Entry parent not filled yet/rejected; TRADE OPEN deferred until fill confirms "
+            f"(orderId={oid}, permId={entry_perm})"
         )
-        prune_dead_brackets(ib, contract, positions, live_tracker)
     
     # Double check order placement success
     ib.sleep(0.5)
@@ -720,11 +1213,12 @@ def _record_flatten_close_from_market_order(
     add_to_live_tracker(live_tracker, 'trade',
                         f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
 
-    completed_trades.append({
+    _append_completed_trade_record(completed_trades, {
         'exit_time': exit_time, 'entry_time': entry_time,
         'direction': 'LONG' if dir_ == 1 else 'SHORT',
         'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
         'pnl': pnl, 'r_multiple': r_multiple, 'reason': reason,
+        'live_exit_type': _live_exit_type(reason),
         'duration': duration_str,
         'report_url': report_url,
         'params_snapshot': bracket.get('params_snapshot') or {},
@@ -734,8 +1228,6 @@ def _record_flatten_close_from_market_order(
         'tp_at_close': tp_at_close_snap,
         'entry_order_id': bracket.get('entryOrderId'),
     })
-    if len(completed_trades) > 1000:
-        del completed_trades[:-1000]
 
     try:
         cancel_residual_orders_when_flat_on_contract(ib, bracket_contract, live_tracker)
@@ -852,7 +1344,15 @@ def _close_all_positions(reason_label, ib, contract, positions, data,
 def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 live_tracker, send_email_fn, idx, latest_row, allow_strategy_exit=False,
                 skip_trailing=False):
-    """Comprehensive exit logic: RTH, maintenance, trailing stop, opposite BB TP, trade close detection."""
+    """Exit logic: RTH, maintenance, broker fill detection, optional strategy exits, trailing.
+
+    Phase 1 clock: call with ``skip_trailing=True`` on 1-min monitor ticks; trail + ``bars_held``
+    only when ``allow_strategy_exit=True`` on a completed strategy bar (``completed_row``).
+
+    Phase 2 (``LIVE_BROKER_AUTHORITATIVE_EXIT``, default on): on strategy bars, trail → TP sync →
+    defer SL/TP ``check_exit`` when broker legs are active; channel exits use ``Channel Exit (signal)``.
+    Roll back with ``LIVE_BROKER_AUTHORITATIVE_EXIT=0`` (and ``LIVE_TRAIL_STRATEGY_BAR_ONLY=0`` for 1-min trail).
+    """
     
     # --- RTH Force Exit ---
     if getattr(strategy, 'enable_rth_filter', False) and getattr(strategy, 'rth_exit_buffer_minutes', 0) > 0:
@@ -913,13 +1413,18 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
         tp_order = bracket['takeProfit']
         dir_ = bracket['direction']
 
-        # Find entry trade
-        entry_trade = next((t for t in ib.trades() if t.order.permId == entry_order.permId), None)
+        bracket_contract = bracket.get('contract', contract)
+        entry_trade = _entry_trade_for_bracket(ib, bracket_contract, bracket)
         if not entry_trade or entry_trade.isActive():
             continue
         fill = entry_trade.fills[0].execution if entry_trade.fills else None
         if not fill:
             continue
+
+        _maybe_send_trade_open_for_bracket(
+            bracket, ib, bracket_contract, data, send_email_fn, live_tracker,
+            strategy=strategy, positions=positions,
+        )
 
         # Find stop/TP trades
         stop_trade = next((t for t in ib.trades() if t.order.permId == stop_order.permId), None)
@@ -964,66 +1469,24 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
             else (_effective_bracket_stop(stop_order, bracket, dir_) or 0.0)
         )
 
-        # --- PreSubmitted stop force-close ---
-        stop_should_trigger = (
-            (current_price <= stop_price_for_breach) if dir_ == 1 else (current_price >= stop_price_for_breach)
-        )
-        if stop_should_trigger:
-            stop_status = stop_trade.orderStatus.status if stop_trade and stop_trade.orderStatus else None
-            why_held = getattr(stop_trade.orderStatus, 'whyHeld', '') if stop_trade and stop_trade.orderStatus else ''
-
-            if stop_status == 'PreSubmitted' and 'trigger' in why_held.lower():
-                logging.warning(
-                    f"CRITICAL: Stop {stop_price_for_breach:.2f} breached, order PreSubmitted. Manual close."
-                )
-                _force_close_position(ib, bracket_contract, bracket, positions, completed_trades,
-                                      live_tracker, send_email_fn, entry_trade, current_price,
-                                      "Manual Close (PreSubmitted Stop)", data=data, strategy=strategy)
-                continue
-
-        # --- Strategy-Specific Signal Exit (The "Soft Exit") ---
         if allow_strategy_exit:
-            try:
-                # FIX: Pass the strategy-specific position_dict, not the full bracket
-                strat_pos = bracket.get('position_dict', bracket)
-                
-                # --- SAFETY: Don't use bar ranges (High/Low) from BEFORE the trade started ---
-                # A bar with index 10:35 completes at 10:36. If we enter at 10:36:05,
-                # the 10:35 bar's range is historical.
-                entry_time = bracket.get('entry_time')
-                bar_time = latest_row.name if hasattr(latest_row, 'name') else None
-                
-                eval_row = latest_row
-                if entry_time and bar_time:
-                    bar_ts = _align_ts_naive_et(bar_time)
-                    ent_ts = _align_ts_naive_et(entry_time)
-                    # If this is the signal bar (precedes) or the first bar (overlaps):
-                    # Clamp High/Low to Close to only check for breaches occurring NOW or forward.
-                    # replace(second=0) to align with bar indices
-                    if bar_ts is not None and ent_ts is not None:
-                        ent_cmp = ent_ts.replace(second=0, microsecond=0) if hasattr(ent_ts, 'replace') else ent_ts
-                        cmp_ok = bar_ts <= ent_cmp
-                    else:
-                        cmp_ok = False
-                    if cmp_ok:
-                        if isinstance(latest_row, pd.Series):
-                            eval_row = latest_row.copy()
-                            eval_row['high'] = eval_row['low'] = eval_row['close']
-                        elif isinstance(latest_row, dict):
-                            eval_row = latest_row.copy()
-                            eval_row['high'] = eval_row['low'] = eval_row['close']
+            breach_row = _eval_row_for_exit(bracket, latest_row)
+            hi = float(
+                breach_row.get("high", current_price)
+                if hasattr(breach_row, "get")
+                else breach_row["high"]
+            )
+            lo = float(
+                breach_row.get("low", current_price)
+                if hasattr(breach_row, "get")
+                else breach_row["low"]
+            )
+            breach_px = lo if dir_ == 1 else hi
+        else:
+            breach_px = current_price
+        stop_should_trigger = _model_stop_breached(dir_, breach_px, stop_price_for_breach)
 
-                exit_triggered, exit_reason, exit_price_hint = strategy.check_exit(strat_pos, eval_row, data)
-                if exit_triggered:
-                    logging.info(f"STRATEGY SIGNAL EXIT: {exit_reason} triggered @ {latest_row['close']:.2f}")
-                    _force_close_position(ib, bracket_contract, bracket, positions, completed_trades,
-                                          live_tracker, send_email_fn, entry_trade, latest_row['close'],
-                                          f"Strategy Exit ({exit_reason})", data=data, strategy=strategy)
-                    continue
-            except Exception as e:
-                logging.error(f"Error checking strategy signal exit: {e}")
-
-        # --- Trailing stop update ---
+        # --- Trailing stop update (strategy bar first: trail → broker sync → exits) ---
         if position_still_open:
             position_dict = bracket.get('position_dict', {})
             if not position_dict:
@@ -1036,8 +1499,8 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 }
                 bracket['position_dict'] = position_dict
 
-            if not skip_trailing:
-                # FIX: Use strat_pos which was already extracted or get it again
+            if not skip_trailing and allow_strategy_exit:
+                # Trail only on completed strategy bars (not 1-min monitor passes).
                 strat_pos = bracket.get('position_dict', position_dict)
                 _sb = _finite_stop_scalar(strat_pos.get("stop"))
                 if _sb is None:
@@ -1113,65 +1576,25 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                                     tp_lmt = _quantize_es_tick(tp_lmt)
                                     if tp_lmt is None:
                                         raise RuntimeError("non-finite TP price for OCA stop replace")
-                                    old_stop_perm = int(getattr(stop_order, "permId", 0) or 0)
-                                    old_tp_perm = int(getattr(tp_order, "permId", 0) or 0)
-                                    # Canceling only the stop cancels the OCA sibling (TP). Replace both legs.
-                                    ib.cancelOrder(stop_order)
-                                    ib.cancelOrder(tp_order)
-                                    outcome = _wait_oca_pair_cancelled(
-                                        ib, old_stop_perm, old_tp_perm, timeout=5.0
+                                    ok = replace_oca_exit_pair_zero_gap(
+                                        ib,
+                                        bracket_contract,
+                                        bracket,
+                                        new_stop,
+                                        tp_lmt,
+                                        dir_,
+                                        stop_order,
+                                        tp_order,
+                                        live_tracker=live_tracker,
+                                        timeout=3.0,
                                     )
-                                    if outcome == "filled":
-                                        logging.info(
-                                            "Trailing (OCA): SL or TP filled during cancel/replace; "
-                                            "skipping new exit orders."
-                                        )
-                                        strat_pos["stop"] = stop_before_trail_update
-                                    elif outcome != "cancelled":
+                                    if not ok:
                                         strat_pos["stop"] = stop_before_trail_update
                                         logging.error(
-                                            "Trailing (OCA): cancel wait outcome=%s stop_perm=%s tp_perm=%s; "
-                                            "reverted strategy stop %.2f -> %.2f",
-                                            outcome,
-                                            old_stop_perm,
-                                            old_tp_perm,
+                                            "Trailing (OCA zero-gap): failed; reverted strategy stop "
+                                            "%.2f -> %.2f",
                                             new_stop,
                                             stop_before_trail_update,
-                                        )
-                                    else:
-                                        tp_action = "SELL" if dir_ == 1 else "BUY"
-                                        new_stop_order = StopOrder(
-                                            action=stop_action,
-                                            totalQuantity=qty_trail,
-                                            stopPrice=new_stop,
-                                            parentId=parent_id,
-                                            tif="GTC",
-                                            ocaGroup=og,
-                                            ocaType=1,
-                                            transmit=False,
-                                        )
-                                        new_tp_order = LimitOrder(
-                                            action=tp_action,
-                                            totalQuantity=qty_trail,
-                                            lmtPrice=tp_lmt,
-                                            parentId=parent_id,
-                                            tif="GTC",
-                                            ocaGroup=og,
-                                            ocaType=1,
-                                            transmit=True,
-                                        )
-                                        ib.placeOrder(bracket_contract, new_stop_order)
-                                        ib.placeOrder(bracket_contract, new_tp_order)
-                                        bracket["stopLoss"] = new_stop_order
-                                        bracket["takeProfit"] = new_tp_order
-                                        logging.info(
-                                            f"Trailing OCA pair replaced: SL {curr_working:.2f} -> {new_stop:.2f}, "
-                                            f"TP {tp_lmt:.2f}"
-                                        )
-                                        add_to_live_tracker(
-                                            live_tracker,
-                                            "order",
-                                            f"Trailing SL+TP (replace) SL ${new_stop:.2f} TP ${tp_lmt:.2f}",
                                         )
                                 else:
                                     stop_order.stopPrice = new_stop
@@ -1182,10 +1605,25 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                                     if hasattr(stop_order, "ocaType"):
                                         stop_order.ocaType = 0
                                     stop_order.transmit = True
+                                    if hasattr(stop_order, "parentId"):
+                                        stop_order.parentId = 0
                                     ib.placeOrder(bracket_contract, stop_order)
                                     ib.sleep(0.2)
-                                    logging.info(f"Trailing stop modified: {curr_working:.2f} -> {new_stop:.2f}")
-                                    add_to_live_tracker(live_tracker, "order", f"Trailing stop -> ${new_stop:.2f}")
+                                    if not ensure_bracket_stop_armed(
+                                        ib, bracket_contract, bracket, live_tracker,
+                                    ):
+                                        strat_pos["stop"] = stop_before_trail_update
+                                        logging.error(
+                                            "Trailing stop modify: could not arm stop @ %.2f; reverted model",
+                                            new_stop,
+                                        )
+                                    else:
+                                        logging.info(
+                                            f"Trailing stop modified: {curr_working:.2f} -> {new_stop:.2f}"
+                                        )
+                                        add_to_live_tracker(
+                                            live_tracker, "order", f"Trailing stop -> ${new_stop:.2f}"
+                                        )
                             except Exception as e:
                                 strat_pos["stop"] = stop_before_trail_update
                                 logging.error(f"Error updating trailing stop: {e}")
@@ -1235,9 +1673,44 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                                             "Trail replace failed and could not restore OCA pair: %s", re
                                         )
 
-            # --- Opposite BB TP update ---
+            # --- Opposite BB TP update (strategy bar, after trail) ---
             if allow_strategy_exit and position_still_open and getattr(strategy, 'opposite_bb_tp', False) and tp_order:
                 _update_opposite_bb_tp(ib, bracket_contract, data, bracket, tp_order, dir_, live_tracker)
+
+            # Refresh order handles after trail / TP sync
+            stop_trade = next((t for t in ib.trades() if t.order.permId == stop_order.permId), stop_trade)
+            tp_trade = next(
+                (t for t in ib.trades() if tp_order and t.order.permId == tp_order.permId), tp_trade
+            )
+            stop_active = _protective_order_active(stop_trade)
+            stop_armed = stop_order_is_armed(stop_trade)
+            tp_active = _protective_order_active(tp_trade)
+
+            if _handle_protective_backup(
+                ib, bracket_contract, bracket, positions, completed_trades,
+                live_tracker, send_email_fn, entry_trade, latest_row, data, strategy,
+                stop_trade, dir_, stop_should_trigger, stop_price_for_breach,
+            ):
+                continue
+
+            if allow_strategy_exit:
+                try:
+                    strat_pos = bracket.get('position_dict', bracket)
+                    eval_row = _eval_row_for_exit(bracket, latest_row)
+                    exit_triggered, exit_reason, exit_price_hint = strategy.check_exit(
+                        strat_pos, eval_row, data
+                    )
+                    if exit_triggered:
+                        closed = _handle_strategy_signal_exit(
+                            ib, bracket_contract, bracket, positions, completed_trades,
+                            live_tracker, send_email_fn, entry_trade, latest_row, data, strategy,
+                            stop_trade, tp_trade, dir_, exit_reason, exit_price_hint,
+                            stop_armed, tp_active,
+                        )
+                        if closed:
+                            continue
+                except Exception as e:
+                    logging.error(f"Error checking strategy signal exit: {e}")
 
 
 def _force_close_position(ib, contract, bracket, positions, completed_trades,
@@ -1295,6 +1768,9 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
             
             # Use unified reporting helper
             report_url = ""
+            slip = _exit_slippage_metrics(
+                dir_, exit_price, stop_at_close_snap, tp_at_close_snap, reason, qty,
+            )
             if strategy:
                 try:
                     # Save to web/trades/
@@ -1311,6 +1787,10 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                             'stop_at_open': bracket.get('entry_stop_price'),
                             'tp_at_open': bracket.get('entry_tp_price'),
                             'params_snapshot': bracket.get('params_snapshot') or {},
+                            'live_exit_type': _live_exit_type(reason),
+                            'slippage_pts': slip.get('slippage_pts'),
+                            'slippage_usd': slip.get('slippage_usd'),
+                            'slippage_reference': slip.get('slippage_reference'),
                         },
                         data, trades_dir
                     )
@@ -1319,6 +1799,13 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                 except Exception as e:
                     logging.error(f"Failed to generate HTML report: {e}")
 
+            logging.info(f"TRADE CLOSE: {reason} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
+            if live_tracker is not None:
+                add_to_live_tracker(
+                    live_tracker, 'trade',
+                    f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}",
+                )
+
             _send_trade_close_notification(
                 ib, bracket, dir_, entry_price, exit_price, pnl, qty, reason, 
                 duration_str, exit_time, data, send_email_fn, live_tracker,
@@ -1326,11 +1813,13 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
             )
             
             # Record in completed trades for dashboard
-            completed_trades.append({
+            _append_completed_trade_record(completed_trades, {
                 'exit_time': exit_time, 'entry_time': entry_time,
                 'direction': 'LONG' if dir_ == 1 else 'SHORT',
                 'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
-                'pnl': pnl, 'reason': reason, 'duration': duration_str,
+                'pnl': pnl, 'reason': reason,
+                'live_exit_type': _live_exit_type(reason),
+                'duration': duration_str,
                 'report_url': report_url,
                 'params_snapshot': bracket.get('params_snapshot') or {},
                 'stop_at_open': bracket.get('entry_stop_price'),
@@ -1338,9 +1827,10 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                 'stop_at_close': stop_at_close_snap,
                 'tp_at_close': tp_at_close_snap,
                 'entry_order_id': bracket.get('entryOrderId'),
+                'slippage_pts': slip.get('slippage_pts'),
+                'slippage_usd': slip.get('slippage_usd'),
+                'slippage_reference': slip.get('slippage_reference'),
             })
-            if len(completed_trades) > 1000:
-                del completed_trades[:-1000]
         else:
             logging.error(f"Force close failed: Position still exists for {bracket_contract.localSymbol}")
 
@@ -1600,9 +2090,9 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         for trade in ib.trades():
             if trade.contract.conId == contract.conId and trade.filled():
                 if tp_order and trade.order.permId == getattr(tp_order, 'permId', 0):
-                    exit_trade = trade; reason = 'Take Profit'; break
+                    exit_trade = trade; reason = 'Broker Take Profit'; break
                 elif stop_order and trade.order.permId == getattr(stop_order, 'permId', 0):
-                    exit_trade = trade; reason = 'Stop Loss'; break
+                    exit_trade = trade; reason = 'Broker Stop'; break
         
         # 2. Deep Search: Check recent fills (crucial for ghost-bracket reconciliation)
         if reason in ['Unknown', 'Manual / External']:
@@ -1610,9 +2100,9 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
                 if fill.contract.conId == contract.conId:
                     p_id = getattr(fill.execution, 'permId', 0)
                     if tp_order and p_id != 0 and p_id == getattr(tp_order, 'permId', -1):
-                        reason = 'Take Profit'; break
+                        reason = 'Broker Take Profit'; break
                     elif stop_order and p_id != 0 and p_id == getattr(stop_order, 'permId', -1):
-                        reason = 'Stop Loss'; break
+                        reason = 'Broker Stop'; break
         
         # 3. Check for specific IB errors or rejections (Ghost-Bracket Sync)
         if reason in ['Unknown', 'Manual / External']:
@@ -1696,17 +2186,25 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
             # Save to web/trades/
             trades_dir = os.path.join(os.getcwd(), 'web', 'trades')
             os.makedirs(trades_dir, exist_ok=True)
+            tp_close_px = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+            slip_pre = _exit_slippage_metrics(
+                dir_, exit_price, curr_stop or None, tp_close_px, reason, qty=qty,
+            )
             report_path = strategy.generate_trade_report(
                 {
                     'entry_time': entry_time, 'exit_time': exit_time,
                     'direction': dir_, 'entry_price': entry_price,
                     'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
-                        'reason': reason,
-                        'stop_at_close': curr_stop or None,
-                        'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
-                        'stop_at_open': bracket.get('entry_stop_price'),
-                        'tp_at_open': bracket.get('entry_tp_price'),
-                        'params_snapshot': bracket.get('params_snapshot') or {},
+                    'reason': reason,
+                    'live_exit_type': _live_exit_type(reason),
+                    'stop_at_close': curr_stop or None,
+                    'tp_at_close': tp_close_px,
+                    'stop_at_open': bracket.get('entry_stop_price'),
+                    'tp_at_open': bracket.get('entry_tp_price'),
+                    'params_snapshot': bracket.get('params_snapshot') or {},
+                    'slippage_pts': slip_pre.get('slippage_pts'),
+                    'slippage_usd': slip_pre.get('slippage_usd'),
+                    'slippage_reference': slip_pre.get('slippage_reference'),
                 },
                 data, trades_dir
             )
@@ -1728,24 +2226,30 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     # Risk calculation for completed record
     initial_risk = abs(entry_price - curr_stop) * 50 * qty if curr_stop else 0
     r_multiple = pnl / initial_risk if initial_risk > 0 else 0
-    
-    # Record completed trade
-    completed_trades.append({
+    tp_close_px = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+    slip = _exit_slippage_metrics(
+        dir_, exit_price, curr_stop or None, tp_close_px, reason, qty=qty,
+    )
+
+    _append_completed_trade_record(completed_trades, {
         'exit_time': exit_time, 'entry_time': entry_time,
         'direction': 'LONG' if dir_ == 1 else 'SHORT',
         'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
         'pnl': pnl, 'r_multiple': r_multiple, 'reason': reason,
+        'live_exit_type': _live_exit_type(reason),
         'duration': duration_str,
         'report_url': report_url,
         'params_snapshot': bracket.get('params_snapshot') or {},
         'stop_at_open': bracket.get('entry_stop_price'),
         'tp_at_open': bracket.get('entry_tp_price'),
         'stop_at_close': curr_stop or None,
-        'tp_at_close': getattr(tp_order, 'lmtPrice', None) if tp_order else None,
+        'tp_at_close': tp_close_px,
         'entry_order_id': bracket.get('entryOrderId'),
+        'slippage_pts': slip.get('slippage_pts'),
+        'slippage_usd': slip.get('slippage_usd'),
+        'slippage_reference': slip.get('slippage_reference'),
+        'model_stop_at_exit': slip.get('model_stop_at_exit'),
     })
-    if len(completed_trades) > 1000:
-        del completed_trades[:-1000]
 
     # Remove any non-terminal legs on this conId (includes **Inactive** TP after OCA replace races).
     try:

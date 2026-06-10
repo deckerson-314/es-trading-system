@@ -4,26 +4,87 @@ Ported from ib_deployment_v4.py lines 1575-3752
 """
 import logging
 import asyncio
+import time
 import pandas as pd
 from datetime import datetime
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 
 from core.account import get_account_summary, add_to_live_tracker
+from core.client_id_guard import (
+    log_placement_blocked,
+    run_client_id_integrity_check,
+    trading_orders_allowed,
+)
 import pytz
 
 
 def _ib_refresh_open_orders(ib):
-    """Ensure ib.trades() includes working orders after reconnect/restart."""
+    """Ensure ib.trades() includes working orders from all API clients (not only this session)."""
     try:
-        ib.reqOpenOrders()
-        ib.sleep(0.15)
+        ib.reqAllOpenOrders()
+        ib.sleep(0.2)
     except Exception:
-        pass
+        try:
+            ib.reqOpenOrders()
+            ib.sleep(0.15)
+        except Exception:
+            pass
+
+
+def _session_client_id(ib) -> int:
+    try:
+        return int(getattr(getattr(ib, "client", None), "clientId", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _order_belongs_to_session(ib, order) -> bool:
+    cid = _session_client_id(ib)
+    if cid <= 0:
+        return True
+    try:
+        return int(getattr(order, "clientId", 0) or 0) in (0, cid)
+    except (TypeError, ValueError):
+        return True
 
 
 # IB "Inactive" (e.g. rejected bracket TP after OCA replace) is NOT in OrderStatus.DoneStates,
 # but isActive() is often False — code that only scans isActive() leaves these on the blotter forever.
 _IB_TERMINAL_BLOTTER = frozenset({"Filled", "Cancelled", "ApiCancelled"})
+# PreSubmitted/trigger is NOT armed on the exchange — only Submitted stops can fill.
+_ARMED_STOP_STATUSES = frozenset({"Submitted"})
+_PENDING_STOP_STATUSES = frozenset({"PreSubmitted", "PendingSubmit", "ApiPending"})
+# Minimum seconds between placeOrder re-protect attempts per (conId, direction).
+_REPROTECT_MIN_INTERVAL_SEC = 90.0
+_reprotect_last_attempt: dict = {}
+
+
+def bracket_guard_blocks_flat_cleanup(positions, contract) -> bool:
+    """
+    True when flat-book cleanup must not run — bracket entry in flight or guard window active.
+    IB position can still read 0 for ~500ms after a market entry fill.
+    """
+    if not positions or contract is None:
+        return False
+    now = datetime.now(pytz.utc)
+    cid = contract.conId
+    for bracket in positions:
+        bc = bracket.get("contract")
+        if bc is not None and getattr(bc, "conId", None) != cid:
+            continue
+        guard_until = bracket.get("guard_until")
+        if guard_until is not None:
+            gu = guard_until if getattr(guard_until, "tzinfo", None) else pytz.utc.localize(guard_until)
+            if now < gu:
+                return True
+        if bracket.get("direction") and not bracket.get("open_notified"):
+            return True
+        created = bracket.get("created_at")
+        if created is not None and not bracket.get("open_notified"):
+            ca = created if getattr(created, "tzinfo", None) else pytz.utc.localize(created)
+            if (now - ca).total_seconds() < 45:
+                return True
+    return False
 
 
 def trade_order_needs_flat_book_cancel(trade) -> bool:
@@ -34,14 +95,25 @@ def trade_order_needs_flat_book_cancel(trade) -> bool:
     return True
 
 
-def cancel_residual_orders_when_flat_on_contract(ib, contract, live_tracker=None) -> int:
+def cancel_residual_orders_when_flat_on_contract(
+    ib, contract, live_tracker=None, positions=None,
+) -> int:
     """
     When position size is 0 for ``contract``, cancel every non-terminal order on that conId.
 
     Catches **Inactive** take-profit / OCA legs that ``trade.isActive()`` skips.
     Returns number of cancelOrder calls issued (may include already-dead orders; errors swallowed).
+
+    Skipped while ``positions`` has an in-flight bracket (``guard_until`` / unfilled entry) so
+    flat-book cleanup cannot cancel bracket legs before IB reports the fill.
     """
     if contract is None or not ib.isConnected():
+        return 0
+    if bracket_guard_blocks_flat_cleanup(positions, contract):
+        logging.debug(
+            "Flat-book cleanup skipped (%s): bracket entry guard active",
+            getattr(contract, "localSymbol", contract),
+        )
         return 0
     try:
         _ib_refresh_open_orders(ib)
@@ -130,6 +202,29 @@ def _trade_non_terminal(trade) -> bool:
     return st not in ("Filled", "Cancelled", "Inactive", "ApiCancelled")
 
 
+def stop_order_is_armed(trade) -> bool:
+    """True when IB stop is Submitted (armed on server and can fill)."""
+    if not trade or not _order_looks_like_protective_stop(trade.order):
+        return False
+    st = (getattr(trade.orderStatus, "status", None) or "").strip()
+    return st in _ARMED_STOP_STATUSES
+
+
+def stop_order_is_pending(trade) -> bool:
+    """True for PreSubmitted / trigger stops that are not yet armed."""
+    if not trade or not _order_looks_like_protective_stop(trade.order):
+        return False
+    st = (getattr(trade.orderStatus, "status", None) or "").strip()
+    if st in _IB_TERMINAL_BLOTTER or st in ("Inactive", "PendingCancel"):
+        return False
+    return st in _PENDING_STOP_STATUSES
+
+
+def _trade_has_working_protective_stop(trade) -> bool:
+    """True only for **armed** stop orders (Submitted) — not PreSubmitted/trigger."""
+    return stop_order_is_armed(trade)
+
+
 def _order_looks_like_protective_stop(order) -> bool:
     """IB often delivers STP as generic Order(orderType='STP'), not StopOrder."""
     if isinstance(order, StopOrder):
@@ -139,17 +234,656 @@ def _order_looks_like_protective_stop(order) -> bool:
         return True
     try:
         ap = float(getattr(order, "auxPrice", 0) or 0)
+    except (TypeError, ValueError):
+        ap = 0.0
+    try:
         lp = float(getattr(order, "lmtPrice", 0) or 0)
+    except (TypeError, ValueError):
+        lp = 0.0
+    try:
         sp = float(getattr(order, "stopPrice", 0) or 0)
     except (TypeError, ValueError):
-        return False
+        sp = 0.0
     if sp > 0 and abs(lp) < 1e-9:
         return True
     return ap > 0 and abs(lp) < 1e-9
 
 
+def _stop_trigger_price(order, bracket=None) -> float:
+    """Best-effort stop trigger from order object or bracket snapshot."""
+    for attr in ("auxPrice", "stopPrice"):
+        try:
+            v = float(getattr(order, attr, 0) or 0)
+            if v > 0:
+                return round(v * 4) / 4
+        except (TypeError, ValueError):
+            pass
+    if bracket:
+        for key in ("entry_stop_price",):
+            try:
+                v = float(bracket.get(key) or 0)
+                if v > 0:
+                    return round(v * 4) / 4
+            except (TypeError, ValueError):
+                pass
+        pd_stop = (bracket.get("position_dict") or {}).get("stop")
+        try:
+            v = float(pd_stop or 0)
+            if v > 0:
+                return round(v * 4) / 4
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _find_trade_for_order(ib, contract, order):
+    if not order:
+        return None
+    cid = getattr(contract, "conId", None)
+    perm = int(getattr(order, "permId", 0) or 0)
+    oid = int(getattr(order, "orderId", 0) or 0)
+    for trade in ib.trades():
+        if cid is not None and trade.contract.conId != cid:
+            continue
+        o = trade.order
+        if perm and o.permId == perm:
+            return trade
+        if oid and o.orderId == oid:
+            return trade
+    return None
+
+
+def _wait_stop_submitted(ib, order, timeout: float = 2.0) -> bool:
+    """Poll until stop order reaches Submitted (armed) or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        trade = _find_trade_for_order(ib, None, order)
+        if trade and stop_order_is_armed(trade):
+            if getattr(trade.order, "permId", 0):
+                order.permId = trade.order.permId
+            return True
+        ib.sleep(0.12)
+    return False
+
+
+def _cancel_order_quiet(ib, order) -> None:
+    if not order:
+        return
+    try:
+        ib.cancelOrder(order)
+    except Exception:
+        pass
+
+
+def _place_standalone_exit_pair(
+    ib,
+    contract,
+    direction: int,
+    qty: float,
+    stop_px: float,
+    tp_lmt=None,
+    oca_group: str = None,
+):
+    """Standalone SL (+ optional OCA-linked TP). Returns (stop_order, tp_order|None)."""
+    if not trading_orders_allowed():
+        log_placement_blocked("standalone SL/TP")
+        return None, None
+    stop_action = "SELL" if direction == 1 else "BUY"
+    new_stop = StopOrder(
+        action=stop_action,
+        totalQuantity=qty,
+        stopPrice=stop_px,
+        tif="GTC",
+        transmit=False,
+        parentId=0,
+    )
+    new_tp = None
+    if tp_lmt is not None and oca_group:
+        tp_action = "SELL" if direction == 1 else "BUY"
+        new_stop.ocaGroup = oca_group
+        new_stop.ocaType = 1
+        new_tp = LimitOrder(
+            action=tp_action,
+            totalQuantity=qty,
+            lmtPrice=tp_lmt,
+            tif="GTC",
+            ocaGroup=oca_group,
+            ocaType=1,
+            transmit=True,
+            parentId=0,
+        )
+    else:
+        new_stop.transmit = True
+    ib.placeOrder(contract, new_stop)
+    if new_tp:
+        ib.placeOrder(contract, new_tp)
+    ib.sleep(0.25)
+    return new_stop, new_tp
+
+
+def promote_bracket_stop_to_standalone(
+    ib, contract, bracket, live_tracker=None, timeout: float = 2.0,
+) -> bool:
+    """
+    If bracket stop is PreSubmitted/trigger, place standalone armed stop (+ TP if OCA),
+    verify Submitted, then cancel old child legs.
+    """
+    if not ib.isConnected() or bracket is None:
+        return False
+    bc = bracket.get("contract") or contract
+    stop_order = bracket.get("stopLoss")
+    if not stop_order:
+        return False
+
+    stop_trade = _find_trade_for_order(ib, bc, stop_order)
+    if stop_trade and stop_order_is_armed(stop_trade):
+        return True
+
+    direction = int(bracket.get("direction", 1))
+    qty = abs(float(getattr(stop_order, "totalQuantity", 1) or 1))
+    stop_px = _stop_trigger_price(stop_order, bracket)
+    if stop_px <= 0:
+        logging.error("promote_bracket_stop_to_standalone: no valid stop price")
+        return False
+
+    tp_order = bracket.get("takeProfit")
+    tp_lmt = None
+    if tp_order:
+        try:
+            tp_lmt = round(float(getattr(tp_order, "lmtPrice", 0) or 0) * 4) / 4
+            if tp_lmt <= 0:
+                tp_lmt = None
+        except (TypeError, ValueError):
+            tp_lmt = None
+    if tp_lmt is None:
+        try:
+            raw = bracket.get("entry_tp_price")
+            if raw is not None and float(raw) > 0:
+                tp_lmt = round(float(raw) * 4) / 4
+        except (TypeError, ValueError):
+            tp_lmt = None
+
+    oca_group = bracket.get("ocaGroup") if tp_lmt else None
+    old_stop, old_tp = stop_order, tp_order
+
+    new_stop, new_tp = _place_standalone_exit_pair(
+        ib, bc, direction, qty, stop_px, tp_lmt=tp_lmt, oca_group=oca_group,
+    )
+    if not _wait_stop_submitted(ib, new_stop, timeout=timeout):
+        logging.warning(
+            "Stop promote failed: new leg not Submitted within %.1fs (target %.2f); cancelling new legs",
+            timeout,
+            stop_px,
+        )
+        _cancel_order_quiet(ib, new_stop)
+        _cancel_order_quiet(ib, new_tp)
+        return False
+
+    _cancel_order_quiet(ib, old_stop)
+    _cancel_order_quiet(ib, old_tp)
+    ib.sleep(0.2)
+
+    bracket["stopLoss"] = new_stop
+    if new_tp:
+        bracket["takeProfit"] = new_tp
+
+    sym = getattr(bc, "localSymbol", bc)
+    logging.info("Stop promoted to standalone Submitted on %s @ %.2f", sym, stop_px)
+    if live_tracker:
+        add_to_live_tracker(
+            live_tracker,
+            "order",
+            f"Stop armed (Submitted) @ ${stop_px:,.2f} on {sym}",
+        )
+    return True
+
+
+def replace_oca_exit_pair_zero_gap(
+    ib,
+    contract,
+    bracket,
+    new_stop_px: float,
+    tp_lmt_px: float,
+    direction: int,
+    old_stop_order,
+    old_tp_order,
+    live_tracker=None,
+    timeout: float = 3.0,
+) -> bool:
+    """
+    Trailing/dynamic update: place new standalone OCA SL+TP, wait for Submitted stop,
+    then cancel old legs (zero-gap — new stop armed before old cancelled).
+    """
+    bc = bracket.get("contract") or contract
+    qty = abs(float(getattr(old_stop_order, "totalQuantity", 1) or 1))
+    oca_group = bracket.get("ocaGroup") or f"bracket_{getattr(bc, 'conId', 0)}_{direction}"
+    new_stop_px = round(float(new_stop_px) * 4) / 4
+    tp_lmt_px = round(float(tp_lmt_px) * 4) / 4
+
+    new_stop, new_tp = _place_standalone_exit_pair(
+        ib, bc, direction, qty, new_stop_px, tp_lmt=tp_lmt_px, oca_group=oca_group,
+    )
+    if not _wait_stop_submitted(ib, new_stop, timeout=timeout):
+        logging.error(
+            "Zero-gap OCA replace: new stop %.2f not Submitted; keeping old legs",
+            new_stop_px,
+        )
+        _cancel_order_quiet(ib, new_stop)
+        _cancel_order_quiet(ib, new_tp)
+        return False
+
+    _cancel_order_quiet(ib, old_stop_order)
+    _cancel_order_quiet(ib, old_tp_order)
+    ib.sleep(0.2)
+
+    bracket["stopLoss"] = new_stop
+    bracket["takeProfit"] = new_tp
+    bracket["ocaGroup"] = oca_group
+    logging.info(
+        "Trailing OCA zero-gap replace: SL -> %.2f, TP %.2f (Submitted before old cancel)",
+        new_stop_px,
+        tp_lmt_px,
+    )
+    if live_tracker:
+        add_to_live_tracker(
+            live_tracker,
+            "order",
+            f"Trailing SL+TP (zero-gap) SL ${new_stop_px:.2f} TP ${tp_lmt_px:.2f}",
+        )
+    return True
+
+
+def ensure_bracket_stop_armed(ib, contract, bracket, live_tracker=None) -> bool:
+    """Ensure bracket stop is Submitted; accept pending session stop; promote only if missing."""
+    if not ib.isConnected() or bracket is None:
+        return False
+    stop_order = bracket.get("stopLoss")
+    if not stop_order:
+        return False
+    bc = bracket.get("contract") or contract
+    stop_trade = _find_trade_for_order(ib, bc, stop_order)
+    if stop_trade and stop_order_is_armed(stop_trade):
+        return True
+
+    # Bracket handle may point at a cancelled leg after consolidate — prefer live IB stop
+    try:
+        open_pos = [
+            p for p in ib.positions()
+            if p.contract.conId == bc.conId and abs(float(p.position)) > 1e-9
+        ]
+    except Exception:
+        open_pos = []
+    if open_pos:
+        live = _find_protective_stop_trade_for_position(ib, open_pos[0])
+        if live and (stop_order_is_armed(live) or stop_order_is_pending(live)):
+            bracket["stopLoss"] = live.order
+            px = _stop_trigger_price(live.order, bracket)
+            if px > 0:
+                bracket["entry_stop_price"] = px
+            return True
+
+    last_promote = bracket.get("last_stop_promote_ts")
+    if last_promote is not None:
+        lp = last_promote if getattr(last_promote, "tzinfo", None) else pytz.utc.localize(last_promote)
+        if (datetime.now(pytz.utc) - lp).total_seconds() < 45:
+            return False
+
+    direction = int(bracket.get("direction", 1))
+    stop_px = _stop_trigger_price(stop_order, bracket)
+    stop_action = "SELL" if direction == 1 else "BUY"
+    if stop_px > 0:
+        for t in ib.trades():
+            if t.contract.conId != bc.conId:
+                continue
+            if not _order_looks_like_protective_stop(t.order):
+                continue
+            if getattr(t.order, "action", "") != stop_action:
+                continue
+            px = _stop_trigger_price(t.order, None)
+            if px > 0 and abs(px - stop_px) <= 0.26:
+                bracket["stopLoss"] = t.order
+                if stop_order_is_armed(t):
+                    return True
+                if stop_order_is_pending(t):
+                    logging.debug(
+                        "Stop acceptable (pending) @ %.2f on %s — skip promote",
+                        px,
+                        getattr(bc, "localSymbol", bc),
+                    )
+                    return True
+                logging.debug(
+                    "Stop promote skipped: session already has stop @ %.2f (status=%s)",
+                    px,
+                    getattr(t.orderStatus, "status", "?"),
+                )
+                return False
+
+    bracket["last_stop_promote_ts"] = datetime.now(pytz.utc)
+    return promote_bracket_stop_to_standalone(
+        ib, bc, bracket, live_tracker=live_tracker, timeout=2.0,
+    )
+
+
+def ensure_all_bracket_stops_armed(ib, contract, positions, live_tracker=None) -> int:
+    """Promote pending stops on all tracked brackets. Returns count armed/promoted."""
+    if not ib.isConnected() or not positions:
+        return 0
+    n = 0
+    for bracket in positions:
+        if not bracket.get("stopLoss"):
+            continue
+        bc = bracket.get("contract") or contract
+        if ensure_bracket_stop_armed(ib, bc, bracket, live_tracker):
+            n += 1
+    return n
+
+
+def _exit_leg_rank(
+    trade,
+    tracked_perm_ids: set,
+    session_cid: int,
+    is_stop: bool,
+    ib,
+    reference_stop_px: float = 0.0,
+) -> int:
+    """Higher = prefer keeping this exit leg (oldest / tracked / armed wins over new duplicates)."""
+    score = 0
+    if is_stop:
+        if stop_order_is_armed(trade):
+            score += 2000
+        elif stop_order_is_pending(trade):
+            score += 200
+    else:
+        st = (getattr(trade.orderStatus, "status", None) or "").strip()
+        if st == "Submitted":
+            score += 2000
+        elif st in _PENDING_STOP_STATUSES:
+            score += 200
+    perm = int(getattr(trade.order, "permId", 0) or 0)
+    if perm in tracked_perm_ids:
+        score += 800
+    # Prefer pre-outage / bracket legs (lower permId) over reconnect spam (high permId).
+    if perm > 0:
+        score += max(0, 300 - perm // 10_000_000)
+    if reference_stop_px > 0 and is_stop:
+        px = _stop_trigger_price(trade.order, None)
+        if px > 0:
+            score += max(0, 250 - int(abs(px - reference_stop_px) * 20))
+    try:
+        if int(getattr(trade.order, "clientId", 0) or 0) == session_cid:
+            score += 50
+    except (TypeError, ValueError):
+        pass
+    if _order_belongs_to_session(ib, trade.order):
+        score += 25
+    return score
+
+
+def _reference_stop_px_for_position(positions, pos) -> float:
+    direction = 1 if pos.position > 0 else -1
+    con_id = pos.contract.conId
+    for bracket in positions or []:
+        if bracket.get("direction") != direction:
+            continue
+        bc = bracket.get("contract")
+        if bc is not None and getattr(bc, "conId", None) not in (None, con_id):
+            continue
+        px = bracket.get("entry_stop_price") or _stop_trigger_price(bracket.get("stopLoss"), bracket)
+        if px and float(px) > 0:
+            return float(px)
+    return 0.0
+
+
+def _reprotect_throttle_ok(con_id: int, direction: int) -> bool:
+    key = (int(con_id), int(direction))
+    now = time.monotonic()
+    last = _reprotect_last_attempt.get(key, 0.0)
+    if now - last < _REPROTECT_MIN_INTERVAL_SEC:
+        return False
+    _reprotect_last_attempt[key] = now
+    return True
+
+
+def consolidate_duplicate_protective_orders(ib, contract, positions, live_tracker=None) -> int:
+    """
+    Keep at most one stop + one TP per open ES exposure; cancel duplicate session legs.
+    Returns number of cancelOrder calls issued.
+    """
+    if not ib.isConnected():
+        return 0
+    _ib_refresh_open_orders(ib)
+    tracked_perm_ids = set()
+    for bracket in positions or []:
+        for key in ("entry", "stopLoss", "takeProfit"):
+            order = bracket.get(key)
+            if order and getattr(order, "permId", 0):
+                tracked_perm_ids.add(int(order.permId))
+
+    session_cid = _session_client_id(ib)
+    cancelled = 0
+    try:
+        es_open = [p for p in ib.positions() if p.contract.symbol == "ES" and p.position != 0]
+    except Exception as e:
+        logging.error("consolidate_duplicate_protective_orders: %s", e)
+        return 0
+
+    for pos in es_open:
+        direction = 1 if pos.position > 0 else -1
+        qty = abs(float(pos.position))
+        need_action = "SELL" if direction == 1 else "BUY"
+        cid = pos.contract.conId
+        ref_stop_px = _reference_stop_px_for_position(positions, pos)
+
+        stops, limits, dead = [], [], []
+        for trade in ib.trades():
+            if trade.contract.conId != cid:
+                continue
+            order = trade.order
+            if getattr(order, "action", "") != need_action:
+                continue
+            try:
+                tq = abs(float(getattr(order, "totalQuantity", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if abs(tq - qty) > 1e-9:
+                continue
+            st = (getattr(trade.orderStatus, "status", None) or "").strip()
+            if st in _IB_TERMINAL_BLOTTER:
+                continue
+            if st in ("Inactive", "PendingCancel"):
+                dead.append(trade)
+                continue
+            if _order_looks_like_protective_stop(order):
+                stops.append(trade)
+            elif (
+                str(getattr(order, "orderType", "") or "").upper() in ("LMT", "LIMIT")
+                or float(getattr(order, "lmtPrice", 0) or 0) > 0
+            ):
+                limits.append(trade)
+
+        for trade in dead:
+            if _order_belongs_to_session(ib, trade.order):
+                _cancel_order_quiet(ib, trade.order)
+                cancelled += 1
+
+        for bucket, is_stop in ((stops, True), (limits, False)):
+            if len(bucket) <= 1:
+                continue
+            ranked = sorted(
+                bucket,
+                key=lambda t: _exit_leg_rank(
+                    t, tracked_perm_ids, session_cid, is_stop, ib, ref_stop_px if is_stop else 0.0,
+                ),
+                reverse=True,
+            )
+            keeper = ranked[0]
+            kperm = getattr(keeper.order, "permId", 0)
+            kpx = _stop_trigger_price(keeper.order, None) if is_stop else getattr(keeper.order, "lmtPrice", 0)
+            for trade in ranked[1:]:
+                if not _order_belongs_to_session(ib, trade.order):
+                    continue
+                if getattr(trade.order, "permId", 0) == kperm:
+                    continue
+                perm = getattr(trade.order, "permId", 0)
+                logging.info(
+                    "Consolidate: cancelling duplicate %s permId=%s (keeping permId=%s @ %s)",
+                    "stop" if is_stop else "TP",
+                    perm,
+                    kperm,
+                    kpx,
+                )
+                _cancel_order_quiet(ib, trade.order)
+                cancelled += 1
+
+        session_stops = [t for t in stops if _order_belongs_to_session(ib, t.order)]
+        foreign_stops = [t for t in stops if not _order_belongs_to_session(ib, t.order)]
+        if len(session_stops) > 1 and foreign_stops:
+            logging.info(
+                "%s: keeping foreign stop clientId(s) %s; cancelled %s duplicate session leg(s)",
+                getattr(pos.contract, "localSymbol", "ES"),
+                sorted({getattr(t.order, "clientId", "?") for t in foreign_stops}),
+                max(0, len(session_stops) - 1),
+            )
+
+    if cancelled and live_tracker:
+        add_to_live_tracker(
+            live_tracker,
+            "info",
+            f"Consolidated protective orders: cancelled {cancelled} duplicate leg(s)",
+        )
+    if cancelled:
+        ib.sleep(0.3)
+    return cancelled
+
+
+def _find_protective_stop_trade_for_position(ib, pos):
+    """Best stop trade for this ES exposure (armed preferred, then oldest permId)."""
+    qty = abs(pos.position)
+    direction = 1 if pos.position > 0 else -1
+    need_action = "SELL" if direction == 1 else "BUY"
+    cid = pos.contract.conId
+    candidates = []
+    for trade in ib.trades():
+        if trade.contract.conId != cid:
+            continue
+        if not _order_looks_like_protective_stop(trade.order):
+            continue
+        order = trade.order
+        if getattr(order, "action", "") != need_action:
+            continue
+        try:
+            tq = abs(float(getattr(order, "totalQuantity", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if tq != qty:
+            continue
+        st = (getattr(trade.orderStatus, "status", None) or "").strip()
+        if st in _IB_TERMINAL_BLOTTER or st in ("Inactive", "PendingCancel"):
+            continue
+        if stop_order_is_armed(trade) or stop_order_is_pending(trade):
+            candidates.append(trade)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _rank(t):
+        score = 0
+        if stop_order_is_armed(t):
+            score += 1000
+        perm = int(getattr(t.order, "permId", 0) or 0)
+        if perm > 0:
+            score += max(0, 500 - perm // 10_000_000)
+        return score
+
+    return max(candidates, key=_rank)
+
+
+def _ensure_strategy_indicators(strategy, data) -> None:
+    """Indicators required by setup_position (atr, etc.) may be missing before first bar."""
+    if data is None or data.empty or strategy is None:
+        return
+    if "atr" in data.columns and not pd.isna(data["atr"].iloc[-1]):
+        return
+    try:
+        from core.monitoring import update_indicators
+        update_indicators(strategy, data)
+    except Exception as e:
+        logging.warning("Could not compute indicators for protection: %s", e)
+
+
+def _try_promote_pending_stop_for_position(ib, pos, positions, live_tracker=None) -> bool:
+    """Promote PreSubmitted stop on IB to standalone Submitted without duplicating legs."""
+    trade = _find_protective_stop_trade_for_position(ib, pos)
+    if trade is None or stop_order_is_armed(trade):
+        return bool(trade and stop_order_is_armed(trade))
+    if not _order_belongs_to_session(ib, trade.order):
+        return adopt_ib_protection_for_position(ib, positions, pos, live_tracker=live_tracker)
+
+    direction = 1 if pos.position > 0 else -1
+    qty = abs(pos.position)
+    con_id = pos.contract.conId
+    stop_order = trade.order
+    oca_group = getattr(stop_order, "ocaGroup", None) or None
+    tp_order = None
+    need_action = "SELL" if direction == 1 else "BUY"
+    for t in ib.trades():
+        if t.contract.conId != con_id:
+            continue
+        o = t.order
+        ot = str(getattr(o, "orderType", "") or "").upper()
+        if ot not in ("LMT", "LIMIT"):
+            continue
+        if getattr(o, "action", "") != need_action:
+            continue
+        try:
+            tq = abs(float(getattr(o, "totalQuantity", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if tq != qty:
+            continue
+        st = (getattr(t.orderStatus, "status", None) or "").strip()
+        if st in _IB_TERMINAL_BLOTTER or st in ("Inactive", "PendingCancel"):
+            continue
+        if oca_group and getattr(o, "ocaGroup", None) == oca_group:
+            tp_order = o
+            break
+
+    stop_px = _stop_trigger_price(stop_order, None)
+    bracket = {
+        "stopLoss": stop_order,
+        "takeProfit": tp_order,
+        "direction": direction,
+        "ocaGroup": oca_group,
+        "contract": pos.contract,
+        "entry_stop_price": stop_px,
+        "entry_tp_price": getattr(tp_order, "lmtPrice", None) if tp_order else None,
+    }
+    if promote_bracket_stop_to_standalone(ib, pos.contract, bracket, live_tracker=live_tracker):
+        if not _bracket_already_tracked(positions, direction, qty, con_id):
+            positions.append({
+                "entry": MarketOrder(
+                    action="BUY" if direction == 1 else "SELL", totalQuantity=qty, tif="GTC",
+                ),
+                "stopLoss": bracket["stopLoss"],
+                "takeProfit": bracket.get("takeProfit"),
+                "direction": direction,
+                "position_dict": {"direction": direction, "stop": stop_px},
+                "entry_time": datetime.now(),
+                "entry_price": float(getattr(pos, "avgCost", 0) or 0) / 50.0,
+                "entry_stop_price": stop_px,
+                "entry_tp_price": bracket.get("entry_tp_price"),
+                "contract": pos.contract,
+                "ocaGroup": oca_group,
+                "open_notified": True,
+                "restored_from_ib": True,
+            })
+        return True
+    return False
+
+
 def es_position_has_protective_exit_orders(ib, pos, refresh: bool = True) -> bool:
-    """True if a working stop matches this ES exposure (used after restart when brackets are not in memory)."""
+    """True if an **armed** (Submitted) stop matches this ES exposure."""
     if refresh:
         _ib_refresh_open_orders(ib)
     qty = abs(pos.position)
@@ -157,11 +891,9 @@ def es_position_has_protective_exit_orders(ib, pos, refresh: bool = True) -> boo
     need_action = "SELL" if direction == 1 else "BUY"
     cid = pos.contract.conId
     for trade in ib.trades():
-        if trade.contract.conId != cid or not _trade_non_terminal(trade):
+        if trade.contract.conId != cid or not _trade_has_working_protective_stop(trade):
             continue
         order = trade.order
-        if not _order_looks_like_protective_stop(order):
-            continue
         if getattr(order, "action", "") != need_action:
             continue
         try:
@@ -172,6 +904,281 @@ def es_position_has_protective_exit_orders(ib, pos, refresh: bool = True) -> boo
             continue
         return True
     return False
+
+
+def es_position_has_acceptable_stop(ib, pos, refresh: bool = True, session_only: bool = False) -> bool:
+    """
+    True when the position has a protective stop that is good enough to skip re-protect.
+
+    By default checks **all** API clientIds on the account (critical after reconnect when
+    clientId rotates). Armed (Submitted) or PreSubmitted/trigger both count.
+    """
+    if es_position_has_protective_exit_orders(ib, pos, refresh=refresh):
+        return True
+    if refresh:
+        _ib_refresh_open_orders(ib)
+    trade = _find_protective_stop_trade_for_position(ib, pos)
+    if trade is None or not stop_order_is_pending(trade):
+        return False
+    if session_only and not _order_belongs_to_session(ib, trade.order):
+        return False
+    return True
+
+
+def adopt_ib_protection_for_position(
+    ib, positions, pos, strategy=None, data=None, live_tracker=None,
+) -> bool:
+    """
+    Bind in-memory bracket to existing IB protective orders (any clientId).
+    Never places new orders — used after reconnect / clientId change.
+    """
+    if pos.position == 0:
+        return False
+    direction = 1 if pos.position > 0 else -1
+    qty = abs(int(pos.position))
+    con_id = pos.contract.conId
+    if _bracket_already_tracked(positions, direction, qty, con_id):
+        _sync_positions_stop_handles_from_ib(ib, positions, pos)
+        return True
+
+    stop_trade = _find_protective_stop_trade_for_position(ib, pos)
+    if stop_trade is None:
+        return False
+
+    need_exit_action = "SELL" if direction == 1 else "BUY"
+    stop_order = stop_trade.order
+    tp_order = None
+    oca_group = getattr(stop_order, "ocaGroup", None) or None
+
+    for trade in ib.trades():
+        if trade.contract.conId != con_id:
+            continue
+        order = trade.order
+        if getattr(order, "action", "") != need_exit_action:
+            continue
+        try:
+            tq = abs(int(getattr(order, "totalQuantity", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if tq != qty:
+            continue
+        ot = str(getattr(order, "orderType", "") or "").upper()
+        if ot in ("LMT", "LIMIT"):
+            st = (getattr(trade.orderStatus, "status", None) or "").strip()
+            if st not in _IB_TERMINAL_BLOTTER and st not in ("Inactive", "PendingCancel"):
+                tp_order = order
+                oca_group = getattr(order, "ocaGroup", None) or oca_group
+
+    try:
+        entry_price = float(getattr(pos, "avgCost", 0) or 0) / 50.0
+    except (TypeError, ValueError):
+        entry_price = 0.0
+    if entry_price <= 0 and data is not None and not data.empty:
+        entry_price = float(data["close"].iloc[-1])
+
+    stop_px = _stop_trigger_price(stop_order, None)
+    sym = getattr(pos.contract, "localSymbol", "ES")
+    cid = getattr(stop_order, "clientId", "?")
+    ost = getattr(stop_trade.orderStatus, "status", "?")
+
+    positions.append({
+        "entry": MarketOrder(
+            action="BUY" if direction == 1 else "SELL", totalQuantity=qty, tif="GTC",
+        ),
+        "stopLoss": stop_order,
+        "takeProfit": tp_order,
+        "direction": direction,
+        "position_dict": {"direction": direction, "stop": stop_px},
+        "entry_time": datetime.now(),
+        "entry_price": entry_price,
+        "entry_stop_price": stop_px,
+        "entry_tp_price": getattr(tp_order, "lmtPrice", None) if tp_order else None,
+        "contract": pos.contract,
+        "ocaGroup": oca_group,
+        "open_notified": True,
+        "restored_from_ib": True,
+        "adopted_foreign_client": not _order_belongs_to_session(ib, stop_order),
+    })
+    logging.info(
+        "Adopted IB protection for %s %s @ %s (SL %.2f clientId=%s status=%s) — no new orders",
+        "LONG" if direction == 1 else "SHORT",
+        qty,
+        sym,
+        stop_px,
+        cid,
+        ost,
+    )
+    if live_tracker:
+        add_to_live_tracker(
+            live_tracker,
+            "info",
+            f"Adopted existing stop @ ${stop_px:,.2f} on {sym} (clientId {cid})",
+        )
+    return True
+
+
+def _sync_positions_stop_handles_from_ib(ib, positions, pos) -> None:
+    """Refresh tracked bracket stopLoss when IB still has a live pending/armed stop."""
+    trade = _find_protective_stop_trade_for_position(ib, pos)
+    if not trade:
+        return
+    direction = 1 if pos.position > 0 else -1
+    for bracket in positions or []:
+        if bracket.get("direction") != direction:
+            continue
+        bc = bracket.get("contract")
+        if bc is not None and getattr(bc, "conId", None) not in (None, pos.contract.conId):
+            continue
+        bracket["stopLoss"] = trade.order
+        px = _stop_trigger_price(trade.order, bracket)
+        if px > 0:
+            bracket["entry_stop_price"] = px
+        break
+
+
+def _bracket_already_tracked(positions, direction: int, qty: int, con_id: int) -> bool:
+    for bracket in positions:
+        if bracket.get('direction') != direction:
+            continue
+        bc = bracket.get('contract')
+        if bc is not None and getattr(bc, 'conId', None) not in (None, con_id):
+            continue
+        bracket_qty = 0
+        for k in ('stopLoss', 'entry', 'takeProfit'):
+            order = bracket.get(k)
+            if order is not None and hasattr(order, 'totalQuantity'):
+                bracket_qty = abs(int(order.totalQuantity or 0))
+                break
+        if bracket_qty == qty:
+            return True
+    return False
+
+
+def restore_tracked_brackets_from_ib(ib, contract, positions, strategy, data, live_tracker=None) -> int:
+    """
+    After restart, rebuild in-memory bracket tracking from IB open orders + position.
+    Without this, protect/exit logic sees an empty positions list despite live risk on IB.
+    """
+    if not ib.isConnected():
+        return 0
+    _ib_refresh_open_orders(ib)
+    restored = 0
+    try:
+        es_positions = [p for p in ib.positions() if p.contract.symbol == 'ES' and p.position != 0]
+    except Exception as e:
+        logging.error("restore_tracked_brackets_from_ib: positions fetch failed: %s", e)
+        return 0
+
+    for pos in es_positions:
+        direction = 1 if pos.position > 0 else -1
+        qty = abs(int(pos.position))
+        con_id = pos.contract.conId
+        if _bracket_already_tracked(positions, direction, qty, con_id):
+            continue
+        stop_trade = _find_protective_stop_trade_for_position(ib, pos)
+        if stop_trade is None:
+            continue
+
+        need_exit_action = 'SELL' if direction == 1 else 'BUY'
+        stop_order = None
+        tp_order = None
+        entry_order = None
+        entry_price = None
+        entry_time = None
+        oca_group = None
+
+        stop_order = stop_trade.order
+        oca_group = getattr(stop_order, 'ocaGroup', None) or oca_group
+
+        for trade in ib.trades():
+            if trade.contract.conId != con_id:
+                continue
+            order = trade.order
+            action = str(getattr(order, 'action', '') or '')
+            try:
+                tq = abs(int(getattr(order, 'totalQuantity', 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if tq != qty:
+                continue
+            ot = str(getattr(order, 'orderType', '') or '').upper()
+            if ot in ('LMT', 'LIMIT') and action == need_exit_action:
+                st = (getattr(trade.orderStatus, 'status', None) or '').strip()
+                if st not in _IB_TERMINAL_BLOTTER and st not in ('Inactive', 'PendingCancel'):
+                    tp_order = order
+                    oca_group = getattr(order, 'ocaGroup', None) or oca_group
+            elif ot == 'MKT' and trade.filled() and action == ('BUY' if direction == 1 else 'SELL'):
+                entry_order = order
+                if trade.fills:
+                    entry_price = float(trade.fills[0].execution.price)
+                    ft = trade.fills[0].execution.time or trade.fills[0].time
+                    if ft:
+                        entry_time = ft.replace(tzinfo=None) if getattr(ft, 'tzinfo', None) else ft
+
+        if stop_order is None:
+            continue
+
+        if entry_price is None:
+            try:
+                entry_price = float(getattr(pos, 'avgCost', 0) or 0) / 50.0
+            except (TypeError, ValueError):
+                entry_price = 0.0
+        if entry_price <= 0 and data is not None and not data.empty:
+            entry_price = float(data['close'].iloc[-1])
+
+        if entry_order is None:
+            entry_order = MarketOrder(
+                action='BUY' if direction == 1 else 'SELL',
+                totalQuantity=qty,
+                tif='GTC',
+            )
+
+        position_dict = {}
+        if strategy is not None and data is not None and not data.empty:
+            try:
+                _ensure_strategy_indicators(strategy, data)
+                position_dict = strategy.setup_position(
+                    entry_price, direction, data.iloc[-1], data
+                )
+            except Exception:
+                position_dict = {}
+
+        stop_px = getattr(stop_order, 'stopPrice', None) or getattr(stop_order, 'auxPrice', None)
+        tp_px = getattr(tp_order, 'lmtPrice', None) if tp_order is not None else None
+
+        positions.append({
+            'entry': entry_order,
+            'stopLoss': stop_order,
+            'takeProfit': tp_order,
+            'direction': direction,
+            'position_dict': position_dict,
+            'entry_time': entry_time or datetime.now(),
+            'entry_price': entry_price,
+            'entry_stop_price': stop_px,
+            'entry_tp_price': tp_px,
+            'contract': pos.contract,
+            'ocaGroup': oca_group,
+            'open_notified': True,
+            'restored_from_ib': True,
+        })
+        restored += 1
+        sym = getattr(pos.contract, 'localSymbol', 'ES')
+        logging.info(
+            "Restored in-memory bracket from IB: %s %s @ %s (SL %s%s)",
+            'LONG' if direction == 1 else 'SHORT',
+            qty,
+            sym,
+            stop_px,
+            f", TP {tp_px}" if tp_px else "",
+        )
+        if live_tracker:
+            add_to_live_tracker(
+                live_tracker,
+                'info',
+                f"Restored tracked bracket for {qty} {sym} from IB orders",
+            )
+
+    return restored
 
 
 def _open_position_on_contract(ib, con_id):
@@ -278,11 +1285,8 @@ def cleanup_orphaned_orders(ib, contract, positions):
 
             open_pos = _open_position_on_contract(ib, trade.contract.conId)
             if open_pos is not None and _order_likely_bracket_exit_leg(trade.order, open_pos):
-                logging.info(
-                    f"Skipping orphan cancel: {trade.order.orderType} perm={perm_id} "
-                    f"parentId={parent_id} (open {trade.contract.localSymbol} — likely pre-restart bracket leg)"
-                )
-                continue
+                if perm_id in tracked_perm_ids:
+                    continue
 
             # If no tracking match found, it's an orphan
             orphaned.append(trade)
@@ -296,7 +1300,37 @@ def cleanup_orphaned_orders(ib, contract, positions):
         except Exception as e:
             logging.warning(f"Error cancelling orphaned order: {e}")
 
-    cancel_residual_orders_when_flat_on_contract(ib, contract, None)
+    cancel_residual_orders_when_flat_on_contract(ib, contract, None, positions=positions)
+
+
+def ensure_bracket_protective_stop(ib, contract, bracket, strategy, data, positions, live_tracker=None):
+    """After entry fill: arm stop (Submitted) or re-place if missing."""
+    if not ib.isConnected() or bracket is None or data is None or data.empty:
+        return
+    bc = bracket.get("contract") or contract
+    if bc is None:
+        return
+    try:
+        open_pos = [
+            p for p in ib.positions()
+            if p.contract.conId == bc.conId and abs(float(p.position)) > 1e-9
+        ]
+    except Exception as e:
+        logging.error("ensure_bracket_protective_stop: positions fetch failed: %s", e)
+        return
+    if not open_pos:
+        return
+    pos = open_pos[0]
+    if ensure_bracket_stop_armed(ib, bc, bracket, live_tracker):
+        return
+    if es_position_has_acceptable_stop(ib, pos, refresh=True):
+        _sync_positions_stop_handles_from_ib(ib, positions, pos)
+        return
+    logging.warning(
+        "Missing broker stop after entry on %s — re-protecting from bracket snapshot",
+        getattr(bc, "localSymbol", bc),
+    )
+    protect_existing_positions(ib, bc, positions, strategy, data, live_tracker)
 
 
 def close_orphaned_positions(ib, contract, positions, live_tracker=None, completed_trades=None, data=None):
@@ -328,7 +1362,7 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None, complet
                 break
 
         if not is_tracked:
-            if es_position_has_protective_exit_orders(ib, pos, refresh=False):
+            if es_position_has_acceptable_stop(ib, pos, refresh=False):
                 logging.info(
                     f"Skipping orphan close: {pos.position} {pos.contract.localSymbol} has working protective "
                     f"orders on IB but no in-memory bracket (restart). Leaving position intact."
@@ -380,6 +1414,8 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
     if contract is None or data is None or data.empty:
         return
 
+    _ensure_strategy_indicators(strategy, data)
+
     # Look for ALL ES positions to ensure legacy ones stay protected during roll
     try:
         es_pos_list = [p for p in ib.positions() if p.contract.symbol == 'ES']
@@ -396,10 +1432,26 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
         qty = abs(pos.position)
         direction = 1 if pos.position > 0 else -1
 
-        if es_position_has_protective_exit_orders(ib, pos, refresh=False):
+        if es_position_has_acceptable_stop(ib, pos, refresh=False):
+            adopt_ib_protection_for_position(
+                ib, positions, pos, strategy=strategy, data=data, live_tracker=live_tracker,
+            )
+            _sync_positions_stop_handles_from_ib(ib, positions, pos)
             continue
 
-        logging.warning(f"UNPROTECTED POSITION: {qty} {pos.contract.localSymbol} contracts. Adding stop loss...")
+        if not _reprotect_throttle_ok(pos.contract.conId, direction):
+            logging.debug(
+                "Re-protect throttled for %s (%.0fs cooldown)",
+                pos.contract.localSymbol,
+                _REPROTECT_MIN_INTERVAL_SEC,
+            )
+            continue
+
+        logging.warning(
+            "UNPROTECTED POSITION: %s %s contracts — no stop on IB; placing protective stop",
+            qty,
+            pos.contract.localSymbol,
+        )
             
         # baseline for SL: Use position's avgCost if it's a legacy contract, 
         # otherwise use current market price.
@@ -414,8 +1466,10 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
             logging.error(f"Cannot recreate stop: Invalid stop price calculated.")
             continue
 
-        # Clamp stop loss to ensure validity against current market price
-        calc_stop = float(pos_dict['stop'])
+        tracked_stop_px = _reference_stop_px_for_position(positions, pos)
+        calc_stop = float(
+            tracked_stop_px if tracked_stop_px > 0 else pos_dict["stop"]
+        )
         curr_px = float(data['close'].iloc[-1])
         if direction == 1:
             valid_stop = min(calc_stop, curr_px - 0.25)
@@ -427,10 +1481,15 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
             action='SELL' if direction == 1 else 'BUY',
             totalQuantity=qty,
             stopPrice=round(valid_stop * 4) / 4,
-            ocaGroup=oca_group, ocaType=1,
-            tif='GTC', transmit=True
+            tif='GTC',
+            transmit=True,
+            parentId=0,
         )
         
+        if not trading_orders_allowed():
+            log_placement_blocked(f"re-protect {pos.contract.localSymbol}")
+            continue
+
         # Place on the SPECIFIC contract of the position (March or June)
         try:
             # Ensure exchange is set for validation
@@ -438,15 +1497,22 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
             ib.placeOrder(pos.contract, stop_order)
             sl_px = getattr(stop_order, "stopPrice", None) or getattr(stop_order, "auxPrice", None)
             logging.info(f"Re-protected {pos.contract.localSymbol} at SL: {sl_px}")
-            
-            # Update internal tracking
-            positions.append({
+
+            new_bracket = {
                 'entry': MarketOrder(action='BUY' if direction == 1 else 'SELL', totalQuantity=qty),
                 'stopLoss': stop_order, 'takeProfit': None,
                 'direction': direction, 'position_dict': pos_dict,
                 'entry_time': datetime.now(), 'entry_price': avg_cost,
-                'contract': pos.contract # Store the specific contract
-            })
+                'contract': pos.contract,
+                'entry_stop_price': sl_px,
+                'open_notified': True,
+            }
+            positions.append(new_bracket)
+            if not ensure_bracket_stop_armed(ib, pos.contract, new_bracket, live_tracker):
+                logging.warning(
+                    "Re-protect stop placed but not yet Submitted on %s @ %s",
+                    pos.contract.localSymbol, sl_px,
+                )
             if live_tracker:
                 add_to_live_tracker(live_tracker, 'warning',
                     f"Added protective stop for {pos.contract.localSymbol} at ${float(sl_px):,.2f}")
@@ -454,10 +1520,12 @@ def protect_existing_positions(ib, contract, positions, strategy, data, live_tra
             logging.error(f"Failed to place protective order for legacy contract: {e}")
 
 
-def enforce_stop_invariant(ib, positions, strategy, data, live_tracker=None):
+def enforce_stop_invariant(ib, positions, strategy, data, live_tracker=None, contract=None):
     """
-    Hard safety invariant:
-    Every open ES position must have at least one active stop order on the same contract/side/qty.
+    Hard safety invariant: every open ES position must have a protective stop on IB.
+
+    Submitted stops are ideal; session PreSubmitted/trigger stops are accepted (paper IB
+    often never arms bracket children). Re-protect only when no stop exists at all.
     """
     if not ib.isConnected() or data is None or data.empty:
         return
@@ -474,12 +1542,27 @@ def enforce_stop_invariant(ib, positions, strategy, data, live_tracker=None):
 
     for pos in es_open:
         qty = abs(pos.position)
+        if es_position_has_acceptable_stop(ib, pos, refresh=False):
+            adopt_ib_protection_for_position(
+                ib, positions, pos, strategy=strategy, data=data, live_tracker=live_tracker,
+            )
+            _sync_positions_stop_handles_from_ib(ib, positions, pos)
+            continue
+
         direction = 1 if pos.position > 0 else -1
-        if es_position_has_protective_exit_orders(ib, pos, refresh=False):
+        if not _reprotect_throttle_ok(pos.contract.conId, direction):
+            logging.warning(
+                "STOP INVARIANT: %s %s has no stop but re-protect throttled (%.0fs)",
+                qty,
+                pos.contract.localSymbol,
+                _REPROTECT_MIN_INTERVAL_SEC,
+            )
             continue
 
         logging.error(
-            f"STOP INVARIANT BREACH: {qty} {pos.contract.localSymbol} has no active stop. Re-protecting now."
+            "STOP INVARIANT BREACH: %s %s has no protective stop on IB. Re-protecting now.",
+            qty,
+            pos.contract.localSymbol,
         )
         protect_existing_positions(ib, pos.contract, positions, strategy, data, live_tracker=live_tracker)
 
@@ -570,6 +1653,10 @@ def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_t
                 action=tp_action, totalQuantity=qty, lmtPrice=tp,
                 tif='GTC', ocaGroup=oca_group, ocaType=1, transmit=True
             )
+
+            if not trading_orders_allowed():
+                log_placement_blocked("TP recreate")
+                continue
 
             logging.info(f"Recreating TP order: {tp_action} {qty} @ {tp:.2f}")
             tp_trade = ib.placeOrder(contract, new_tp_order)
@@ -678,9 +1765,31 @@ def reconcile_positions(ib, contract, positions, live_tracker=None,
     except Exception as e:
         logging.error(f"Error in reconcile_positions: {e}")
 
+    # Positions on IB with no in-memory bracket (common after gateway outage / clientId change)
+    try:
+        actual_es_pos = [p for p in ib.positions() if p.contract.symbol == "ES" and p.position != 0]
+        for pos in actual_es_pos:
+            direction = 1 if pos.position > 0 else -1
+            qty = abs(int(pos.position))
+            if _bracket_already_tracked(positions, direction, qty, pos.contract.conId):
+                continue
+            if adopt_ib_protection_for_position(
+                ib, positions, pos, strategy=strategy, data=data, live_tracker=live_tracker,
+            ):
+                continue
+            logging.warning(
+                "IB position %s %s @ %s not tracked and no protective orders to adopt",
+                "LONG" if direction == 1 else "SHORT",
+                qty,
+                getattr(pos.contract, "localSymbol", "ES"),
+            )
+    except Exception as e:
+        logging.error("reconcile_positions adopt pass failed: %s", e)
 
-async def periodic_protection_check(ib, contract, positions, strategy, data, live_tracker=None, 
-                                 send_email_fn=None, close_all_fn=None, completed_trades=None):
+
+async def periodic_protection_check(ib, contract, positions, strategy, data, live_tracker=None,
+                                 send_email_fn=None, close_all_fn=None, completed_trades=None,
+                                 expected_client_id: int = 100, dashboard_state=None):
     """Every-20s async task: maintenance -> cleanup -> protect -> stop invariant -> recreate TP."""
     from core.execution import prune_dead_brackets
 
@@ -728,26 +1837,82 @@ async def periodic_protection_check(ib, contract, positions, strategy, data, liv
                 except Exception as e:
                     logging.error(f"Error checking maintenance in periodic loop: {e}")
 
-            # --- 2. Standard Protection Checks ---
+            # --- 2. Standard Protection Checks (adopt before place) ---
+            run_client_id_integrity_check(
+                ib,
+                expected_client_id,
+                contract,
+                send_email_fn=send_email_fn,
+                live_tracker=live_tracker,
+                dashboard_state=dashboard_state,
+                label="periodic",
+            )
+            try:
+                for pos in [p for p in ib.positions() if p.contract.symbol == "ES" and p.position != 0]:
+                    adopt_ib_protection_for_position(
+                        ib, positions, pos, strategy=strategy, data=data, live_tracker=live_tracker,
+                    )
+            except Exception as e:
+                logging.error("Periodic adopt pass failed: %s", e)
+            consolidate_duplicate_protective_orders(ib, contract, positions, live_tracker)
             cleanup_orphaned_orders(ib, contract, positions)
             close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
             protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
-            enforce_stop_invariant(ib, positions, strategy, data, live_tracker)
             check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
+            enforce_stop_invariant(ib, positions, strategy, data, live_tracker, contract=contract)
         except Exception as e:
             logging.error(f"Error in periodic protection check: {e}")
 
 
-def run_reconnection_safety_sequence(ib, contract, positions, strategy, data, live_tracker=None, completed_trades=None):
-    """Post-reconnection safety: reconcile -> cleanup -> close orphans -> protect -> recreate TP."""
+def run_reconnection_safety_sequence(
+    ib,
+    contract,
+    positions,
+    strategy,
+    data,
+    live_tracker=None,
+    completed_trades=None,
+    expected_client_id: int = 100,
+    send_email_fn=None,
+    dashboard_state=None,
+):
+    """Post-reconnection: adopt existing IB protection before placing anything new."""
     logging.info("Running post-reconnection safety sequence...")
-    # 0. Sync internal state with reality (THE STABILITY FIX)
-    reconcile_positions(ib, contract, positions, live_tracker, strategy=strategy)
-    
-    # 1. Standard safety checks
+    _ib_refresh_open_orders(ib)
+    if not run_client_id_integrity_check(
+        ib,
+        expected_client_id,
+        contract,
+        send_email_fn=send_email_fn,
+        live_tracker=live_tracker,
+        dashboard_state=dashboard_state,
+        label="reconnect",
+    ):
+        logging.critical(
+            "Post-reconnect: new order placement halted until only clientId %s has ES orders",
+            expected_client_id,
+        )
+    reconcile_positions(
+        ib, contract, positions, live_tracker, strategy=strategy, data=data,
+    )
+    n = restore_tracked_brackets_from_ib(ib, contract, positions, strategy, data, live_tracker)
+    if n:
+        logging.info("Post-reconnect: restored %s bracket(s) from IB", n)
+    try:
+        for pos in [p for p in ib.positions() if p.contract.symbol == "ES" and p.position != 0]:
+            adopt_ib_protection_for_position(
+                ib, positions, pos, strategy=strategy, data=data, live_tracker=live_tracker,
+            )
+    except Exception as e:
+        logging.error("Post-reconnect adopt pass failed: %s", e)
+
+    n_consolidated = consolidate_duplicate_protective_orders(ib, contract, positions, live_tracker)
+    if n_consolidated:
+        logging.info("Post-reconnect: cancelled %s duplicate protective order(s)", n_consolidated)
+
     cleanup_orphaned_orders(ib, contract, positions)
     close_orphaned_positions(ib, contract, positions, live_tracker, completed_trades, data)
     protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
-    enforce_stop_invariant(ib, positions, strategy, data, live_tracker)
     check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
+    enforce_stop_invariant(ib, positions, strategy, data, live_tracker, contract=contract)
     logging.info("Safety sequence complete")

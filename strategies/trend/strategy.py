@@ -615,8 +615,17 @@ class TrendStrategy(Strategy):
         
         tp_price = None
         if self.tp_mult_atr > 0:
-            atr = row.atr if hasattr(row, 'atr') else row['atr']
-            if not pd.isna(atr) and atr > 0:
+            atr = None
+            if isinstance(row, pd.Series):
+                atr = row.get("atr")
+            elif hasattr(row, "atr"):
+                atr = getattr(row, "atr", None)
+            else:
+                try:
+                    atr = row["atr"]
+                except (KeyError, TypeError):
+                    atr = None
+            if atr is not None and not pd.isna(atr) and atr > 0:
                 if direction == 1:
                     tp_price = entry_price + (atr * self.tp_mult_atr)
                 else:

@@ -11,6 +11,16 @@ from datetime import datetime, timedelta, date
 import pytz
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
+from tools.dashboard.debug import (
+    append_perf_record,
+    client_debug_script_block,
+    dashboard_debug_enabled,
+    health_sidecar_path,
+    log_dashboard_write,
+    next_write_seq,
+    timed_section,
+)
+
 if TYPE_CHECKING:
     from tools.safety.guards import SecurityGuard
 
@@ -97,6 +107,7 @@ class DashboardState:
     # Account & Market Data
     account_info: Dict[str, Any] = field(default_factory=dict)
     positions: List[Dict[str, Any]] = field(default_factory=list)
+    open_brackets: List[Dict[str, Any]] = field(default_factory=list)
     active_orders: List[Dict[str, Any]] = field(default_factory=list)
     completed_trades: List[Dict[str, Any]] = field(default_factory=list)
     
@@ -118,12 +129,21 @@ class DashboardState:
     error_log: List[Dict[str, Any]] = field(default_factory=list)
     live_tracker: List[Dict[str, Any]] = field(default_factory=list)
     bar_log: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Set True after trade open/close so the next UI cycle forces a full HTML refresh.
+    request_full_refresh: bool = False
     
     # Parameters
     params: Dict[str, Any] = field(default_factory=dict)
 
     # Populated after startup: blocks `check_entries` when daily emergency flatten latched.
     security_guard: Optional["SecurityGuard"] = None
+
+    # Single clientId policy (core.client_id_guard)
+    client_id_trading_halted: bool = False
+    client_id_expected: int = 0
+    client_id_active_on_account: List[int] = field(default_factory=list)
+    client_id_violation_detail: str = ""
 
     # Live chart (OHLC + Donchian + optional SL/TP overlay); built in main / update_ui
     chart_payload: Optional[Dict[str, Any]] = None
@@ -200,6 +220,35 @@ def dashboard_timeframe_minutes(params: Optional[Dict[str, Any]]) -> int:
         except (TypeError, ValueError):
             continue
     return 1
+
+
+def build_chart_payload_with_indicators(
+    df: Any,
+    strategy: Any,
+    max_bars: int = 480,
+    timeframe_mins: int = 1,
+    completed_trades: Optional[List[Dict[str, Any]]] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Refresh strategy indicators on a bar snapshot, then serialize for Plotly."""
+    if pd is None or df is None or getattr(df, 'empty', True):
+        return None
+    work = df
+    if strategy is not None:
+        try:
+            work = df.copy()
+            from core.monitoring import update_indicators
+
+            update_indicators(strategy, work)
+        except Exception:
+            logging.debug(
+                'build_chart_payload_with_indicators: indicator refresh failed',
+                exc_info=True,
+            )
+            work = df
+    return build_chart_payload_from_df(
+        work, max_bars, timeframe_mins, completed_trades, params
+    )
 
 
 def build_chart_payload_from_df(
@@ -313,7 +362,10 @@ def build_chart_payload_from_df(
                 'exit_price': xp,
                 'direction': tr.get('direction', 'N/A'),
                 'reason': tr.get('reason', ''),
+                'live_exit_type': tr.get('live_exit_type', ''),
                 'pnl': jfloat(tr.get('pnl')),
+                'stop_at_open': jfloat(tr.get('stop_at_open')),
+                'tp_at_open': jfloat(tr.get('tp_at_open')),
                 'stop_at_close': jfloat(tr.get('stop_at_close')),
                 'tp_at_close': jfloat(tr.get('tp_at_close')),
             })
@@ -370,13 +422,75 @@ def _sanitize_json_for_browser(obj: Any) -> Any:
     return str(obj)
 
 
+def chart_payload_json_path(html_path: str) -> str:
+    """Sidecar JSON for live chart polling (no full HTML regen)."""
+    base, _ = os.path.splitext(html_path)
+    return f'{base}_chart.json'
+
+
+def export_chart_payload(state: DashboardState) -> Optional[Dict[str, Any]]:
+    """Chart dict for browser / sidecar JSON."""
+    if not state.chart_payload:
+        return None
+    merged = dict(state.chart_payload)
+    if state.trade_overlay:
+        merged['overlay'] = state.trade_overlay
+    return merged
+
+
+def write_chart_payload_json(
+    state: DashboardState,
+    json_path: str,
+    write_label: str = '',
+) -> int:
+    """Write chart-only JSON sidecar (~100KB). Fast path for 30s chart updates."""
+    import time as _time
+
+    t0 = _time.perf_counter()
+    merged = export_chart_payload(state)
+    if not merged:
+        logging.info('Dashboard chart JSON skipped [%s]: no payload', write_label or '?')
+        return 0
+    try:
+        safe = _sanitize_json_for_browser(merged)
+        chart_points = len(safe.get('times') or [])
+        seq = next_write_seq()
+        wrapper = {
+            'write_seq': seq,
+            'write_label': write_label,
+            'wall_ts': datetime.now(EASTERN).isoformat(),
+            'chart_points': chart_points,
+            'chart': safe,
+        }
+        content = json.dumps(wrapper, allow_nan=False)
+        _write_text_file_robust(json_path, content, encoding='utf-8')
+        ms = round((_time.perf_counter() - t0) * 1000, 1)
+        logging.info(
+            'Dashboard chart JSON #%s [%s] pts=%s bytes=%s write=%.0fms',
+            seq,
+            write_label or '?',
+            chart_points,
+            len(content),
+            ms,
+        )
+        append_perf_record({
+            'event': 'dashboard_chart_json',
+            'write_seq': seq,
+            'write_label': write_label,
+            'json_path': json_path,
+            'chart_points': chart_points,
+            'json_bytes': len(content),
+            'write_ms': ms,
+        })
+        return seq
+    except Exception as e:
+        logging.error('Dashboard chart JSON write failed [%s]: %s', write_label or '?', e, exc_info=True)
+        raise
+
+
 def _chart_json_for_page(state: DashboardState) -> str:
     """JSON for embedded chart (safe inside HTML)."""
-    merged = None
-    if state.chart_payload:
-        merged = dict(state.chart_payload)
-        if state.trade_overlay:
-            merged['overlay'] = state.trade_overlay
+    merged = export_chart_payload(state)
     if not merged:
         return "null"
     try:
@@ -386,6 +500,313 @@ def _chart_json_for_page(state: DashboardState) -> str:
     except (TypeError, ValueError) as e:
         logging.warning("chart JSON encode failed: %s", e)
         return "null"
+
+
+def tables_payload_json_path(html_path: str) -> str:
+    """Sidecar JSON for live table polling (positions, orders, trades, logs)."""
+    base, _ = os.path.splitext(html_path)
+    return f'{base}_tables.json'
+
+
+def render_positions_panel(state: DashboardState) -> str:
+    """HTML fragment for positions + open-bracket tables."""
+    html = ''
+    if state.positions:
+        html += """        <table>
+            <thead>
+                <tr>
+                    <th>Contract</th>
+                    <th>Pos</th>
+                    <th>Avg (pts)</th>
+                    <th>Mkt (pts)</th>
+                    <th>Mkt Value</th>
+                    <th>Unrealized</th>
+                    <th>Realized (line)</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        for pos in state.positions:
+            unrealized = float(pos.get('unrealizedPNL', 0) or 0)
+            realized = float(pos.get('realizedPNL', 0) or 0)
+            pnl_class = 'positive' if unrealized >= 0 else 'negative'
+            sym = pos.get('localSymbol') or pos.get('symbol', 'N/A')
+            avg_pts = float(pos.get('avgPrice', 0) or pos.get('avgCost', 0) or 0)
+            mkt_pts = float(pos.get('marketPrice', 0) or 0)
+            if mkt_pts <= 0:
+                mkt_pts = float(state.current_price or 0)
+            html += f"""                <tr>
+                    <td>{sym}</td>
+                    <td>{pos.get('position', 0)}</td>
+                    <td>${avg_pts:,.2f}</td>
+                    <td>${mkt_pts:,.2f}</td>
+                    <td>${float(pos.get('marketValue', 0) or 0):,.2f}</td>
+                    <td class="{pnl_class}">${unrealized:,.2f}</td>
+                    <td>${realized:,.2f}</td>
+                </tr>
+"""
+        html += """            </tbody>
+        </table>
+"""
+    else:
+        html += """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active positions</div>"""
+
+    if state.open_brackets:
+        html += """
+        <h3>Bot-tracked bracket</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Contract</th>
+                    <th>Dir</th>
+                    <th>Qty</th>
+                    <th>Entry Time</th>
+                    <th>Duration</th>
+                    <th>Entry</th>
+                    <th>Stop</th>
+                    <th>TP</th>
+                    <th>Mkt</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        for row in state.open_brackets:
+            html += f"""                <tr>
+                    <td>{row.get('localSymbol', 'N/A')}</td>
+                    <td>{row.get('direction', 'N/A')}</td>
+                    <td>{row.get('qty', '')}</td>
+                    <td>{row.get('entry_time', 'N/A')}</td>
+                    <td>{row.get('duration', 'N/A')}</td>
+                    <td>${float(row.get('entry_price') or 0):,.2f}</td>
+                    <td>${float(row.get('stop') or 0):,.2f}</td>
+                    <td>{'$' + format(float(row.get('take_profit') or 0), ',.2f') if row.get('take_profit') is not None else 'N/A'}</td>
+                    <td>${float(row.get('market_price') or 0):,.2f}</td>
+                </tr>
+"""
+        html += """            </tbody>
+        </table>
+"""
+    return html
+
+
+def render_orders_panel(state: DashboardState) -> str:
+    if not state.active_orders:
+        return """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active orders</div>"""
+    html = """        <div style="overflow-x:auto;">
+        <table>
+            <thead>
+                <tr>
+                    <th>Contract</th>
+                    <th>PermID</th>
+                    <th>Parent</th>
+                    <th>Order ID</th>
+                    <th>Type</th>
+                    <th>Action</th>
+                    <th>Size</th>
+                    <th>Lmt</th>
+                    <th>Stop</th>
+                    <th>Aux</th>
+                    <th>Trig*</th>
+                    <th>TIF</th>
+                    <th>Status</th>
+                    <th>Why held</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    for order in state.active_orders:
+        sym = html_lib.escape(str(order.get("localSymbol") or order.get("symbol") or "-"))
+        why = html_lib.escape(str(order.get("whyHeld") or ""))
+        html += f"""                <tr>
+                    <td>{sym}</td>
+                    <td>{order.get('permId') or '-'}</td>
+                    <td>{order.get('parentId') or '-'}</td>
+                    <td>{order.get('orderId') or '-'}</td>
+                    <td>{html_lib.escape(str(order.get('orderType') or ''))}</td>
+                    <td>{html_lib.escape(str(order.get('action') or ''))}</td>
+                    <td>{order.get('totalQuantity')}</td>
+                    <td>{_format_dashboard_order_price(order.get('lmtPrice'))}</td>
+                    <td>{_format_dashboard_order_price(order.get('stopPrice'))}</td>
+                    <td>{_format_dashboard_order_price(order.get('auxPrice'))}</td>
+                    <td>{_format_dashboard_order_price(order.get('triggerPrice'))}</td>
+                    <td>{html_lib.escape(str(order.get('tif') or ''))}</td>
+                    <td><span class="log-type INFO" style="width: auto; padding: 2px 8px;">{html_lib.escape(str(order.get('status') or ''))}</span></td>
+                    <td style="max-width:220px;font-size:0.85em">{why}</td>
+                </tr>
+"""
+    html += """            </tbody>
+        </table>
+        </div>
+        <p style="font-size:0.85em;color:#64748b;margin-top:6px">*Trig = first of Stop / Aux / Lmt (IB populates different fields per order type).</p>
+"""
+    return html
+
+
+def render_bar_log_panel(state: DashboardState) -> str:
+    if not state.bar_log:
+        return """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No bar data yet</div>"""
+    html = """        <div class="log-container" style="max-height: 300px;">
+"""
+    for bar in reversed(state.bar_log[-20:]):
+        criteria = bar.get('entry_criteria', '')
+        bar_info = bar.get('bar_info', '')
+        html += f"""            <div class="log-entry" style="flex-direction: column;">
+                <div style="font-weight: 600; color: #2c3e50;">{bar.get('timestamp', '')} - {bar_info}</div>
+                <div style="color: #555; font-size: 0.85em; margin-top: 4px;">{criteria}</div>
+            </div>
+"""
+    html += """        </div>
+"""
+    return html
+
+
+def render_completed_trades_panel(state: DashboardState) -> str:
+    if not state.completed_trades:
+        return """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No completed trades</div>"""
+    html = """        <table>
+            <thead>
+                <tr>
+                    <th>Exit Time</th>
+                    <th>Direction</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>PnL</th>
+                    <th>R-Multiple</th>
+                    <th>Duration</th>
+                    <th>Reason</th>
+                    <th>Exit Type</th>
+                    <th>Slip (pts)</th>
+                    <th>Report</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    for trade in reversed(state.completed_trades[-200:]):
+        pnl = float(trade.get('pnl', 0) or 0)
+        r_mult = float(trade.get('r_multiple', 0) or 0)
+        pnl_class = 'positive' if pnl > 0 else 'negative' if pnl < 0 else ''
+        r_class = 'positive' if r_mult > 0 else 'negative' if r_mult < 0 else ''
+        exit_time = format_dashboard_datetime(trade.get('exit_time'))
+        reason = str(trade.get('reason', 'N/A') or '')
+        live_exit = str(trade.get('live_exit_type', '') or '')
+        slip_pts = trade.get('slippage_pts')
+        slip_disp = f"{float(slip_pts):+.2f}" if slip_pts is not None else "—"
+        reason_lower = reason.lower()
+        if 'take profit' in reason_lower or reason_lower == 'tp':
+            reason_cls = 'TRADE'
+        elif 'stop' in reason_lower:
+            reason_cls = 'WARNING'
+        else:
+            reason_cls = 'INFO'
+        direction = trade.get('direction', 'N/A')
+        dir_emoji = '🟢' if direction == 'LONG' else '🔴' if direction == 'SHORT' else ''
+        html += f"""                <tr>
+                    <td>{exit_time}</td>
+                    <td>{dir_emoji} {direction}</td>
+                    <td>${float(trade.get('entry_price', 0) or 0):,.2f}</td>
+                    <td>${float(trade.get('exit_price', 0) or 0):,.2f}</td>
+                    <td class="{pnl_class}">${pnl:,.2f}</td>
+                    <td class="{r_class}" title="Risk: ${trade.get('initial_risk', 0):,.2f}">{r_mult:+.2f}R</td>
+                    <td>{trade.get('duration', 'N/A')}</td>
+                    <td><span class="log-type {reason_cls}" style="width: auto; padding: 2px 8px;">{reason}</span></td>
+                    <td>{live_exit or '—'}</td>
+                    <td>{slip_disp}</td>
+                    <td>
+                        {f'<a href="{trade.get("report_url")}" target="_blank" class="report-link">📊 View</a>' if trade.get('report_url') else '<span style="color:#bdc3c7">N/A</span>'}
+                    </td>
+                </tr>
+"""
+    html += """            </tbody>
+        </table>
+"""
+    return html
+
+
+def render_system_logs_panel(state: DashboardState) -> str:
+    all_logs = []
+    for entry in state.live_tracker:
+        all_logs.append({
+            'timestamp': entry.get('timestamp', ''),
+            'type': entry.get('type', 'INFO').upper(),
+            'message': entry.get('message', ''),
+        })
+    for entry in state.error_log:
+        all_logs.append({
+            'timestamp': entry.get('timestamp', ''),
+            'type': 'ERROR',
+            'message': entry.get('error', str(entry)),
+        })
+    all_logs.sort(key=lambda x: x['timestamp'], reverse=True)
+    html = ''
+    for log in all_logs[:100]:
+        html += f"""            <div class="log-entry">
+                <span class="log-timestamp">{log['timestamp']}</span>
+                <span class="log-type {log['type']}">{log['type']}</span>
+                <span class="log-message">{log['message']}</span>
+            </div>
+"""
+    if not html:
+        html = """            <div class="log-entry"><span class="log-message">No log entries yet</span></div>
+"""
+    return html
+
+
+def build_tables_sections(state: DashboardState) -> Dict[str, str]:
+    return {
+        'positions': render_positions_panel(state),
+        'orders': render_orders_panel(state),
+        'bar_log': render_bar_log_panel(state),
+        'completed_trades': render_completed_trades_panel(state),
+        'system_logs': render_system_logs_panel(state),
+    }
+
+
+def write_tables_payload_json(
+    state: DashboardState,
+    json_path: str,
+    write_label: str = '',
+) -> int:
+    """Write table HTML fragments for browser polling (~50–200KB)."""
+    import time as _time
+
+    t0 = _time.perf_counter()
+    try:
+        sections = build_tables_sections(state)
+        seq = next_write_seq()
+        wrapper = {
+            'write_seq': seq,
+            'write_label': write_label,
+            'wall_ts': datetime.now(EASTERN).isoformat(),
+            'completed_trade_count': len(state.completed_trades or []),
+            'active_order_count': len(state.active_orders or []),
+            'position_count': len(state.positions or []),
+            'sections': sections,
+        }
+        content = json.dumps(_sanitize_json_for_browser(wrapper), allow_nan=False)
+        _write_text_file_robust(json_path, content, encoding='utf-8')
+        ms = round((_time.perf_counter() - t0) * 1000, 1)
+        logging.info(
+            'Dashboard tables JSON #%s [%s] trades=%s orders=%s pos=%s bytes=%s write=%.0fms',
+            seq,
+            write_label or '?',
+            wrapper['completed_trade_count'],
+            wrapper['active_order_count'],
+            wrapper['position_count'],
+            len(content),
+            ms,
+        )
+        append_perf_record({
+            'event': 'dashboard_tables_json',
+            'write_seq': seq,
+            'write_label': write_label,
+            'json_path': json_path,
+            'json_bytes': len(content),
+            'write_ms': ms,
+        })
+        return seq
+    except Exception as e:
+        logging.error('Dashboard tables JSON write failed [%s]: %s', write_label or '?', e, exc_info=True)
+        raise
 
 
 def group_params_for_display(params_dict):
@@ -434,7 +855,12 @@ def group_params_for_display(params_dict):
         
     return grouped
 
-def generate_dashboard_html(state: DashboardState) -> str:
+def generate_dashboard_html(
+    state: DashboardState,
+    write_label: str = "",
+    write_seq: Optional[int] = None,
+    health_basename: Optional[str] = None,
+) -> str:
     """Generate the live trading dashboard HTML from state."""
     
     # Calculate uptime
@@ -560,17 +986,17 @@ def generate_dashboard_html(state: DashboardState) -> str:
         
         <div class="stale-warning">⚠️ WARNING: THIS DASHBOARD MAY BE OUT OF DATE</div>
 
-        <div class="status-bar {status_class}">
+        <div class="status-bar {status_class}" id="dash-status-bar">
             <div>
-                <strong style="font-size: 1.2em;">{status_text}</strong>
+                <strong id="dash-status-text" style="font-size: 1.2em;">{status_text}</strong>
                 <span style="opacity: 0.8; margin-left: 10px;">[{state.mode.upper()}]</span>
-                {f'<span style="margin-left: 20px; opacity: 0.9;">Last Data: {state.last_data_receipt_time.strftime("%H:%M:%S")} ({int(time_since_data)}s ago)</span>' if state.last_data_receipt_time else ""}
+                <span id="dash-last-data-line" style="margin-left: 20px; opacity: 0.9;">{f'Last Data: {state.last_data_receipt_time.strftime("%H:%M:%S")} ({int(time_since_data)}s ago)' if state.last_data_receipt_time else ''}</span>
             </div>
             <div style="text-align: right; font-size: 0.9em;">
                 <div>Uptime: {format_duration(total_uptime)}</div>
                 <div id="last-update" data-timestamp="{now_eastern.isoformat()}" style="display:none"></div>
                 <div id="last-data-receipt" data-timestamp="{last_receipt.isoformat() if last_receipt else ''}" style="display:none"></div>
-                <div>Last Update: {now_eastern.strftime('%Y-%m-%d %H:%M:%S')}</div>
+                <div id="dash-last-update-line">Last Update: {now_eastern.strftime('%Y-%m-%d %H:%M:%S')}</div>
             </div>
         </div>
 
@@ -605,216 +1031,30 @@ def generate_dashboard_html(state: DashboardState) -> str:
         <script type="application/json" id="chart-payload">{_chart_json_for_page(state)}</script>
         
         <h2>Active Positions</h2>
-"""
-    if state.positions:
-        html += """        <table>
-            <thead>
-                <tr>
-                    <th>Contract</th>
-                    <th>Pos</th>
-                    <th>Avg (pts)</th>
-                    <th>Mkt (pts)</th>
-                    <th>Mkt Value</th>
-                    <th>Unrealized</th>
-                    <th>Realized (line)</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-        for pos in state.positions:
-            unrealized = float(pos.get('unrealizedPNL', 0) or 0)
-            realized = float(pos.get('realizedPNL', 0) or 0)
-            pnl_class = 'positive' if unrealized >= 0 else 'negative'
-            sym = pos.get('localSymbol') or pos.get('symbol', 'N/A')
-            avg_pts = float(pos.get('avgPrice', 0) or pos.get('avgCost', 0) or 0)
-            mkt_pts = float(pos.get('marketPrice', 0) or 0)
-            if mkt_pts <= 0:
-                mkt_pts = float(state.current_price or 0)
-            
-            html += f"""                <tr>
-                    <td>{sym}</td>
-                    <td>{pos.get('position', 0)}</td>
-                    <td>${avg_pts:,.2f}</td>
-                    <td>${mkt_pts:,.2f}</td>
-                    <td>${float(pos.get('marketValue', 0) or 0):,.2f}</td>
-                    <td class="{pnl_class}">${unrealized:,.2f}</td>
-                    <td>${realized:,.2f}</td>
-                </tr>
-"""
-        html += """            </tbody>
-        </table>
-"""
-    else:
-        html += """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active positions</div>"""
-
-    html += """
-        <h2>Active Orders (all symbols, non-terminal)</h2>
-"""
-    if state.active_orders:
-        html += """        <div style="overflow-x:auto;">
-        <table>
-            <thead>
-                <tr>
-                    <th>Contract</th>
-                    <th>PermID</th>
-                    <th>Parent</th>
-                    <th>Order ID</th>
-                    <th>Type</th>
-                    <th>Action</th>
-                    <th>Size</th>
-                    <th>Lmt</th>
-                    <th>Stop</th>
-                    <th>Aux</th>
-                    <th>Trig*</th>
-                    <th>TIF</th>
-                    <th>Status</th>
-                    <th>Why held</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-        for order in state.active_orders:
-            sym = html_lib.escape(str(order.get("localSymbol") or order.get("symbol") or "-"))
-            why = html_lib.escape(str(order.get("whyHeld") or ""))
-            html += f"""                <tr>
-                    <td>{sym}</td>
-                    <td>{order.get('permId') or '-'}</td>
-                    <td>{order.get('parentId') or '-'}</td>
-                    <td>{order.get('orderId') or '-'}</td>
-                    <td>{html_lib.escape(str(order.get('orderType') or ''))}</td>
-                    <td>{html_lib.escape(str(order.get('action') or ''))}</td>
-                    <td>{order.get('totalQuantity')}</td>
-                    <td>{_format_dashboard_order_price(order.get('lmtPrice'))}</td>
-                    <td>{_format_dashboard_order_price(order.get('stopPrice'))}</td>
-                    <td>{_format_dashboard_order_price(order.get('auxPrice'))}</td>
-                    <td>{_format_dashboard_order_price(order.get('triggerPrice'))}</td>
-                    <td>{html_lib.escape(str(order.get('tif') or ''))}</td>
-                    <td><span class="log-type INFO" style="width: auto; padding: 2px 8px;">{html_lib.escape(str(order.get('status') or ''))}</span></td>
-                    <td style="max-width:220px;font-size:0.85em">{why}</td>
-                </tr>
-"""
-        html += """            </tbody>
-        </table>
+        <div id="dash-positions-panel">
+{render_positions_panel(state)}
         </div>
-        <p style="font-size:0.85em;color:#64748b;margin-top:6px">*Trig = first of Stop / Aux / Lmt (IB populates different fields per order type).</p>
-"""
-    else:
-        html += """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No active orders</div>"""
 
-    # === BAR LOG SECTION ===
-    html += """
+        <h2>Active Orders (all symbols, non-terminal)</h2>
+        <div id="dash-orders-panel">
+{render_orders_panel(state)}
+        </div>
+
         <h2>Bar Log (Last 20 {chart_tf}-minute bars)</h2>
         <p style="font-size:0.85em;color:#64748b;margin:-8px 0 12px 0">Updates when a completed strategy bar closes (not every 1-minute chart tick). Newest entry at top.</p>
-"""
-    if state.bar_log:
-        html += """        <div class="log-container" style="max-height: 300px;">
-"""
-        for bar in reversed(state.bar_log[-20:]):
-            criteria = bar.get('entry_criteria', '')
-            bar_info = bar.get('bar_info', '')
-            html += f"""            <div class="log-entry" style="flex-direction: column;">
-                <div style="font-weight: 600; color: #2c3e50;">{bar.get('timestamp', '')} - {bar_info}</div>
-                <div style="color: #555; font-size: 0.85em; margin-top: 4px;">{criteria}</div>
-            </div>
-"""
-        html += """        </div>
-"""
-    else:
-        html += """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No bar data yet</div>"""
+        <div id="dash-bar-log-panel">
+{render_bar_log_panel(state)}
+        </div>
 
-    # === COMPLETED TRADES SECTION ===
-    html += """
         <h2>Completed Trades</h2>
-"""
-    if state.completed_trades:
-        html += """        <table>
-            <thead>
-                <tr>
-                    <th>Exit Time</th>
-                    <th>Direction</th>
-                    <th>Entry</th>
-                    <th>Exit</th>
-                    <th>PnL</th>
-                    <th>R-Multiple</th>
-                    <th>Duration</th>
-                    <th>Reason</th>
-                    <th>Report</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-        for trade in reversed(state.completed_trades[-200:]):
-            pnl = float(trade.get('pnl', 0) or 0)
-            r_mult = float(trade.get('r_multiple', 0) or 0)
-            pnl_class = 'positive' if pnl > 0 else 'negative' if pnl < 0 else ''
-            r_class = 'positive' if r_mult > 0 else 'negative' if r_mult < 0 else ''
-            
-            exit_time = format_dashboard_datetime(trade.get('exit_time'))
-            reason = str(trade.get('reason', 'N/A') or '')
-            reason_lower = reason.lower()
-            if 'take profit' in reason_lower or reason_lower == 'tp':
-                reason_cls = 'TRADE'
-            elif 'stop' in reason_lower:
-                reason_cls = 'WARNING'
-            else:
-                reason_cls = 'INFO'
-            
-            direction = trade.get('direction', 'N/A')
-            dir_emoji = '🟢' if direction == 'LONG' else '🔴' if direction == 'SHORT' else ''
-            
-            html += f"""                <tr>
-                    <td>{exit_time}</td>
-                    <td>{dir_emoji} {direction}</td>
-                    <td>${float(trade.get('entry_price', 0) or 0):,.2f}</td>
-                    <td>${float(trade.get('exit_price', 0) or 0):,.2f}</td>
-                    <td class="{pnl_class}">${pnl:,.2f}</td>
-                    <td class="{r_class}" title="Risk: ${trade.get('initial_risk', 0):,.2f}">{r_mult:+.2f}R</td>
-                    <td>{trade.get('duration', 'N/A')}</td>
-                    <td><span class="log-type {reason_cls}" style="width: auto; padding: 2px 8px;">{reason}</span></td>
-                    <td>
-                        {f'<a href="{trade.get("report_url")}" target="_blank" class="report-link">📊 View</a>' if trade.get('report_url') else '<span style="color:#bdc3c7">N/A</span>'}
-                    </td>
-                </tr>
-"""
-        html += """            </tbody>
-        </table>
-"""
-    else:
-        html += """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No completed trades</div>"""
+        <div id="dash-completed-trades-panel">
+{render_completed_trades_panel(state)}
+        </div>
 
-    html += """
         <h2>System Logs</h2>
-        <div class="log-container">
-"""
-    # Combine live tracker and error log, sort by timestamp
-    all_logs = []
-    
-    for entry in state.live_tracker:
-        all_logs.append({
-            'timestamp': entry.get('timestamp', ''),
-            'type': entry.get('type', 'INFO').upper(),
-            'message': entry.get('message', '')
-        })
-        
-    for entry in state.error_log:
-        all_logs.append({
-            'timestamp': entry.get('timestamp', ''),
-            'type': 'ERROR',
-            'message': entry.get('error', str(entry))
-        })
-        
-    # Sort by timestamp descending (newest first)
-    all_logs.sort(key=lambda x: x['timestamp'], reverse=True)
-    
-    for log in all_logs[:100]: # Show last 100
-        html += f"""            <div class="log-entry">
-                <span class="log-timestamp">{log['timestamp']}</span>
-                <span class="log-type {log['type']}">{log['type']}</span>
-                <span class="log-message">{log['message']}</span>
-            </div>
-"""
-            
-    html += """        </div>
+        <div id="dash-system-logs-panel" class="log-container">
+{render_system_logs_panel(state)}
+        </div>
 
         <h2>Strategy Parameters</h2>
         <div class="params-section">
@@ -852,55 +1092,127 @@ def generate_dashboard_html(state: DashboardState) -> str:
     
     <script>
 """
+    if dashboard_debug_enabled() and health_basename:
+        lbl = html_lib.escape(write_label or '', quote=True)
+        html += f"    <!-- dashboard write_seq={write_seq} label={lbl} -->\n"
+        html += client_debug_script_block(health_basename)
+    status_js_name = f"{state.mode.lower()}_status.js"
+    chart_json_name = os.path.basename(chart_payload_json_path(f'dashboard_{state.mode.lower()}.html'))
+    tables_json_name = os.path.basename(tables_payload_json_path(f'dashboard_{state.mode.lower()}.html'))
     html += f"        const DASH_FILE_STALE_SEC = {DASHBOARD_FILE_STALE_CLIENT_SEC};\n"
     html += f"        const DASH_DATA_STALL_SEC = {DASHBOARD_DATA_STALL_CLIENT_SEC};\n"
+    html += f"        const DASH_STATUS_JS = '{status_js_name}';\n"
+    html += f"        const CHART_JSON_URL = '{chart_json_name}';\n"
+    html += f"        const TABLES_JSON_URL = '{tables_json_name}';\n"
+    html += f"        var lastChartJsonSeq = 0;\n"
+    html += f"        var lastTablesJsonSeq = 0;\n"
+    html += f"        var lastStatusPollTs = Date.now();\n"
+    html += f"        var lastChartJsonPollTs = 0;\n"
+    html += f"        var lastTablesJsonPollTs = 0;\n"
     html += """
+        function parseStatusPayload(text) {
+            var m = text.match(/updateStatus\\s*\\(\\s*['"][^'"]+['"]\\s*,\\s*(\\{[\\s\\S]*\\})\\s*\\)/);
+            if (!m) return null;
+            try { return JSON.parse(m[1]); } catch (e) { return null; }
+        }
+
+        function applyStatusPayload(st) {
+            if (!st) return;
+            lastStatusPollTs = Date.now();
+            var lastUpdateElem = document.getElementById('last-update');
+            var lastDataElem = document.getElementById('last-data-receipt');
+            if (st.last_update_iso && lastUpdateElem) {
+                lastUpdateElem.dataset.timestamp = st.last_update_iso;
+            }
+            if (st.last_data_receipt_iso && lastDataElem) {
+                lastDataElem.dataset.timestamp = st.last_data_receipt_iso;
+            }
+            var statusText = document.getElementById('dash-status-text');
+            var statusBar = document.getElementById('dash-status-bar');
+            var lastDataLine = document.getElementById('dash-last-data-line');
+            var lastUpdateLine = document.getElementById('dash-last-update-line');
+            if (statusText && statusBar) {
+                if (!st.connected) {
+                    statusText.textContent = 'CONNECTION: OFFLINE';
+                    statusBar.className = 'status-bar disconnected';
+                } else if (st.data_stale) {
+                    statusText.textContent = 'DATA: STALE (live stream)';
+                    statusBar.className = 'status-bar stale';
+                } else {
+                    statusText.textContent = 'CONNECTION: ONLINE';
+                    statusBar.className = 'status-bar online';
+                }
+            }
+            if (lastUpdateLine && st.last_update) {
+                lastUpdateLine.textContent = 'Last Update: ' + st.last_update;
+            }
+            if (lastDataLine && st.last_data_receipt_iso) {
+                var d = new Date(st.last_data_receipt_iso);
+                if (!isNaN(d.getTime())) {
+                    var sec = Math.max(0, Math.round((Date.now() - d) / 1000));
+                    var hh = ('0' + d.getHours()).slice(-2);
+                    var mm = ('0' + d.getMinutes()).slice(-2);
+                    var ss = ('0' + d.getSeconds()).slice(-2);
+                    lastDataLine.textContent = 'Last Data: ' + hh + ':' + mm + ':' + ss + ' (' + sec + 's ago)';
+                }
+            }
+        }
+
         function checkStaleData() {
             const lastUpdateElem = document.getElementById('last-update');
             const lastDataElem = document.getElementById('last-data-receipt');
             const warningElem = document.querySelector('.stale-warning');
             if (!lastUpdateElem || !lastDataElem || !warningElem) return;
-            // Background tabs throttle timers and meta-refresh; do not escalate while hidden.
             if (document.visibilityState !== 'visible') return;
 
             const now = new Date();
             const fileUpdateTs = new Date(lastUpdateElem.dataset.timestamp);
-            const fileDiff = (now - fileUpdateTs) / 1000;
+            const fileDiff = isNaN(fileUpdateTs) ? 999999 : (now - fileUpdateTs) / 1000;
 
             const dataTs = lastDataElem.dataset.timestamp ? new Date(lastDataElem.dataset.timestamp) : null;
-            const dataDiff = dataTs ? (now - dataTs) / 1000 : 0;
+            const dataDiff = dataTs && !isNaN(dataTs) ? (now - dataTs) / 1000 : 0;
 
             if (fileDiff > DASH_FILE_STALE_SEC) {
+                var statusFresh = (Date.now() - lastStatusPollTs) / 1000 < 20;
+                var chartFresh = lastChartJsonPollTs > 0
+                    && (Date.now() - lastChartJsonPollTs) / 1000 < 90;
+                if (statusFresh || chartFresh) {
+                    document.body.classList.remove('stale-data');
+                    warningElem.innerText = '';
+                    return;
+                }
                 document.body.classList.add('stale-data');
-                warningElem.innerText = '⚠️ No fresh dashboard snapshot in ' + Math.round(fileDiff)
-                    + 's (bot stopped, writes failing, or tab was backgrounded — reload or open via http://localhost if serving web/)';
+                warningElem.innerText = '⚠️ Dashboard snapshot not updating (' + Math.round(fileDiff)
+                    + 's). Bot may be running but HTML writes stopped — check paper_logs; hard-refresh (Ctrl+F5). Status: ' + DASH_STATUS_JS;
             } else if (dataDiff > DASH_DATA_STALL_SEC) {
                 document.body.classList.add('stale-data');
-                warningElem.innerText = '⚠️ No recent market bar timestamp in HTML (' + Math.round(dataDiff)
-                    + 's) — possible data stall or quiet session';
+                warningElem.innerText = '⚠️ No recent market bars in snapshot (' + Math.round(dataDiff)
+                    + 's) — data stall or quiet session';
             } else {
                 document.body.classList.remove('stale-data');
                 warningElem.innerText = '';
             }
         }
 
+        function pollStatusJs() {
+            fetch(DASH_STATUS_JS + '?_=' + Date.now(), { cache: 'no-store' })
+                .then(function(r) { return r.text(); })
+                .then(function(text) {
+                    applyStatusPayload(parseStatusPayload(text));
+                    checkStaleData();
+                })
+                .catch(function() { checkStaleData(); });
+        }
+
         checkStaleData();
         setInterval(checkStaleData, 2000);
+        pollStatusJs();
+        setInterval(pollStatusJs, 8000);
 
-        function renderLiveChart() {
+        function renderLiveChartFromPayload(p) {
             var el = document.getElementById('live-chart');
-            var raw = document.getElementById('chart-payload');
             if (!el) return;
             if (typeof Plotly === 'undefined') return;
-            if (!raw) {
-                el.innerHTML = '<p style="padding:12px;color:#7f8c8d">Chart waiting…</p>';
-                return;
-            }
-            var p;
-            try { p = JSON.parse(raw.textContent); } catch (e) {
-                el.innerHTML = '<p style="padding:12px;color:#c0392b">Chart JSON error</p>';
-                return;
-            }
             if (!p || !p.times || p.times.length < 2) {
                 el.innerHTML = '<p style="padding:12px;color:#7f8c8d">No OHLC yet (history warming up)…</p>';
                 return;
@@ -954,16 +1266,21 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     if (m.entry_time && m.entry_price != null) {
                         entX.push(m.entry_time);
                         entY.push(m.entry_price);
-                        entTxt.push('ENTRY ' + (m.direction || '') + '<br>' + (m.reason || '') + '<br>PnL: ' + (m.pnl != null ? m.pnl.toFixed(2) : 'n/a'));
+                        var entExtra = ['ENTRY ' + (m.direction || ''), '@ ' + m.entry_price.toFixed(2), m.entry_time];
+                        if (m.stop_at_open != null) entExtra.push('SL@open: ' + m.stop_at_open.toFixed(2));
+                        if (m.tp_at_open != null) entExtra.push('TP@open: ' + m.tp_at_open.toFixed(2));
+                        entTxt.push(entExtra.join('<br>'));
                     }
                     if (m.exit_time && m.exit_price != null) {
                         exX.push(m.exit_time);
                         exY.push(m.exit_price);
-                        var extra = [];
+                        var extra = ['EXIT ' + (m.direction || ''), '@ ' + m.exit_price.toFixed(2), m.exit_time];
+                        if (m.live_exit_type) extra.push(m.live_exit_type);
+                        else if (m.reason) extra.push(m.reason);
                         if (m.stop_at_close != null) extra.push('SL@close: ' + m.stop_at_close.toFixed(2));
                         if (m.tp_at_close != null) extra.push('TP@close: ' + m.tp_at_close.toFixed(2));
-                        exTxt.push('EXIT ' + (m.direction || '') + '<br>' + (m.reason || '') + '<br>PnL: ' + (m.pnl != null ? m.pnl.toFixed(2) : 'n/a') +
-                            (extra.length ? ('<br>' + extra.join('<br>')) : ''));
+                        if (m.pnl != null) extra.push('PnL: $' + m.pnl.toFixed(2));
+                        exTxt.push(extra.join('<br>'));
                     }
                 }
                 if (entX.length) traces.push({
@@ -1037,6 +1354,19 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     traces.push({ type: 'scatter', x: p.active_trade_lines.times, y: p.active_trade_lines.tp, name: 'Active TP (per bar)',
                         line: { color: '#1b5e20', width: 1.6, shape: 'hv' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
             }
+            if (p.closed_trade_lines && p.closed_trade_lines.length) {
+                var closedColors = ['#5d4037', '#455a64'];
+                for (var ci = 0; ci < p.closed_trade_lines.length; ci++) {
+                    var cl = p.closed_trade_lines[ci];
+                    var cc = closedColors[ci % closedColors.length];
+                    if (cl.times && anyNonNull(cl.stop))
+                        traces.push({ type: 'scatter', x: cl.times, y: cl.stop, name: (cl.label || 'Closed SL'),
+                            line: { color: cc, width: 1.2, shape: 'hv', dash: 'dot' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
+                    if (cl.times && anyNonNull(cl.tp))
+                        traces.push({ type: 'scatter', x: cl.times, y: cl.tp, name: (cl.label || 'Closed TP') + ' TP',
+                            line: { color: cc, width: 1, shape: 'hv', dash: 'dashdot' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
+                }
+            }
             if (savedZoom) {
                 if (savedZoom.x0 && savedZoom.x1) {
                     layout.xaxis.range = [savedZoom.x0, savedZoom.x1];
@@ -1063,12 +1393,10 @@ def generate_dashboard_html(state: DashboardState) -> str:
                     layout.yaxis5.autorange = false;
                 }
             } else {
-                var right = new Date(p.times[p.times.length - 1]);
-                if (!isNaN(right.getTime())) {
-                    var left = new Date(right.getTime() - (2 * 24 * 60 * 60 * 1000));
-                    layout.xaxis.range = [left.toISOString(), right.toISOString()];
-                    layout.xaxis.autorange = false;
-                }
+                var nBars = p.times.length;
+                var startIdx = Math.max(0, nBars - 21);
+                layout.xaxis.range = [p.times[startIdx], p.times[nBars - 1]];
+                layout.xaxis.autorange = false;
             }
             Plotly.react(el, traces, layout, { displayModeBar: true, responsive: true });
             if (!el.__zoomHookAttached) {
@@ -1112,6 +1440,57 @@ def generate_dashboard_html(state: DashboardState) -> str:
                 el.__zoomHookAttached = true;
             }
         }
+        function renderLiveChart() {
+            var raw = document.getElementById('chart-payload');
+            if (!raw) {
+                var el0 = document.getElementById('live-chart');
+                if (el0) el0.innerHTML = '<p style="padding:12px;color:#7f8c8d">Chart waiting…</p>';
+                return;
+            }
+            var p;
+            try { p = JSON.parse(raw.textContent); } catch (e) {
+                var el1 = document.getElementById('live-chart');
+                if (el1) el1.innerHTML = '<p style="padding:12px;color:#c0392b">Chart JSON error</p>';
+                return;
+            }
+            renderLiveChartFromPayload(p);
+        }
+        function pollChartJson() {
+            if (typeof Plotly === 'undefined' || !CHART_JSON_URL) return;
+            fetch(CHART_JSON_URL + '?_=' + Date.now(), { cache: 'no-store' })
+                .then(function(r) { return r.json(); })
+                .then(function(w) {
+                    if (!w || !w.chart) return;
+                    lastChartJsonPollTs = Date.now();
+                    if (w.write_seq && w.write_seq <= lastChartJsonSeq) return;
+                    lastChartJsonSeq = w.write_seq || 0;
+                    renderLiveChartFromPayload(w.chart);
+                })
+                .catch(function(e) { console.warn('[dashboard] chart JSON poll failed:', e); });
+        }
+        setInterval(pollChartJson, 30000);
+        setTimeout(pollChartJson, 3000);
+        function pollTablesJson() {
+            if (!TABLES_JSON_URL) return;
+            fetch(TABLES_JSON_URL + '?_=' + Date.now(), { cache: 'no-store' })
+                .then(function(r) { return r.json(); })
+                .then(function(w) {
+                    if (!w || !w.sections) return;
+                    lastTablesJsonPollTs = Date.now();
+                    if (w.write_seq && w.write_seq <= lastTablesJsonSeq) return;
+                    lastTablesJsonSeq = w.write_seq || 0;
+                    var s = w.sections;
+                    var el;
+                    if (s.positions && (el = document.getElementById('dash-positions-panel'))) el.innerHTML = s.positions;
+                    if (s.orders && (el = document.getElementById('dash-orders-panel'))) el.innerHTML = s.orders;
+                    if (s.bar_log && (el = document.getElementById('dash-bar-log-panel'))) el.innerHTML = s.bar_log;
+                    if (s.completed_trades && (el = document.getElementById('dash-completed-trades-panel'))) el.innerHTML = s.completed_trades;
+                    if (s.system_logs && (el = document.getElementById('dash-system-logs-panel'))) el.innerHTML = s.system_logs;
+                })
+                .catch(function(e) { console.warn('[dashboard] tables JSON poll failed:', e); });
+        }
+        setInterval(pollTablesJson, 15000);
+        setTimeout(pollTablesJson, 2500);
         function scheduleLiveChart(attemptsLeft) {
             var el = document.getElementById('live-chart');
             if (!el) return;
@@ -1133,38 +1512,110 @@ def generate_dashboard_html(state: DashboardState) -> str:
 """
     return html
 
-def update_dashboard(state: DashboardState, html_path: str = WEB_DASHBOARD, json_path: str = None) -> None:
+def build_status_payload(state: DashboardState) -> Dict[str, Any]:
+    """Small JSON blob for paper_status.js / live_status.js (browser freshness poll)."""
+    total_pos = sum(p.get('position', 0) for p in state.positions) if state.positions else 0.0
+    pnl = 0.0
+    if state.account_info:
+        pnl = float(state.account_info.get('RealizedPNL', 0) or 0) + float(
+            state.account_info.get('UnrealizedPNL', 0) or 0
+        )
+    now_et = datetime.now(EASTERN)
+    lr = state.last_data_receipt_time
+    if lr and lr.tzinfo is None:
+        lr = EASTERN.localize(lr)
+    data_age = (now_et - lr).total_seconds() if lr else 0
+    return {
+        'mode': state.mode.upper(),
+        'port': state.port,
+        'connected': state.is_connected,
+        'net_liquidation': float(state.account_info.get('NetLiquidation', 0))
+        if state.account_info
+        else 0.0,
+        'pnl': pnl,
+        'position': total_pos,
+        'current_price': float(state.current_price or 0),
+        'last_update': now_et.strftime('%Y-%m-%d %H:%M:%S'),
+        'last_update_iso': now_et.isoformat(),
+        'last_data_receipt_iso': lr.isoformat() if lr else None,
+        'data_stale': data_age > DASHBOARD_DATA_STALE_SERVER_SEC,
+        'client_id_halted': bool(getattr(state, 'client_id_trading_halted', False)),
+        'client_id_expected': int(getattr(state, 'client_id_expected', 0) or 0),
+        'client_id_active': list(getattr(state, 'client_id_active_on_account', []) or []),
+        'client_id_violation': str(getattr(state, 'client_id_violation_detail', '') or ''),
+    }
+
+
+def write_dashboard_status_only(state: DashboardState, json_path: str) -> None:
+    """Fast heartbeat: status.js only (no HTML / Plotly payload)."""
+    prefix = "live" if state.mode.lower() == "live" else "paper"
+    status_data = build_status_payload(state)
+    js_content = (
+        f"window.updateStatus('{prefix}', "
+        f"{json.dumps(_sanitize_json_for_browser(status_data), allow_nan=False)});"
+    )
+    _write_text_file_robust(json_path, js_content, encoding='utf-8')
+
+
+def update_dashboard(
+    state: DashboardState,
+    html_path: str = WEB_DASHBOARD,
+    json_path: str = None,
+    write_label: str = "",
+) -> None:
     """
     Main entry point to update dashboard files.
     """
-    try:
-        # 1. Generate & Write HTML (in-place write avoids WinError 5 when file is open in browser)
-        html_content = generate_dashboard_html(state)
-        _write_text_file_robust(html_path, html_content, encoding='utf-8')
+    import time as _time
 
-        # 2. Write JSONP Status (if path provided)
+    t0 = _time.perf_counter()
+    timings: Dict[str, float] = {}
+    chart_points = 0
+    if state.chart_payload and state.chart_payload.get('times'):
+        chart_points = len(state.chart_payload['times'])
+    health_bn = os.path.basename(health_sidecar_path(html_path))
+    err: Optional[str] = None
+    html_bytes = 0
+    write_seq = next_write_seq()
+
+    try:
         if json_path:
-            prefix = "live" if state.mode.lower() == "live" else "paper"
-            total_pos = sum(p.get('position', 0) for p in state.positions) if state.positions else 0.0
-            
-            pnl = 0.0
-            if state.account_info:
-                pnl = float(state.account_info.get('RealizedPNL', 0) or 0) + float(state.account_info.get('UnrealizedPNL', 0) or 0)
-                
-            status_data = {
-                'mode': state.mode.upper(),
-                'port': state.port,
-                'connected': state.is_connected,
-                'net_liquidation': float(state.account_info.get('NetLiquidation', 0)) if state.account_info else 0.0,
-                'pnl': pnl,
-                'position': total_pos,
-                'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-            js_content = (
-                f"window.updateStatus('{prefix}', "
-                f"{json.dumps(_sanitize_json_for_browser(status_data), allow_nan=False)});"
+            with timed_section(timings, 'write_status_js_ms'):
+                write_dashboard_status_only(state, json_path)
+
+        with timed_section(timings, 'generate_html_ms'):
+            html_content = generate_dashboard_html(
+                state,
+                write_label=write_label,
+                write_seq=write_seq,
+                health_basename=health_bn if dashboard_debug_enabled() else None,
             )
-            _write_text_file_robust(json_path, js_content, encoding='utf-8')
+        html_bytes = len(html_content.encode('utf-8'))
+
+        with timed_section(timings, 'write_html_ms'):
+            _write_text_file_robust(html_path, html_content, encoding='utf-8')
+
+        with timed_section(timings, 'write_tables_json_ms'):
+            write_tables_payload_json(state, tables_payload_json_path(html_path), write_label)
+
+        if state.chart_payload:
+            with timed_section(timings, 'write_chart_json_ms'):
+                write_chart_payload_json(state, chart_payload_json_path(html_path), write_label)
 
     except Exception as e:
-        logging.error(f"Failed to update dashboard: {e}")
+        err = str(e)
+        logging.error(f"Failed to update dashboard: {e}", exc_info=True)
+        raise
+    finally:
+        timings['total_ms'] = round((_time.perf_counter() - t0) * 1000, 1)
+        log_dashboard_write(
+            write_label=write_label,
+            html_path=html_path,
+            connected=state.is_connected,
+            timings_ms=timings,
+            html_bytes=html_bytes,
+            chart_points=chart_points,
+            last_data_receipt=state.last_data_receipt_time,
+            error=err,
+            write_seq=write_seq,
+        )

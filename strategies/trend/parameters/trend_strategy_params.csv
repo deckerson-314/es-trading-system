@@ -6,21 +6,21 @@ Max Open Trades,1,1,1,int,Max concurrent trades (1 means FIFO/Replace)
 Transaction Cost (Per Trade),15,15,15,float,Estimated friction per trade (Slippage + Commissions) to realistic PnL. E.g. $4 comm + $12.50 slip = 16.5
 Timeframe (minutes),13,1,20,int,Fixed timeframe
 === Entry Logic ===,,,,,
-Buy Lookback,41,100,500,int,Donchian lookback in bars (used when Buy Lookback (minutes) row absent; else derived)
-Sell Lookback,249,100,500,int,Donchian lookback in bars (used when Sell Lookback (minutes) row absent; else derived)
-Buy Lookback (minutes),537.2172,50,5000,float,Wall-clock lookback for longs; effective bars = minutes / Timeframe (minutes) when this row exists
-Sell Lookback (minutes),3236.8406,50,5000,float,Wall-clock lookback for shorts; effective bars = minutes / Timeframe (minutes) when this row exists
-Enable ADX Filter,1,0,1,int,Filter trending markets only
+Buy Lookback,13,100,500,int,Donchian lookback in bars (used when Buy Lookback (minutes) row absent; else derived)
+Sell Lookback,40,100,500,int,Donchian lookback in bars (used when Sell Lookback (minutes) row absent; else derived)
+Buy Lookback (minutes),173.4197,50,5000,float,Wall-clock lookback for longs; effective bars = minutes / Timeframe (minutes) when this row exists
+Sell Lookback (minutes),522.9283,50,5000,float,Wall-clock lookback for shorts; effective bars = minutes / Timeframe (minutes) when this row exists
+Enable ADX Filter,0,0,1,int,Filter trending markets only
 ADX Period,10,5,15,int,ADX calculation period
 Min ADX Threshold,27.5803,5,50,float,Minimum ADX to trade
-ATR Filter Period,9,1,15,int,For volatility normalization
-Min ATR (Points),4.4126,0,8,float,Minimum volatility required to trade
-Enable SMA Filter,1,0,1,int,Trend Regime Filter (Major Trend)
+ATR Filter Period,8,1,15,int,For volatility normalization
+Min ATR (Points),6.6165,0,8,float,Minimum volatility required to trade
+Enable SMA Filter,0,0,1,int,Trend Regime Filter (Major Trend)
 SMA Period,266,50,350,int,Lookback for Regime SMA
 Enable Volume Filter,0,0,1,int,Volume Breakout Validation
 Volume MA Length,14,5,75,int,Lookback for Avg Volume
 Min Volume Multiplier,1.4425,0.5,4,float,Breakout Vol > Avg Vol * Mult
-Enable RSI Filter,1,0,1,int,Filter entries using RSI (0=False 1=True)
+Enable RSI Filter,0,0,1,int,Filter entries using RSI (0=False 1=True)
 RSI Period,26,5,50,int,RSI calculation period
 RSI Max Buy Threshold,93.3473,50,150,float,RSI must be below this to buy (exhaustion)
 RSI Min Sell Threshold,33.9987,15,50,float,RSI must be above this to sell
@@ -36,15 +36,15 @@ Weekend Maintenance Start Day,4,4,4,int,"Weekend maintenance start day (0=Monday
 Weekend Maintenance Start Time (HH:MM),05:00:00 PM,05:00:00 PM,05:00:00 PM,str,Weekend maintenance start time in Eastern Time (ES: Fri 4:00 PM CT = 5:00 PM ET)
 Weekend Maintenance End Day,6,6,6,int,"Weekend maintenance end day (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday). For ES futures: 6 (Sunday)"
 Weekend Maintenance End Time (HH:MM),06:00:00 PM,06:00:00 PM,06:00:00 PM,str,Weekend maintenance end time in Eastern Time (ES: Sun 5:00 PM CT = 6:00 PM ET)
-Maintenance Buffer Minutes,16,1,60,int,Minutes before/after maintenance to exit/block trading
+Maintenance Buffer Minutes,29,1,60,int,Minutes before/after maintenance to exit/block trading
 Err:510,,,,,
-Initial Stop Loss (%),0.2104,0.01,1,float,Fixed stop loss
-Enable Trailing Stop,0,0,1,int,Use ATR trailing stop
-ATR Length for Trailing Stop,26,3,50,int,ATR period for trailing
-ATR Multiplier for Trailing Stop,1.5956,0.1,8,float,Trailing distance
-Trailing Delay (bars),7,0,50,int,Wait before trailing starts
-Trailing Delay (minutes),77,0,300,int,Context-aware trailing delay (preferred when present)
-Take Profit ATR Multiplier,2.8457,0,6,float,Optional Take Profit (0=None)
+Initial Stop Loss (%),0.9925,0.01,1,float,Fixed stop loss
+Enable Trailing Stop,1,0,1,int,Use ATR trailing stop
+ATR Length for Trailing Stop,48,3,50,int,ATR period for trailing
+ATR Multiplier for Trailing Stop,0.1,0.1,8,float,Trailing distance
+Trailing Delay (bars),1,0,50,int,Wait before trailing starts
+Trailing Delay (minutes),13,0,300,int,Context-aware trailing delay (preferred when present)
+Take Profit ATR Multiplier,5.0304,0,6,float,Optional Take Profit (0=None)
 Err:510,,,,,
 POP_SIZE,500,50,250,int,Population size
 NUM_GEN,300,50,150,int,Number of generations
