@@ -127,71 +127,30 @@ def _timeline_search_dirs() -> list:
     return [d for d in dirs if d and os.path.isdir(d)]
 
 
-def _load_timeline_traces(entry_time, exit_time, dir_int):
-    """
-    Read open_trade_timeline.jsonl for this trade; returns (xs, stops, tps) for Plotly or (None,None,None).
-    """
-    et = pd.Timestamp(entry_time)
-    xt = pd.Timestamp(exit_time)
-    et, xt = _pair_align_entry_exit(et, xt)
-    want = "LONG" if dir_int == 1 else "SHORT" if dir_int == -1 else ""
-    if not want:
+def _load_timeline_traces(entry_time, exit_time, dir_int, stop_at_open=None, stop_at_close=None,
+                          tp_at_open=None, tp_at_close=None, output_dir=None):
+    """Build stop/TP hv trail for trade report charts."""
+    from core.timeline import build_display_trail_series, load_trade_timeline_series
+
+    raw = load_trade_timeline_series(
+        output_dir,
+        entry_time,
+        exit_time=exit_time,
+        direction=dir_int,
+    )
+    series = build_display_trail_series(
+        entry_time,
+        exit_time,
+        stop_at_open=stop_at_open,
+        stop_at_close=stop_at_close,
+        tp_at_open=tp_at_open,
+        tp_at_close=tp_at_close,
+        timeline=raw,
+    )
+    if not series:
         return None, None, None
-    by_ts = {}
-    for d in _timeline_search_dirs():
-        path = os.path.join(d, "open_trade_timeline.jsonl")
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if str(rec.get("direction", "")).upper() != want:
-                        continue
-                    ets = rec.get("entry_time")
-                    if not ets:
-                        continue
-                    try:
-                        r_et = _align_ts_to_trade_ref(pd.Timestamp(ets), et)
-                    except Exception:
-                        continue
-                    if abs((r_et - et).total_seconds()) > 900:
-                        continue
-                    ts_raw = rec.get("ts")
-                    if not ts_raw:
-                        continue
-                    try:
-                        tst = _align_ts_to_trade_ref(pd.Timestamp(ts_raw), et)
-                    except Exception:
-                        continue
-                    if tst < et - pd.Timedelta(hours=6) or tst > xt + pd.Timedelta(hours=6):
-                        continue
-                    sp = rec.get("stop")
-                    tp = rec.get("tp")
-                    try:
-                        sp = float(sp) if sp is not None and not (isinstance(sp, float) and math.isnan(sp)) else None
-                    except (TypeError, ValueError):
-                        sp = None
-                    try:
-                        tp = float(tp) if tp is not None and not (isinstance(tp, float) and math.isnan(tp)) else None
-                    except (TypeError, ValueError):
-                        tp = None
-                    by_ts[tst] = (sp, tp)
-        except OSError:
-            continue
-    if not by_ts:
-        return None, None, None
-    ordered = sorted(by_ts.items(), key=lambda kv: kv[0])
-    xs = [k for k, _ in ordered]
-    stops = [v[0] for _, v in ordered]
-    tps = [v[1] for _, v in ordered]
-    return xs, stops, tps
+    xs = [pd.Timestamp(t) for t in series["times"]]
+    return xs, series["stop"], series["tp"]
 
 
 def generate_unified_trade_report(
@@ -252,7 +211,16 @@ def generate_unified_trade_report(
     bar_window = max(60, min(600, 24 * int(tf_mins)))
     seg_1m = _segment_for_trade(df, entry_time, exit_time, bars=bar_window) if not df.empty else df
     seg_plot = _resample_segment_htf(seg_1m, tf_mins) if tf_mins > 1 else seg_1m
-    tl_x, tl_stop, tl_tp = _load_timeline_traces(entry_time, exit_time, dir_int)
+    tl_x, tl_stop, tl_tp = _load_timeline_traces(
+        entry_time,
+        exit_time,
+        dir_int,
+        stop_at_open=stop_open,
+        stop_at_close=stop_close,
+        tp_at_open=tp_open,
+        tp_at_close=tp_close,
+        output_dir=os.environ.get("IB_BOT_OUTPUT_DIR") or os.path.join(os.getcwd(), "paper_logs"),
+    )
 
     price_title = (
         f"Price ({tf_mins}-min HTF — matches live signal aggregation)"
@@ -331,36 +299,38 @@ def generate_unified_trade_report(
 
         x0 = seg_plot.index.min()
         x1 = seg_plot.index.max()
-        for val, name, color in [
-            (stop_open, "SL@open", "red"),
-            (tp_open, "TP@open", "purple"),
-            (stop_close, "SL@close", "firebrick"),
-            (tp_close, "TP@close", "darkviolet"),
-        ]:
-            if val is not None:
-                y = float(val)
-                fig.add_trace(
-                    go.Scatter(
-                        x=[x0, x1],
-                        y=[y, y],
-                        mode="lines",
-                        line=dict(color=color, dash="dot", width=1.2),
-                        name=name,
-                    ),
-                    row=1,
-                    col=1,
-                )
+        has_trail = tl_x and tl_stop and len(tl_x) >= 2
+        if not has_trail:
+            for val, name, color in [
+                (stop_open, "SL@open", "red"),
+                (tp_open, "TP@open", "purple"),
+                (stop_close, "SL@close", "firebrick"),
+                (tp_close, "TP@close", "darkviolet"),
+            ]:
+                if val is not None:
+                    y = float(val)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x0, x1],
+                            y=[y, y],
+                            mode="lines",
+                            line=dict(color=color, dash="dot", width=1.2),
+                            name=name,
+                        ),
+                        row=1,
+                        col=1,
+                    )
 
-        if tl_x and tl_stop:
-            has_tp = any(v is not None for v in tl_tp)
+        if has_trail:
+            has_tp = any(v is not None for v in (tl_tp or []))
             fig.add_trace(
                 go.Scatter(
                     x=tl_x,
                     y=tl_stop,
                     mode="lines",
-                    line=dict(color="#e65100", width=2, shape="hv"),
+                    line=dict(color="#e65100", width=2.5, shape="hv"),
                     connectgaps=False,
-                    name="SL trail (timeline)",
+                    name="SL trail",
                 ),
                 row=1,
                 col=1,
@@ -373,7 +343,7 @@ def generate_unified_trade_report(
                         mode="lines",
                         line=dict(color="#6a1b9a", width=1.5, dash="dash", shape="hv"),
                         connectgaps=False,
-                        name="TP trail (timeline)",
+                        name="TP trail",
                     ),
                     row=1,
                     col=1,

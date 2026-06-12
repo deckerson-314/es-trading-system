@@ -426,9 +426,9 @@ def _trade_overlay_from_open_brackets(open_brackets):
 
 
 def _active_trade_stop_tp_series(open_brackets, output_dir: str, max_points: int = 1200):
-    """
-    Load per-bar stop/TP history for the first active bracket from open_trade_timeline.jsonl.
-    """
+    """Load stop/TP trail for the first open bracket (timeline + bracket anchors)."""
+    from core.timeline import build_display_trail_series, load_trade_timeline_series
+
     if not open_brackets or not output_dir:
         return None
     b = open_brackets[0]
@@ -437,76 +437,52 @@ def _active_trade_stop_tp_series(open_brackets, output_dir: str, max_points: int
     if entry_time is None:
         return None
 
-    timeline_path = os.path.join(output_dir, "open_trade_timeline.jsonl")
-    if not os.path.exists(timeline_path):
-        return None
-
-    target_dir = "LONG" if direction == 1 else "SHORT" if direction == -1 else None
-    target_entry = entry_time.isoformat() if hasattr(entry_time, "isoformat") else str(entry_time)
-
-    rows = []
-    try:
-        with open(timeline_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                rec_entry = rec.get("entry_time")
-                if not rec_entry or str(rec_entry) != target_entry:
-                    continue
-                if target_dir and str(rec.get("direction", "")).upper() != target_dir:
-                    continue
-                rows.append(rec)
-    except Exception:
-        return None
-
-    if not rows:
-        return None
-
-    rows = rows[-max_points:]
-    times, stop_vals, tp_vals = [], [], []
-    for rec in rows:
-        ts = rec.get("ts")
-        if not ts:
-            continue
-        times.append(str(ts))
-        try:
-            stop_vals.append(float(rec.get("stop")) if rec.get("stop") is not None else None)
-        except (TypeError, ValueError):
-            stop_vals.append(None)
-        try:
-            tp_vals.append(float(rec.get("tp")) if rec.get("tp") is not None else None)
-        except (TypeError, ValueError):
-            tp_vals.append(None)
-
-    if not times:
-        return None
-    return {"times": times, "stop": stop_vals, "tp": tp_vals}
+    raw = load_trade_timeline_series(
+        output_dir, entry_time, direction=direction, max_points=max_points,
+    )
+    stop_open = b.get("entry_stop_price")
+    if stop_open is None:
+        stop_open = (b.get("position_dict") or {}).get("stop")
+    tp_open = b.get("entry_tp_price")
+    if tp_open is None and b.get("takeProfit") is not None:
+        tp_open = getattr(b["takeProfit"], "lmtPrice", None)
+    stop_close = (b.get("position_dict") or {}).get("stop") or stop_open
+    return build_display_trail_series(
+        entry_time,
+        pd.Timestamp.now(tz=pytz.timezone("US/Eastern")).replace(tzinfo=None),
+        stop_at_open=stop_open,
+        stop_at_close=stop_close,
+        tp_at_open=tp_open,
+        tp_at_close=tp_open,
+        timeline=raw,
+    )
 
 
 def _closed_trade_timelines_for_chart(output_dir: str, completed_trades: list, max_trades: int = 2):
-    """Per-bar SL/TP paths for recent closed trades (from open_trade_timeline.jsonl)."""
+    """Per-bar SL/TP paths for recent closed trades (timeline + open/close anchors)."""
+    from core.timeline import build_display_trail_series, load_trade_timeline_series
+
     if not output_dir or not completed_trades:
-        return []
-    timeline_path = os.path.join(output_dir, "open_trade_timeline.jsonl")
-    if not os.path.isfile(timeline_path):
         return []
     out = []
     for tr in list(reversed(completed_trades))[:max_trades]:
         entry_time = tr.get("entry_time")
-        if entry_time is None:
+        exit_time = tr.get("exit_time")
+        if entry_time is None or exit_time is None:
             continue
         direction = tr.get("direction", "LONG")
-        dir_int = 1 if str(direction).upper() == "LONG" else -1
-        series = _active_trade_stop_tp_series(
-            [{"entry_time": entry_time, "direction": dir_int}],
-            output_dir,
+        dir_int = 1 if str(direction).upper() in ("LONG", "1", "1.0") else -1
+        raw = load_trade_timeline_series(
+            output_dir, entry_time, exit_time=exit_time, direction=dir_int,
+        )
+        series = build_display_trail_series(
+            entry_time,
+            exit_time,
+            stop_at_open=tr.get("stop_at_open", tr.get("stop")),
+            stop_at_close=tr.get("stop_at_close"),
+            tp_at_open=tr.get("tp_at_open", tr.get("tp")),
+            tp_at_close=tr.get("tp_at_close"),
+            timeline=raw,
         )
         if series:
             series["label"] = f"{direction} {tr.get('reason', '')}"
@@ -1202,25 +1178,26 @@ def _sync_dashboard_table_fields_blocking() -> None:
             )
         except Exception as e:
             logging.debug("Dashboard orders sync skipped: %s", e)
-    if positions:
-        pass  # detailed rows refreshed on full IB snapshot; keep last good rows
-    elif ib.isConnected() and contract:
+    has_exposure = _has_open_market_exposure(ib, contract, positions)
+    if has_exposure and ib.isConnected() and contract:
         try:
-            ib_rows = []
-            for p in ib.positions():
-                if p.contract.conId != contract.conId:
-                    continue
-                if abs(float(p.position or 0)) < 1:
-                    continue
-                ib_rows.append(_portfolio_row_for_dashboard(p, cp))
-            if ib_rows:
-                dashboard_state.positions = ib_rows
-            else:
-                dashboard_state.positions = []
+            pos_data = []
+            for p in ib.portfolio():
+                if p.contract.symbol == contract.symbol:
+                    pos_data.append(_portfolio_row_for_dashboard(p, cp))
+            if not pos_data:
+                for p in ib.positions():
+                    if p.contract.conId != contract.conId:
+                        continue
+                    if abs(float(p.position or 0)) < 1:
+                        continue
+                    pos_data.append(_portfolio_row_for_dashboard(p, cp))
+            dashboard_state.positions = _merge_positions_for_dashboard(
+                ib, contract, positions, pos_data, cp,
+            )
         except Exception as e:
             logging.debug("Dashboard IB positions sync skipped: %s", e)
-            dashboard_state.positions = []
-    else:
+    elif not has_exposure:
         dashboard_state.positions = []
 
 
@@ -1453,7 +1430,7 @@ async def _run_light_dashboard_refresh(
         except Exception as e:
             logging.debug("Light refresh account snapshot skipped: %s", e)
     _sync_dashboard_table_fields_blocking()
-    if not positions:
+    if not _has_open_market_exposure(ib, contract, positions):
         dashboard_state.positions = []
     await _write_dashboard_files_async(
         dashboard_state, dash_path, status_path, label,
@@ -1468,7 +1445,7 @@ async def _run_full_dashboard_refresh_loop():
     while not _shutdown_requested:
         try:
             if dashboard_state and ib.isConnected():
-                likely_flat = not positions
+                likely_flat = not _has_open_market_exposure(ib, contract, positions)
                 force = bool(getattr(dashboard_state, 'request_full_refresh', False))
                 if likely_flat and not force:
                     await _run_light_dashboard_refresh(dash_path, status_path)
@@ -1484,7 +1461,7 @@ async def _run_full_dashboard_refresh_loop():
             raise
         except Exception as e:
             logging.warning("Full dashboard refresh loop error: %s", e, exc_info=True)
-        likely_flat = not positions
+        likely_flat = not _has_open_market_exposure(ib, contract, positions)
         interval = _FULL_DASHBOARD_MIN_SEC_FLAT if likely_flat else _FULL_DASHBOARD_MIN_SEC
         try:
             await _interruptible_sleep(interval)
@@ -1513,8 +1490,9 @@ async def _run_dashboard_status_heartbeat():
 async def _run_full_dashboard_refresh(dash_path: str, status_path: str):
     """Background full refresh: IB snapshot (threaded) + HTML write."""
     global _LAST_FULL_DASHBOARD_MONO, _last_trade_report_sweep_mono, _trade_report_sweep_task
+    global _dashboard_refresh_lock
     if _dashboard_refresh_lock is None:
-        return
+        _dashboard_refresh_lock = asyncio.Lock()
     if _dashboard_refresh_lock.locked():
         logging.debug("Dashboard full refresh skipped (previous still in flight)")
         return
@@ -1522,7 +1500,7 @@ async def _run_full_dashboard_refresh(dash_path: str, status_path: str):
         if not dashboard_state or not ib.isConnected() or _shutdown_requested:
             return
         force_refresh = bool(getattr(dashboard_state, 'request_full_refresh', False))
-        likely_flat = not positions
+        likely_flat = not _has_open_market_exposure(ib, contract, positions)
         if likely_flat and not force_refresh:
             await _run_light_dashboard_refresh(dash_path, status_path)
             return
@@ -1602,7 +1580,7 @@ async def _run_full_dashboard_refresh(dash_path: str, status_path: str):
 
 async def update_ui_periodically():
     """Run throttled SecurityGuard checks (dashboard refresh has its own dedicated loop)."""
-    global _LAST_GUARD_UI_MONO
+    global _LAST_GUARD_UI_MONO, _dashboard_refresh_lock
     if _dashboard_refresh_lock is None:
         _dashboard_refresh_lock = asyncio.Lock()
     while not _shutdown_requested:
@@ -2124,7 +2102,10 @@ async def main():
         except Exception:
             pass
 
-        # Start async tasks
+        # Start async tasks (lock before refresh loop — otherwise full refresh no-ops)
+        global _dashboard_refresh_lock
+        if _dashboard_refresh_lock is None:
+            _dashboard_refresh_lock = asyncio.Lock()
         _status_heartbeat_task = asyncio.create_task(_run_dashboard_status_heartbeat())
         _chart_refresh_loop_task = asyncio.create_task(_run_chart_dashboard_refresh_loop())
         _full_dashboard_refresh_loop_task = asyncio.create_task(_run_full_dashboard_refresh_loop())

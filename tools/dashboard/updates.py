@@ -1234,6 +1234,35 @@ def generate_dashboard_html(
                 for (var i = 0; i < arr.length; i++) if (arr[i] != null) return true;
                 return false;
             }
+            function priceYRangeForWindow(p, i0, i1) {
+                var lo = Infinity, hi = -Infinity;
+                function eat(v) {
+                    if (v != null && isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+                }
+                for (var i = i0; i <= i1; i++) {
+                    if (p.h) eat(p.h[i]);
+                    if (p.l) eat(p.l[i]);
+                    if (p.o) eat(p.o[i]);
+                    if (p.c) eat(p.c[i]);
+                }
+                if (p.trade_markers) {
+                    for (var k = 0; k < p.trade_markers.length; k++) {
+                        var m = p.trade_markers[k];
+                        eat(m.entry_price); eat(m.exit_price);
+                        eat(m.stop_at_open); eat(m.stop_at_close);
+                        eat(m.tp_at_open); eat(m.tp_at_close);
+                    }
+                }
+                if (p.closed_trade_lines) {
+                    for (var ci = 0; ci < p.closed_trade_lines.length; ci++) {
+                        var st = p.closed_trade_lines[ci].stop;
+                        if (st) for (var s = 0; s < st.length; s++) eat(st[s]);
+                    }
+                }
+                if (!isFinite(lo)) return null;
+                var pad = Math.max(2, (hi - lo) * 0.08);
+                return [lo - pad, hi + pad];
+            }
             if (anyNonNull(p.donchian_high))
                 traces.push({ type: 'scatter', x: p.times, y: p.donchian_high, name: 'Donchian high',
                     line: { color: '#1565c0', width: 1.2 }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
@@ -1355,13 +1384,13 @@ def generate_dashboard_html(
                         line: { color: '#1b5e20', width: 1.6, shape: 'hv' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
             }
             if (p.closed_trade_lines && p.closed_trade_lines.length) {
-                var closedColors = ['#5d4037', '#455a64'];
+                var closedColors = ['#e65100', '#6a1b9a'];
                 for (var ci = 0; ci < p.closed_trade_lines.length; ci++) {
                     var cl = p.closed_trade_lines[ci];
                     var cc = closedColors[ci % closedColors.length];
                     if (cl.times && anyNonNull(cl.stop))
                         traces.push({ type: 'scatter', x: cl.times, y: cl.stop, name: (cl.label || 'Closed SL'),
-                            line: { color: cc, width: 1.2, shape: 'hv', dash: 'dot' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
+                            line: { color: cc, width: 2.2, shape: 'hv' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
                     if (cl.times && anyNonNull(cl.tp))
                         traces.push({ type: 'scatter', x: cl.times, y: cl.tp, name: (cl.label || 'Closed TP') + ' TP',
                             line: { color: cc, width: 1, shape: 'hv', dash: 'dashdot' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
@@ -1397,6 +1426,11 @@ def generate_dashboard_html(
                 var startIdx = Math.max(0, nBars - 21);
                 layout.xaxis.range = [p.times[startIdx], p.times[nBars - 1]];
                 layout.xaxis.autorange = false;
+                var yWin = priceYRangeForWindow(p, startIdx, nBars - 1);
+                if (yWin) {
+                    layout.yaxis.range = yWin;
+                    layout.yaxis.autorange = false;
+                }
             }
             Plotly.react(el, traces, layout, { displayModeBar: true, responsive: true });
             if (!el.__zoomHookAttached) {

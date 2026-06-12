@@ -293,17 +293,52 @@ def _find_trade_for_order(ib, contract, order):
     return None
 
 
-def _wait_stop_submitted(ib, order, timeout: float = 2.0) -> bool:
+def _wait_stop_submitted(
+    ib, order, contract=None, timeout: float = 2.0, accept_pending: bool = False,
+) -> bool:
     """Poll until stop order reaches Submitted (armed) or timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        trade = _find_trade_for_order(ib, None, order)
+        trade = _find_trade_for_order(ib, contract, order)
         if trade and stop_order_is_armed(trade):
+            if getattr(trade.order, "permId", 0):
+                order.permId = trade.order.permId
+            return True
+        if accept_pending and trade and stop_order_is_pending(trade):
             if getattr(trade.order, "permId", 0):
                 order.permId = trade.order.permId
             return True
         ib.sleep(0.12)
     return False
+
+
+def _mark_trail_replace_started(bracket) -> None:
+    if bracket is not None:
+        bracket["trail_replace_started_at"] = datetime.now(pytz.utc)
+
+
+def _clear_trail_replace_started(bracket) -> None:
+    if bracket is not None:
+        bracket.pop("trail_replace_started_at", None)
+
+
+def trail_replace_in_progress(positions) -> bool:
+    """True while a trailing stop zero-gap replace is in flight."""
+    now = datetime.now(pytz.utc)
+    for bracket in positions or []:
+        t0 = bracket.get("trail_replace_started_at")
+        if t0 is None:
+            continue
+        t0 = t0 if getattr(t0, "tzinfo", None) else pytz.utc.localize(t0)
+        if (now - t0).total_seconds() < 45:
+            return True
+    return False
+
+
+def _fresh_trail_oca_group(contract, direction: int) -> str:
+    """Unique OCA group — IB rejects new legs while an existing group is occupied."""
+    con_id = getattr(contract, "conId", 0) or 0
+    return f"trail_{con_id}_{direction}_{int(time.time() * 1000)}"
 
 
 def _cancel_order_quiet(ib, order) -> None:
@@ -313,6 +348,17 @@ def _cancel_order_quiet(ib, order) -> None:
         ib.cancelOrder(order)
     except Exception:
         pass
+
+
+def _contract_for_order(contract):
+    """IB rejects futures orders without exchange (Error 321)."""
+    if contract is None:
+        return contract
+    if not getattr(contract, "exchange", None):
+        contract.exchange = getattr(contract, "primaryExchange", None) or "CME"
+    if not getattr(contract, "primaryExchange", None):
+        contract.primaryExchange = contract.exchange or "CME"
+    return contract
 
 
 def _place_standalone_exit_pair(
@@ -409,7 +455,7 @@ def promote_bracket_stop_to_standalone(
     new_stop, new_tp = _place_standalone_exit_pair(
         ib, bc, direction, qty, stop_px, tp_lmt=tp_lmt, oca_group=oca_group,
     )
-    if not _wait_stop_submitted(ib, new_stop, timeout=timeout):
+    if not _wait_stop_submitted(ib, new_stop, bc, timeout=timeout, accept_pending=True):
         logging.warning(
             "Stop promote failed: new leg not Submitted within %.1fs (target %.2f); cancelling new legs",
             timeout,
@@ -438,6 +484,77 @@ def promote_bracket_stop_to_standalone(
     return True
 
 
+def replace_trailing_stop_zero_gap(
+    ib,
+    contract,
+    bracket,
+    new_stop_px: float,
+    direction: int,
+    old_stop_order,
+    live_tracker=None,
+    timeout: float = 5.0,
+) -> bool:
+    """
+    Trailing update: place a standalone stop at the new price, wait until live on IB,
+    then cancel the old stop only (TP unchanged). Avoids reusing an occupied OCA group.
+    """
+    if not ib.isConnected() or bracket is None:
+        return False
+    bc = _contract_for_order(bracket.get("contract") or contract)
+    qty = abs(float(getattr(old_stop_order, "totalQuantity", 1) or 1))
+    new_stop_px = round(float(new_stop_px) * 4) / 4
+    old_px = _stop_trigger_price(old_stop_order, bracket)
+    _mark_trail_replace_started(bracket)
+    try:
+        if not trading_orders_allowed():
+            log_placement_blocked("trailing stop replace")
+            return False
+        stop_action = "SELL" if direction == 1 else "BUY"
+        new_stop = StopOrder(
+            action=stop_action,
+            totalQuantity=qty,
+            stopPrice=new_stop_px,
+            tif="GTC",
+            transmit=True,
+            parentId=0,
+        )
+        ib.placeOrder(bc, new_stop)
+        ib.sleep(0.2)
+        if not _wait_stop_submitted(
+            ib, new_stop, bc, timeout=timeout, accept_pending=True,
+        ):
+            logging.error(
+                "Trailing stop replace: new stop %.2f not live within %.1fs; keeping old leg @ %.2f",
+                new_stop_px,
+                timeout,
+                old_px,
+            )
+            _cancel_order_quiet(ib, new_stop)
+            return False
+
+        _cancel_order_quiet(ib, old_stop_order)
+        ib.sleep(0.2)
+
+        bracket["stopLoss"] = new_stop
+        pd = bracket.get("position_dict")
+        if isinstance(pd, dict):
+            pd["stop"] = new_stop_px
+        logging.info(
+            "Trailing stop zero-gap replace: %.2f -> %.2f (stop only, TP unchanged)",
+            old_px,
+            new_stop_px,
+        )
+        if live_tracker:
+            add_to_live_tracker(
+                live_tracker,
+                "order",
+                f"Trailing stop -> ${new_stop_px:.2f}",
+            )
+        return True
+    finally:
+        _clear_trail_replace_started(bracket)
+
+
 def replace_oca_exit_pair_zero_gap(
     ib,
     contract,
@@ -448,49 +565,56 @@ def replace_oca_exit_pair_zero_gap(
     old_stop_order,
     old_tp_order,
     live_tracker=None,
-    timeout: float = 3.0,
+    timeout: float = 5.0,
 ) -> bool:
     """
-    Trailing/dynamic update: place new standalone OCA SL+TP, wait for Submitted stop,
-    then cancel old legs (zero-gap — new stop armed before old cancelled).
+    Full OCA SL+TP replace when both legs must move. Uses a fresh OCA group — IB rejects
+    new orders while the existing bracket group still has live members.
     """
     bc = bracket.get("contract") or contract
     qty = abs(float(getattr(old_stop_order, "totalQuantity", 1) or 1))
-    oca_group = bracket.get("ocaGroup") or f"bracket_{getattr(bc, 'conId', 0)}_{direction}"
+    oca_group = _fresh_trail_oca_group(bc, direction)
     new_stop_px = round(float(new_stop_px) * 4) / 4
     tp_lmt_px = round(float(tp_lmt_px) * 4) / 4
 
-    new_stop, new_tp = _place_standalone_exit_pair(
-        ib, bc, direction, qty, new_stop_px, tp_lmt=tp_lmt_px, oca_group=oca_group,
-    )
-    if not _wait_stop_submitted(ib, new_stop, timeout=timeout):
-        logging.error(
-            "Zero-gap OCA replace: new stop %.2f not Submitted; keeping old legs",
+    _mark_trail_replace_started(bracket)
+    try:
+        new_stop, new_tp = _place_standalone_exit_pair(
+            ib, bc, direction, qty, new_stop_px, tp_lmt=tp_lmt_px, oca_group=oca_group,
+        )
+        if not _wait_stop_submitted(
+            ib, new_stop, bc, timeout=timeout, accept_pending=True,
+        ):
+            logging.error(
+                "Zero-gap OCA replace: new stop %.2f not live; keeping old legs",
+                new_stop_px,
+            )
+            _cancel_order_quiet(ib, new_stop)
+            _cancel_order_quiet(ib, new_tp)
+            return False
+
+        _cancel_order_quiet(ib, old_stop_order)
+        _cancel_order_quiet(ib, old_tp_order)
+        ib.sleep(0.2)
+
+        bracket["stopLoss"] = new_stop
+        bracket["takeProfit"] = new_tp
+        bracket["ocaGroup"] = oca_group
+        logging.info(
+            "Trailing OCA zero-gap replace: SL -> %.2f, TP %.2f (new group %s)",
             new_stop_px,
+            tp_lmt_px,
+            oca_group,
         )
-        _cancel_order_quiet(ib, new_stop)
-        _cancel_order_quiet(ib, new_tp)
-        return False
-
-    _cancel_order_quiet(ib, old_stop_order)
-    _cancel_order_quiet(ib, old_tp_order)
-    ib.sleep(0.2)
-
-    bracket["stopLoss"] = new_stop
-    bracket["takeProfit"] = new_tp
-    bracket["ocaGroup"] = oca_group
-    logging.info(
-        "Trailing OCA zero-gap replace: SL -> %.2f, TP %.2f (Submitted before old cancel)",
-        new_stop_px,
-        tp_lmt_px,
-    )
-    if live_tracker:
-        add_to_live_tracker(
-            live_tracker,
-            "order",
-            f"Trailing SL+TP (zero-gap) SL ${new_stop_px:.2f} TP ${tp_lmt_px:.2f}",
-        )
-    return True
+        if live_tracker:
+            add_to_live_tracker(
+                live_tracker,
+                "order",
+                f"Trailing SL+TP (zero-gap) SL ${new_stop_px:.2f} TP ${tp_lmt_px:.2f}",
+            )
+        return True
+    finally:
+        _clear_trail_replace_started(bracket)
 
 
 def ensure_bracket_stop_armed(ib, contract, bracket, live_tracker=None) -> bool:
@@ -578,6 +702,17 @@ def ensure_all_bracket_stops_armed(ib, contract, positions, live_tracker=None) -
     return n
 
 
+def _stop_tightness_rank(px: float, direction: int) -> int:
+    """Higher = tighter protective stop for this direction (dominates duplicate resolution)."""
+    if px <= 0:
+        return 0
+    if direction == 1:
+        return int(round(px * 100))
+    if direction == -1:
+        return int(round((10000.0 - px) * 100))
+    return 0
+
+
 def _exit_leg_rank(
     trade,
     tracked_perm_ids: set,
@@ -585,10 +720,13 @@ def _exit_leg_rank(
     is_stop: bool,
     ib,
     reference_stop_px: float = 0.0,
+    direction: int = 0,
 ) -> int:
-    """Higher = prefer keeping this exit leg (oldest / tracked / armed wins over new duplicates)."""
+    """Higher = prefer keeping this exit leg (tighter stop / armed / tracked)."""
     score = 0
     if is_stop:
+        px = _stop_trigger_price(trade.order, None)
+        score += _stop_tightness_rank(px, direction)
         if stop_order_is_armed(trade):
             score += 2000
         elif stop_order_is_pending(trade):
@@ -602,10 +740,9 @@ def _exit_leg_rank(
     perm = int(getattr(trade.order, "permId", 0) or 0)
     if perm in tracked_perm_ids:
         score += 800
-    # Prefer pre-outage / bracket legs (lower permId) over reconnect spam (high permId).
     if perm > 0:
         score += max(0, 300 - perm // 10_000_000)
-    if reference_stop_px > 0 and is_stop:
+    if reference_stop_px > 0 and is_stop and direction == 0:
         px = _stop_trigger_price(trade.order, None)
         if px > 0:
             score += max(0, 250 - int(abs(px - reference_stop_px) * 20))
@@ -628,9 +765,23 @@ def _reference_stop_px_for_position(positions, pos) -> float:
         bc = bracket.get("contract")
         if bc is not None and getattr(bc, "conId", None) not in (None, con_id):
             continue
-        px = bracket.get("entry_stop_price") or _stop_trigger_price(bracket.get("stopLoss"), bracket)
-        if px and float(px) > 0:
-            return float(px)
+        pd_stop = (bracket.get("position_dict") or {}).get("stop")
+        entry_stop = bracket.get("entry_stop_price") or _stop_trigger_price(
+            bracket.get("stopLoss"), bracket,
+        )
+        candidates = []
+        for raw in (pd_stop, entry_stop):
+            try:
+                v = float(raw or 0)
+                if v > 0:
+                    candidates.append(v)
+            except (TypeError, ValueError):
+                pass
+        if not candidates:
+            continue
+        if direction == 1:
+            return max(candidates)
+        return min(candidates)
     return 0.0
 
 
@@ -650,6 +801,9 @@ def consolidate_duplicate_protective_orders(ib, contract, positions, live_tracke
     Returns number of cancelOrder calls issued.
     """
     if not ib.isConnected():
+        return 0
+    if trail_replace_in_progress(positions):
+        logging.debug("Consolidate skipped: trailing stop replace in progress")
         return 0
     _ib_refresh_open_orders(ib)
     tracked_perm_ids = set()
@@ -712,7 +866,13 @@ def consolidate_duplicate_protective_orders(ib, contract, positions, live_tracke
             ranked = sorted(
                 bucket,
                 key=lambda t: _exit_leg_rank(
-                    t, tracked_perm_ids, session_cid, is_stop, ib, ref_stop_px if is_stop else 0.0,
+                    t,
+                    tracked_perm_ids,
+                    session_cid,
+                    is_stop,
+                    ib,
+                    ref_stop_px if is_stop else 0.0,
+                    direction,
                 ),
                 reverse=True,
             )
@@ -925,6 +1085,160 @@ def es_position_has_acceptable_stop(ib, pos, refresh: bool = True, session_only:
     return True
 
 
+def _find_filled_entry_trade_for_position(ib, pos):
+    """Most recent filled entry trade for an open ES position (restart/adopt wiring)."""
+    direction = 1 if pos.position > 0 else -1
+    want_action = "BUY" if direction == 1 else "SELL"
+    try:
+        qty = abs(float(pos.position))
+    except (TypeError, ValueError):
+        return None
+    cid = pos.contract.conId
+    candidates = []
+    for trade in ib.trades():
+        if trade.contract.conId != cid:
+            continue
+        st = (getattr(trade.orderStatus, "status", None) or "").strip()
+        if not trade.filled() and st != "Filled":
+            continue
+        order = trade.order
+        if getattr(order, "action", "") != want_action:
+            continue
+        ot = str(getattr(order, "orderType", "") or "").upper()
+        if ot not in ("MKT", "MARKET", "LMT", "LIMIT"):
+            continue
+        try:
+            tq = abs(float(getattr(order, "totalQuantity", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if abs(tq - qty) > 1e-9:
+            continue
+        candidates.append(trade)
+    if not candidates:
+        return None
+
+    def _fill_ts(t):
+        if not t.fills:
+            return datetime.min.replace(tzinfo=pytz.utc)
+        ft = _fill_timestamp_from_ib_fill(t.fills[0])
+        if ft is None:
+            return datetime.min.replace(tzinfo=pytz.utc)
+        if getattr(ft, "tzinfo", None) is None:
+            return pytz.utc.localize(ft)
+        return ft
+
+    return max(candidates, key=_fill_ts)
+
+
+def _fill_timestamp_from_ib_fill(fill):
+    """
+    Best-effort UTC timestamp from an ib_insync Fill.
+
+    Paper IB Gateway often sets ``execution.time`` ~4h ahead of ``fill.time``.
+    ``main.log_execution`` uses ``fill.time``; bracket wiring must match.
+    """
+    if fill is None:
+        return None
+    for candidate in (
+        getattr(fill, "time", None),
+        getattr(getattr(fill, "execution", None), "time", None),
+    ):
+        if candidate is None:
+            continue
+        try:
+            if pd.Timestamp(candidate) is pd.NaT:
+                continue
+        except Exception:
+            continue
+        return candidate
+    return None
+
+
+def _ib_fill_time_to_naive_et(ft):
+    """IB fill timestamps are UTC; store naive US/Eastern for charts/reports."""
+    if ft is None:
+        return None
+    try:
+        ts = pd.Timestamp(ft)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert("America/New_York").tz_localize(None).to_pydatetime()
+    except Exception:
+        try:
+            if getattr(ft, "tzinfo", None) is not None:
+                return ft.astimezone(pytz.timezone("America/New_York")).replace(tzinfo=None)
+        except Exception:
+            pass
+        return ft
+
+
+def _ib_fill_to_naive_et(fill):
+    """Convert an ib_insync Fill to naive US/Eastern (same clock as live_trades.csv)."""
+    return _ib_fill_time_to_naive_et(_fill_timestamp_from_ib_fill(fill))
+
+
+def _estimate_bars_held_since_entry(entry_time, timeframe_minutes: int) -> int:
+    """Approximate strategy bars held for trailing delay after restart."""
+    if entry_time is None or not timeframe_minutes or timeframe_minutes <= 0:
+        return 0
+    try:
+        et = entry_time
+        if getattr(et, "tzinfo", None) is not None:
+            et = et.astimezone(pytz.timezone("America/New_York")).replace(tzinfo=None)
+        now_et = datetime.now(pytz.timezone("America/New_York")).replace(tzinfo=None)
+        mins = (now_et - et).total_seconds() / 60.0
+        return max(0, int(mins // timeframe_minutes))
+    except Exception:
+        return 0
+
+
+def wire_bracket_entry_from_ib(ib, pos, bracket, strategy=None) -> bool:
+    """
+    Link adopted/restored bracket to the filled IB entry so check_exits can trail and close.
+    Returns True when entry metadata was wired (or was already present).
+    """
+    if bracket is None or pos is None:
+        return False
+
+    entry_trade = _find_filled_entry_trade_for_position(ib, pos)
+    if entry_trade is None:
+        return bool(bracket.get("entryOrderId"))
+
+    entry_order = entry_trade.order
+    bracket["entry"] = entry_order
+    bracket["entryOrderId"] = int(getattr(entry_order, "orderId", 0) or 0)
+    if entry_trade.fills:
+        try:
+            bracket["entry_price"] = float(entry_trade.fills[0].execution.price)
+        except (TypeError, ValueError):
+            pass
+        converted = _ib_fill_to_naive_et(entry_trade.fills[0])
+        if converted is not None:
+            bracket["entry_time"] = converted
+
+    stop_px = _stop_trigger_price(bracket.get("stopLoss"), bracket)
+    tf = int(getattr(strategy, "timeframe", 13) or 13) if strategy else 13
+    bars_held = _estimate_bars_held_since_entry(bracket.get("entry_time"), tf)
+    pd = bracket.get("position_dict") or {}
+    pd.setdefault("direction", bracket.get("direction"))
+    if stop_px > 0:
+        pd["stop"] = stop_px
+    pd["bars_held"] = max(int(pd.get("bars_held") or 0), bars_held)
+    bracket["position_dict"] = pd
+    bracket["position_verified"] = True
+    bracket["open_notified"] = True
+    if not bracket.get("entry_wired"):
+        logging.info(
+            "Wired bracket entry from IB: orderId=%s permId=%s entry=%.2f bars_held≈%s",
+            bracket.get("entryOrderId"),
+            getattr(entry_order, "permId", 0),
+            float(bracket.get("entry_price") or 0),
+            pd.get("bars_held"),
+        )
+        bracket["entry_wired"] = True
+    return True
+
+
 def adopt_ib_protection_for_position(
     ib, positions, pos, strategy=None, data=None, live_tracker=None,
 ) -> bool:
@@ -939,6 +1253,13 @@ def adopt_ib_protection_for_position(
     con_id = pos.contract.conId
     if _bracket_already_tracked(positions, direction, qty, con_id):
         _sync_positions_stop_handles_from_ib(ib, positions, pos)
+        for bracket in positions or []:
+            if bracket.get("direction") != direction:
+                continue
+            bc = bracket.get("contract")
+            if bc is not None and getattr(bc, "conId", None) not in (None, con_id):
+                continue
+            wire_bracket_entry_from_ib(ib, pos, bracket, strategy=strategy)
         return True
 
     stop_trade = _find_protective_stop_trade_for_position(ib, pos)
@@ -981,15 +1302,44 @@ def adopt_ib_protection_for_position(
     cid = getattr(stop_order, "clientId", "?")
     ost = getattr(stop_trade.orderStatus, "status", "?")
 
-    positions.append({
-        "entry": MarketOrder(
-            action="BUY" if direction == 1 else "SELL", totalQuantity=qty, tif="GTC",
-        ),
+    tf = int(getattr(strategy, "timeframe", 13) or 13) if strategy else 13
+    entry_time = None
+    entry_trade = _find_filled_entry_trade_for_position(ib, pos)
+    entry_order = MarketOrder(
+        action="BUY" if direction == 1 else "SELL", totalQuantity=qty, tif="GTC",
+    )
+    entry_order_id = 0
+    if entry_trade is not None:
+        entry_order = entry_trade.order
+        entry_order_id = int(getattr(entry_order, "orderId", 0) or 0)
+        if entry_trade.fills:
+            try:
+                entry_price = float(entry_trade.fills[0].execution.price)
+            except (TypeError, ValueError):
+                pass
+            ft = entry_trade.fills[0].execution.time or getattr(entry_trade.fills[0], "time", None)
+            entry_time = _ib_fill_time_to_naive_et(ft)
+
+    position_dict = {"direction": direction, "stop": stop_px}
+    if entry_time is not None:
+        position_dict["bars_held"] = _estimate_bars_held_since_entry(entry_time, tf)
+    elif strategy is not None and data is not None and not data.empty:
+        try:
+            _ensure_strategy_indicators(strategy, data)
+            position_dict = strategy.setup_position(
+                entry_price, direction, data.iloc[-1], data,
+            )
+            position_dict["stop"] = stop_px
+        except Exception:
+            pass
+
+    bracket = {
+        "entry": entry_order,
         "stopLoss": stop_order,
         "takeProfit": tp_order,
         "direction": direction,
-        "position_dict": {"direction": direction, "stop": stop_px},
-        "entry_time": datetime.now(),
+        "position_dict": position_dict,
+        "entry_time": entry_time or datetime.now(),
         "entry_price": entry_price,
         "entry_stop_price": stop_px,
         "entry_tp_price": getattr(tp_order, "lmtPrice", None) if tp_order else None,
@@ -998,7 +1348,12 @@ def adopt_ib_protection_for_position(
         "open_notified": True,
         "restored_from_ib": True,
         "adopted_foreign_client": not _order_belongs_to_session(ib, stop_order),
-    })
+        "position_verified": True,
+    }
+    if entry_order_id:
+        bracket["entryOrderId"] = entry_order_id
+    wire_bracket_entry_from_ib(ib, pos, bracket, strategy=strategy)
+    positions.append(bracket)
     logging.info(
         "Adopted IB protection for %s %s @ %s (SL %.2f clientId=%s status=%s) — no new orders",
         "LONG" if direction == 1 else "SHORT",
@@ -1111,9 +1466,7 @@ def restore_tracked_brackets_from_ib(ib, contract, positions, strategy, data, li
                 entry_order = order
                 if trade.fills:
                     entry_price = float(trade.fills[0].execution.price)
-                    ft = trade.fills[0].execution.time or trade.fills[0].time
-                    if ft:
-                        entry_time = ft.replace(tzinfo=None) if getattr(ft, 'tzinfo', None) else ft
+                    entry_time = _ib_fill_to_naive_et(trade.fills[0])
 
         if stop_order is None:
             continue
@@ -1146,7 +1499,7 @@ def restore_tracked_brackets_from_ib(ib, contract, positions, strategy, data, li
         stop_px = getattr(stop_order, 'stopPrice', None) or getattr(stop_order, 'auxPrice', None)
         tp_px = getattr(tp_order, 'lmtPrice', None) if tp_order is not None else None
 
-        positions.append({
+        bracket = {
             'entry': entry_order,
             'stopLoss': stop_order,
             'takeProfit': tp_order,
@@ -1160,7 +1513,20 @@ def restore_tracked_brackets_from_ib(ib, contract, positions, strategy, data, li
             'ocaGroup': oca_group,
             'open_notified': True,
             'restored_from_ib': True,
-        })
+            'position_verified': True,
+        }
+        if entry_order is not None:
+            eoid = int(getattr(entry_order, 'orderId', 0) or 0)
+            if eoid:
+                bracket['entryOrderId'] = eoid
+        if entry_time is not None and strategy is not None:
+            tf = int(getattr(strategy, 'timeframe', 13) or 13)
+            bh = _estimate_bars_held_since_entry(entry_time, tf)
+            if isinstance(bracket.get('position_dict'), dict):
+                bracket['position_dict']['bars_held'] = max(
+                    int(bracket['position_dict'].get('bars_held') or 0), bh,
+                )
+        positions.append(bracket)
         restored += 1
         sym = getattr(pos.contract, 'localSymbol', 'ES')
         logging.info(

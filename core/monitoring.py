@@ -184,6 +184,8 @@ async def _async_process_bar_snapshot(
                 allow_strategy_exit=False,
                 skip_trailing=True,
             )
+            if has_new and positions:
+                append_open_trade_timeline(output_dir, data.index[-1], data.iloc[-1], positions)
 
     except Exception as e:
         bar_time_str = "unknown"
@@ -312,6 +314,8 @@ def _sync_on_bar_update_legacy(
                 allow_strategy_exit=False,
                 skip_trailing=True,
             )
+            if has_new and positions:
+                append_open_trade_timeline(output_dir, data.index[-1], data.iloc[-1], positions)
 
     except Exception as e:
         bar_time_str = "unknown"
@@ -461,7 +465,13 @@ def append_open_trade_timeline(output_dir, timestamp, row, positions):
             direction = b.get('direction', 0)
             stop_order = b.get('stopLoss')
             tp_order = b.get('takeProfit')
-            stop_px = getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None)) if stop_order else None
+            model_stop = (b.get('position_dict') or {}).get('stop')
+            broker_stop = (
+                getattr(stop_order, 'auxPrice', getattr(stop_order, 'stopPrice', None))
+                if stop_order
+                else None
+            )
+            stop_px = model_stop if model_stop is not None else broker_stop
             tp_px = getattr(tp_order, 'lmtPrice', None) if tp_order else None
             entry_px = float(b.get('entry_price', 0) or 0)
             qty = 1

@@ -708,11 +708,12 @@ class TrendStrategy(Strategy):
         low = row.low if not isinstance(row, pd.Series) else row['low']
         atr = row.atr if not isinstance(row, pd.Series) else row['atr']
 
-        if position['bars_held'] == 0:
+        bars_held = int(position.get('bars_held', 0) or 0)
+        if bars_held == 0:
             position['bars_held'] = 1
             return False
 
-        position['bars_held'] += 1
+        position['bars_held'] = bars_held + 1
         if position['bars_held'] < self.trailing_delay:
             return False
 

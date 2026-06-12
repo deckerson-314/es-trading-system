@@ -9,7 +9,7 @@ import core.execution as core_execution
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from core.execution import check_exits
+from core.execution import check_exits, _force_close_position
 
 class TestExitLogic(unittest.TestCase):
     def test_short_exit_no_trigger(self):
@@ -662,6 +662,88 @@ class TestExitLogic(unittest.TestCase):
                 os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
             else:
                 os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+
+    def test_force_close_when_already_flat_records_trade(self):
+        """Broker stop filled before software exit must still land in completed_trades."""
+        ib = MagicMock()
+        contract = MagicMock()
+        contract.conId = 649180671
+        contract.localSymbol = "ESU6"
+
+        entry_order = MagicMock()
+        entry_order.permId = 1204129882
+        entry_order.totalQuantity = 1
+        entry_trade = MagicMock()
+        entry_trade.order = entry_order
+        entry_trade.filled.return_value = True
+        entry_trade.fills = [MagicMock(execution=MagicMock(price=7369.0))]
+        entry_trade.contract = contract
+
+        stop_order = MagicMock()
+        stop_order.permId = 1204129885
+        stop_order.totalQuantity = 1
+        stop_order.auxPrice = 7396.25
+        stop_order.stopPrice = 7396.25
+        stop_order.orderType = "STP"
+        stop_trade = MagicMock()
+        stop_trade.order = stop_order
+        stop_trade.contract = contract
+        stop_trade.filled.return_value = True
+        stop_trade.fills = [
+            MagicMock(execution=MagicMock(price=7374.25, side='SLD', shares=1.0))
+        ]
+
+        ib.positions.return_value = []
+        ib.trades.return_value = [entry_trade, stop_trade]
+        ib.fills.return_value = [
+            MagicMock(
+                contract=contract,
+                execution=MagicMock(
+                    permId=1204129885, price=7374.25, side='SLD', shares=1.0,
+                    time=pd.Timestamp("2026-06-11 10:24:06"),
+                ),
+            )
+        ]
+
+        bracket = {
+            "entry": entry_order,
+            "stopLoss": stop_order,
+            "takeProfit": None,
+            "direction": 1,
+            "position_dict": {"direction": 1, "stop": 7396.25, "bars_held": 2},
+            "entry_time": pd.Timestamp("2026-06-11 10:11:07"),
+            "entry_price": 7369.0,
+            "entry_stop_price": 7323.0,
+            "entry_tp_price": 7442.5,
+            "position_verified": True,
+            "contract": contract,
+            "entryOrderId": 1550,
+        }
+        positions = [bracket]
+        completed = []
+        data = pd.DataFrame(
+            {"close": [7359.5], "high": [7360.0], "low": [7358.0]},
+            index=pd.DatetimeIndex([pd.Timestamp("2026-06-11 10:24:00")]),
+        )
+
+        old_send = core_execution._send_trade_close_notification
+        core_execution._send_trade_close_notification = MagicMock()
+        try:
+            _force_close_position(
+                ib, contract, bracket, positions, completed,
+                [], MagicMock(), entry_trade, 7359.5,
+                "Software Stop (backup)", data=data, strategy=None,
+            )
+        finally:
+            core_execution._send_trade_close_notification = old_send
+
+        self.assertEqual(positions, [])
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["direction"], "LONG")
+        self.assertEqual(completed[0]["entry_price"], 7369.0)
+        self.assertEqual(completed[0]["exit_price"], 7374.25)
+        self.assertEqual(completed[0]["reason"], "Broker Stop")
 
 
 if __name__ == '__main__':
