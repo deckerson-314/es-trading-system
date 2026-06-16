@@ -4,9 +4,10 @@ Ported from ib_deployment_v4.py lines 1575-3752
 """
 import logging
 import asyncio
+import os
 import time
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 
 from core.account import get_account_summary, add_to_live_tracker
@@ -322,6 +323,37 @@ def _clear_trail_replace_started(bracket) -> None:
         bracket.pop("trail_replace_started_at", None)
 
 
+def _trail_replace_grace_seconds() -> float:
+    raw = os.environ.get("LIVE_TRAIL_REPLACE_GRACE_SEC", "3")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def mark_trail_replace_grace(bracket, seconds: float = None) -> None:
+    """Skip software backup briefly after a successful trail replace (let IB fill)."""
+    if bracket is None:
+        return
+    sec = _trail_replace_grace_seconds() if seconds is None else max(0.0, float(seconds))
+    if sec <= 0:
+        return
+    bracket["trail_replace_grace_until"] = datetime.now(pytz.utc) + timedelta(seconds=sec)
+
+
+def trail_replace_grace_active(bracket) -> bool:
+    if not bracket:
+        return False
+    until = bracket.get("trail_replace_grace_until")
+    if until is None:
+        return False
+    until = until if getattr(until, "tzinfo", None) else pytz.utc.localize(until)
+    if datetime.now(pytz.utc) >= until:
+        bracket.pop("trail_replace_grace_until", None)
+        return False
+    return True
+
+
 def trail_replace_in_progress(positions) -> bool:
     """True while a trailing stop zero-gap replace is in flight."""
     now = datetime.now(pytz.utc)
@@ -550,6 +582,7 @@ def replace_trailing_stop_zero_gap(
                 "order",
                 f"Trailing stop -> ${new_stop_px:.2f}",
             )
+        mark_trail_replace_grace(bracket)
         return True
     finally:
         _clear_trail_replace_started(bracket)
@@ -612,6 +645,7 @@ def replace_oca_exit_pair_zero_gap(
                 "order",
                 f"Trailing SL+TP (zero-gap) SL ${new_stop_px:.2f} TP ${tp_lmt_px:.2f}",
             )
+        mark_trail_replace_grace(bracket)
         return True
     finally:
         _clear_trail_replace_started(bracket)
@@ -2230,6 +2264,79 @@ async def periodic_protection_check(ib, contract, positions, strategy, data, liv
             logging.error(f"Error in periodic protection check: {e}")
 
 
+def log_stop_drift_on_disconnect(positions, label: str = "disconnect", live_tracker=None) -> None:
+    """Log model vs broker stop levels when API is down (model may be tighter)."""
+    if not positions:
+        return
+    for bracket in positions:
+        dir_ = int(bracket.get("direction") or 0)
+        pd_stop = (bracket.get("position_dict") or {}).get("stop")
+        stop_order = bracket.get("stopLoss")
+        broker_px = _stop_trigger_price(stop_order, bracket) if stop_order else 0.0
+        model_px = float(pd_stop) if pd_stop is not None else 0.0
+        sym = getattr(bracket.get("contract"), "localSymbol", "ES")
+        gap = (model_px - broker_px) * dir_ if (model_px and broker_px) else None
+        tighter = gap is not None and gap > 0.25
+        msg = (
+            f"STOP DRIFT [{label}] {sym} dir={dir_}: "
+            f"model={model_px:.2f} broker={broker_px:.2f}"
+            + (f" gap={gap:.2f} (model tighter)" if tighter else "")
+        )
+        logging.warning(msg)
+        if live_tracker is not None:
+            level = "warning" if tighter else "info"
+            add_to_live_tracker(live_tracker, level, msg[:120])
+
+
+def catch_up_model_trailing_stops(
+    ib,
+    contract,
+    positions,
+    strategy,
+    data,
+    live_tracker=None,
+) -> int:
+    """One-shot after reconnect: tighten broker stop when model stop is ahead."""
+    if not ib.isConnected() or data is None or data.empty or not positions:
+        return 0
+    latest_row = data.iloc[-1]
+    updated = 0
+    for bracket in positions:
+        dir_ = int(bracket.get("direction") or 0)
+        if dir_ not in (1, -1):
+            continue
+        strat_pos = bracket.get("position_dict") or {}
+        model_raw = strat_pos.get("stop")
+        if model_raw is None:
+            continue
+        model_stop = round(float(model_raw) * 4) / 4
+        stop_order = bracket.get("stopLoss")
+        stop_trade = _find_trade_for_order(ib, bracket.get("contract") or contract, stop_order)
+        if not stop_trade or not stop_order_is_armed(stop_trade):
+            continue
+        broker_px = _stop_trigger_price(stop_trade.order, bracket)
+        if broker_px <= 0:
+            continue
+        needs_tighten = (dir_ == 1 and model_stop > broker_px + 0.24) or (
+            dir_ == -1 and model_stop < broker_px - 0.24
+        )
+        if not needs_tighten:
+            continue
+        bc = bracket.get("contract") or contract
+        ok = replace_trailing_stop_zero_gap(
+            ib, bc, bracket, model_stop, dir_, stop_order, live_tracker=live_tracker,
+        )
+        if ok:
+            updated += 1
+            logging.info(
+                "Reconnect trail catch-up: broker %.2f -> model %.2f (dir=%s)",
+                broker_px,
+                model_stop,
+                dir_,
+            )
+    return updated
+
+
 def run_reconnection_safety_sequence(
     ib,
     contract,
@@ -2281,4 +2388,9 @@ def run_reconnection_safety_sequence(
     protect_existing_positions(ib, contract, positions, strategy, data, live_tracker)
     check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker)
     enforce_stop_invariant(ib, positions, strategy, data, live_tracker, contract=contract)
+    n_catchup = catch_up_model_trailing_stops(
+        ib, contract, positions, strategy, data, live_tracker=live_tracker,
+    )
+    if n_catchup:
+        logging.info("Post-reconnect: trail catch-up on %s bracket(s)", n_catchup)
     logging.info("Safety sequence complete")

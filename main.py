@@ -94,7 +94,8 @@ from core.protection import (cancel_all_pending, cleanup_orphaned_orders, close_
                               periodic_protection_check, run_reconnection_safety_sequence,
                               reconcile_positions, restore_tracked_brackets_from_ib,
                               ensure_all_bracket_stops_armed, enforce_stop_invariant,
-                              consolidate_duplicate_protective_orders)
+                              consolidate_duplicate_protective_orders,
+                              log_stop_drift_on_disconnect)
 from core.shutdown import register_shutdown_checker, ShutdownRequested, is_shutdown_requested
 from core.monitoring import (
     on_bar_update_handler,
@@ -1009,6 +1010,7 @@ def check_disconnect_status():
             disconnect_start_time = datetime.now()
             disconnect_email_sent = False
             logging.warning("API disconnected - tracking time")
+            log_stop_drift_on_disconnect(positions, label="api_disconnect", live_tracker=live_tracker)
 
         if not disconnect_email_sent:
             dur = (datetime.now() - disconnect_start_time).total_seconds()

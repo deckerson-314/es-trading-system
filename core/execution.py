@@ -20,8 +20,12 @@ from core.protection import (
     cancel_residual_orders_when_flat_on_contract,
     ensure_bracket_protective_stop,
     ensure_bracket_stop_armed,
+    mark_trail_replace_grace,
+    replace_oca_exit_pair_zero_gap,
     replace_trailing_stop_zero_gap,
     stop_order_is_armed,
+    stop_order_is_pending,
+    trail_replace_grace_active,
     wire_bracket_entry_from_ib,
     _find_protective_stop_trade_for_position,
     _find_trade_for_order,
@@ -167,6 +171,24 @@ def _wait_oca_pair_cancelled_with_retries(
     return last
 
 
+def _exit_path(reason: str) -> str:
+    """Normalized exit path for GA/live divergence analysis (architecture review P3)."""
+    lit = _live_exit_type(reason)
+    if lit == "software_stop_backup":
+        return "software_backup"
+    if lit == "broker_stop":
+        return "broker_stop"
+    if lit == "broker_tp":
+        return "broker_tp"
+    if "channel" in lit:
+        return "channel_signal"
+    if lit in ("maintenance", "rth"):
+        return lit
+    if lit == "trail_replace_pending":
+        return "trail_replace_pending"
+    return lit or "other"
+
+
 def _exit_slippage_metrics(
     dir_: int,
     exit_price: float,
@@ -174,6 +196,8 @@ def _exit_slippage_metrics(
     working_tp: Optional[float],
     reason: str,
     qty: float = 1.0,
+    broker_stop_at_exit: Optional[float] = None,
+    model_stop_at_exit: Optional[float] = None,
 ) -> dict:
     """
     Compare fill vs last known broker protective level (§9.3 reporting).
@@ -183,7 +207,8 @@ def _exit_slippage_metrics(
         "slippage_pts": None,
         "slippage_usd": None,
         "slippage_reference": None,
-        "model_stop_at_exit": working_stop,
+        "model_stop_at_exit": model_stop_at_exit if model_stop_at_exit is not None else working_stop,
+        "broker_stop_at_exit": broker_stop_at_exit,
     }
     if exit_price <= 0:
         return out
@@ -357,39 +382,63 @@ def _handle_protective_backup(
     dir_,
     stop_should_trigger: bool,
     stop_price_for_breach: float,
+    trail_grace_active: bool = False,
 ) -> bool:
   """
-  Backup flatten when model stop is breached but the broker leg cannot protect.
+  Backup flatten when price breached stop but the broker leg cannot protect.
+  When broker-authoritative: defer to armed Submitted stops (industry standard).
   Returns True if a close was initiated.
   """
   if not stop_should_trigger:
+    return False
+
+  if trail_grace_active:
+    logging.info(
+      "Protective backup deferred: post-trail grace (stop %.2f)",
+      stop_price_for_breach,
+    )
     return False
 
   stop_armed = stop_order_is_armed(stop_trade)
   stop_status = stop_trade.orderStatus.status if stop_trade and stop_trade.orderStatus else None
   why_held = getattr(stop_trade.orderStatus, "whyHeld", "") if stop_trade and stop_trade.orderStatus else ""
 
+  breach_px = latest_row.get("low") if dir_ == 1 else latest_row.get("high")
+  if breach_px is None:
+    breach_px = latest_row["close"]
+
   if broker_authoritative_exits_enabled():
-    breach_px = latest_row.get("low") if dir_ == 1 else latest_row.get("high")
-    if breach_px is None:
-      breach_px = latest_row["close"]
     if stop_armed:
-      logging.warning(
-        "Software Stop (backup): price %.2f breached stop %.2f; armed leg still open "
-        "(status=%s); forcing market close",
+      logging.info(
+        "Broker-authoritative: deferring protective backup to armed stop "
+        "(breach %.2f vs stop %.2f, status=%s)",
         breach_px,
         stop_price_for_breach,
         stop_status,
       )
-    else:
+      return False
+    if stop_order_is_pending(stop_trade) and "trigger" in str(why_held).lower():
       logging.warning(
-        "Software Stop (backup): price %.2f breached stop %.2f; stop not armed "
-        "(%s / %s); forcing market close",
+        "Software Stop (backup): price %.2f breached stop %.2f; stop PreSubmitted "
+        "(whyHeld=%s); forcing market close",
         breach_px,
         stop_price_for_breach,
-        stop_status or "missing",
-        why_held or "no whyHeld",
+        why_held or "trigger",
       )
+      _force_close_position(
+        ib, bracket_contract, bracket, positions, completed_trades,
+        live_tracker, send_email_fn, entry_trade, latest_row["close"],
+        "Software Stop (backup)", data=data, strategy=strategy,
+      )
+      return True
+    logging.warning(
+      "Software Stop (backup): price %.2f breached stop %.2f; stop not armed "
+      "(%s / %s); forcing market close",
+      breach_px,
+      stop_price_for_breach,
+      stop_status or "missing",
+      why_held or "no whyHeld",
+    )
     _force_close_position(
       ib, bracket_contract, bracket, positions, completed_trades,
       live_tracker, send_email_fn, entry_trade, latest_row["close"],
@@ -481,46 +530,44 @@ def _handle_strategy_signal_exit(
     exit_price_hint,
     stop_active: bool,
     tp_active: bool,
+    trail_grace_active: bool = False,
+    trail_ratchet_this_bar: bool = False,
 ) -> bool:
   """Route check_exit reasons; returns True if position close was initiated."""
   price = latest_row["close"]
   logging.info("STRATEGY SIGNAL EXIT: %s triggered @ %.2f", exit_reason, price)
 
+  if exit_reason == "Stop Loss":
+    if trail_grace_active:
+      logging.info(
+        "Deferring strategy Stop Loss: post-trail grace (model stop active)",
+      )
+      return False
+    if trail_ratchet_this_bar:
+      logging.info(
+        "Deferring strategy Stop Loss: same bar as trail ratchet (bars_held=%s)",
+        bracket.get("position_dict", {}).get("bars_held"),
+      )
+      return False
+
   if broker_authoritative_exits_enabled():
     stop_armed = stop_active  # caller passes stop_order_is_armed(stop_trade)
     if exit_reason == "Stop Loss" and stop_armed:
-      broker_px = _broker_stop_trigger_price(
-        stop_trade.order if stop_trade else bracket.get("stopLoss")
-      )
-      stop_level = (
-        broker_px
-        if (broker_px is not None and broker_px > 0)
-        else (_effective_bracket_stop(bracket.get("stopLoss"), bracket, dir_) or 0.0)
-      )
-      breach_px = (
-        float(latest_row.get("low", price))
-        if dir_ == 1
-        else float(latest_row.get("high", price))
-      )
-      if _model_stop_breached(dir_, breach_px, stop_level):
-        logging.warning(
-          "Broker-authoritative: stop breached @ %.2f (stop %.2f) but Submitted leg "
-          "did not fill; forcing software backup",
-          breach_px,
-          stop_level,
-        )
-        _force_close_position(
-          ib, bracket_contract, bracket, positions, completed_trades,
-          live_tracker, send_email_fn, entry_trade, price,
-          "Software Stop (backup)", data=data, strategy=strategy,
-        )
-        return True
       st = stop_trade.orderStatus.status if stop_trade and stop_trade.orderStatus else "?"
       logging.info(
-        "Broker-authoritative: deferring Stop Loss to armed stop (status=%s); no soft market exit",
+        "Broker-authoritative: deferring strategy Stop Loss to armed stop "
+        "(status=%s); protective backup handles unarmed breach",
         st,
       )
       return False
+    if exit_reason == "Stop Loss" and stop_trade and stop_order_is_pending(stop_trade):
+      why_held = getattr(stop_trade.orderStatus, "whyHeld", "") if stop_trade.orderStatus else ""
+      if "trigger" in str(why_held).lower():
+        logging.info(
+          "Deferring strategy Stop Loss: stop pending broker replace (whyHeld=%s)",
+          why_held or "trigger",
+        )
+        return False
     if exit_reason == "Take Profit" and tp_active:
       st = tp_trade.orderStatus.status if tp_trade and tp_trade.orderStatus else "?"
       logging.info(
@@ -1589,30 +1636,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
             continue
 
         current_price = latest_row['close']
-        live_stop_order = stop_trade.order if stop_trade else stop_order
-        broker_px = _broker_stop_trigger_price(live_stop_order)
-        stop_price_for_breach = (
-            broker_px
-            if (broker_px is not None and broker_px > 0)
-            else (_effective_bracket_stop(stop_order, bracket, dir_) or 0.0)
-        )
-
-        if allow_strategy_exit:
-            breach_row = _eval_row_for_exit(bracket, latest_row)
-            hi = float(
-                breach_row.get("high", current_price)
-                if hasattr(breach_row, "get")
-                else breach_row["high"]
-            )
-            lo = float(
-                breach_row.get("low", current_price)
-                if hasattr(breach_row, "get")
-                else breach_row["low"]
-            )
-            breach_px = lo if dir_ == 1 else hi
-        else:
-            breach_px = current_price
-        stop_should_trigger = _model_stop_breached(dir_, breach_px, stop_price_for_breach)
+        trail_ratchet_this_bar = False
 
         # --- Trailing stop update (strategy bar first: trail → broker sync → exits) ---
         if position_still_open:
@@ -1638,6 +1662,8 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 stop_before_trail_update = float(_sb) if _sb is not None else 0.0
 
                 stop_updated = strategy.update_trailing_stop(strat_pos, latest_row, data)
+                if stop_updated:
+                    trail_ratchet_this_bar = True
 
                 # Strategy may write NaN/inf into stop on bad bar data; clamp before IB / round().
                 _trail_raw = _finite_stop_scalar(strat_pos.get("stop"))
@@ -1707,16 +1733,38 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                             use_stop_replace = bool(tp_order or og or getattr(stop_order, "parentId", 0))
                             try:
                                 if use_stop_replace:
-                                    ok = replace_trailing_stop_zero_gap(
-                                        ib,
-                                        bracket_contract,
-                                        bracket,
-                                        new_stop,
-                                        dir_,
-                                        stop_order,
-                                        live_tracker=live_tracker,
-                                        timeout=5.0,
+                                    tp_lmt = _finite_stop_scalar(
+                                        getattr(tp_order, "lmtPrice", None)
                                     )
+                                    if tp_lmt is None:
+                                        tp_lmt = _finite_stop_scalar(bracket.get("entry_tp_price"))
+                                    use_oca_pair = bool(
+                                        tp_order and tp_lmt is not None and og
+                                    )
+                                    if use_oca_pair:
+                                        ok = replace_oca_exit_pair_zero_gap(
+                                            ib,
+                                            bracket_contract,
+                                            bracket,
+                                            new_stop,
+                                            tp_lmt,
+                                            dir_,
+                                            stop_order,
+                                            tp_order,
+                                            live_tracker=live_tracker,
+                                            timeout=5.0,
+                                        )
+                                    else:
+                                        ok = replace_trailing_stop_zero_gap(
+                                            ib,
+                                            bracket_contract,
+                                            bracket,
+                                            new_stop,
+                                            dir_,
+                                            stop_order,
+                                            live_tracker=live_tracker,
+                                            timeout=5.0,
+                                        )
                                     if not ok:
                                         strat_pos["stop"] = stop_before_trail_update
                                         position_dict["stop"] = stop_before_trail_update
@@ -1816,10 +1864,36 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
             stop_armed = stop_order_is_armed(stop_trade)
             tp_active = _protective_order_active(tp_trade)
 
+            # Post-trail breach uses refreshed broker stop (not pre-trail snapshot).
+            live_stop_order = stop_trade.order if stop_trade else stop_order
+            broker_px = _broker_stop_trigger_price(live_stop_order)
+            stop_price_for_breach = (
+                broker_px
+                if (broker_px is not None and broker_px > 0)
+                else (_effective_bracket_stop(stop_order, bracket, dir_) or 0.0)
+            )
+            if allow_strategy_exit:
+                breach_row = _eval_row_for_exit(bracket, latest_row)
+                hi = float(
+                    breach_row.get("high", current_price)
+                    if hasattr(breach_row, "get")
+                    else breach_row["high"]
+                )
+                lo = float(
+                    breach_row.get("low", current_price)
+                    if hasattr(breach_row, "get")
+                    else breach_row["low"]
+                )
+                breach_px = lo if dir_ == 1 else hi
+            else:
+                breach_px = current_price
+            stop_should_trigger = _model_stop_breached(dir_, breach_px, stop_price_for_breach)
+
             if _handle_protective_backup(
                 ib, bracket_contract, bracket, positions, completed_trades,
                 live_tracker, send_email_fn, entry_trade, latest_row, data, strategy,
                 stop_trade, dir_, stop_should_trigger, stop_price_for_breach,
+                trail_grace_active=trail_replace_grace_active(bracket),
             ):
                 continue
 
@@ -1836,6 +1910,8 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                             live_tracker, send_email_fn, entry_trade, latest_row, data, strategy,
                             stop_trade, tp_trade, dir_, exit_reason, exit_price_hint,
                             stop_armed, tp_active,
+                            trail_grace_active=trail_replace_grace_active(bracket),
+                            trail_ratchet_this_bar=trail_ratchet_this_bar,
                         )
                         if closed:
                             continue
@@ -1898,6 +1974,10 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
         dir_ = 1 if actual_pos > 0 else -1
         stop_at_close_snap = _effective_bracket_stop(stop_order, bracket, dir_)
         tp_at_close_snap = getattr(tp_order, 'lmtPrice', None) if tp_order else None
+        broker_stop_at_exit = _broker_stop_trigger_price(stop_order)
+        model_stop_at_exit = (bracket.get("position_dict") or {}).get("stop")
+        if model_stop_at_exit is not None:
+            model_stop_at_exit = _finite_stop_scalar(model_stop_at_exit)
 
         # Cancel existing orders (snapshot SL/TP first for reporting)
         for order in [bracket.get('stopLoss'), bracket.get('takeProfit')]:
@@ -1936,6 +2016,8 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
             report_url = ""
             slip = _exit_slippage_metrics(
                 dir_, exit_price, stop_at_close_snap, tp_at_close_snap, reason, qty,
+                broker_stop_at_exit=broker_stop_at_exit,
+                model_stop_at_exit=model_stop_at_exit,
             )
             if strategy:
                 try:
@@ -1954,9 +2036,12 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                             'tp_at_open': bracket.get('entry_tp_price'),
                             'params_snapshot': bracket.get('params_snapshot') or {},
                             'live_exit_type': _live_exit_type(reason),
+                            'exit_path': _exit_path(reason),
                             'slippage_pts': slip.get('slippage_pts'),
                             'slippage_usd': slip.get('slippage_usd'),
                             'slippage_reference': slip.get('slippage_reference'),
+                            'broker_stop_at_exit': broker_stop_at_exit,
+                            'model_stop_at_exit': model_stop_at_exit,
                         },
                         data, trades_dir
                     )
@@ -1985,6 +2070,7 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                 'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
                 'pnl': pnl, 'reason': reason,
                 'live_exit_type': _live_exit_type(reason),
+                'exit_path': _exit_path(reason),
                 'duration': duration_str,
                 'report_url': report_url,
                 'params_snapshot': bracket.get('params_snapshot') or {},
@@ -1996,6 +2082,8 @@ def _force_close_position(ib, contract, bracket, positions, completed_trades,
                 'slippage_pts': slip.get('slippage_pts'),
                 'slippage_usd': slip.get('slippage_usd'),
                 'slippage_reference': slip.get('slippage_reference'),
+                'model_stop_at_exit': slip.get('model_stop_at_exit'),
+                'broker_stop_at_exit': slip.get('broker_stop_at_exit'),
             })
         else:
             logging.error(f"Force close failed: Position still exists for {bracket_contract.localSymbol}")
@@ -2368,6 +2456,10 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     duration_str = format_duration((exit_time - entry_time).total_seconds()) if entry_time else "N/A"
 
     curr_stop = _effective_bracket_stop(stop_order, bracket, dir_) or 0
+    broker_stop_at_exit = _broker_stop_trigger_price(stop_order)
+    model_stop_at_exit = (bracket.get("position_dict") or {}).get("stop")
+    if model_stop_at_exit is not None:
+        model_stop_at_exit = _finite_stop_scalar(model_stop_at_exit)
 
     # Generate HTML report if possible
     report_url = ""
@@ -2379,6 +2471,8 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
             tp_close_px = getattr(tp_order, 'lmtPrice', None) if tp_order else None
             slip_pre = _exit_slippage_metrics(
                 dir_, exit_price, curr_stop or None, tp_close_px, reason, qty=qty,
+                broker_stop_at_exit=broker_stop_at_exit,
+                model_stop_at_exit=model_stop_at_exit,
             )
             report_path = strategy.generate_trade_report(
                 {
@@ -2387,6 +2481,7 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
                     'exit_price': exit_price, 'pnl': pnl, 'qty': qty,
                     'reason': reason,
                     'live_exit_type': _live_exit_type(reason),
+                    'exit_path': _exit_path(reason),
                     'stop_at_close': curr_stop or None,
                     'tp_at_close': tp_close_px,
                     'stop_at_open': bracket.get('entry_stop_price'),
@@ -2395,6 +2490,8 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
                     'slippage_pts': slip_pre.get('slippage_pts'),
                     'slippage_usd': slip_pre.get('slippage_usd'),
                     'slippage_reference': slip_pre.get('slippage_reference'),
+                    'broker_stop_at_exit': broker_stop_at_exit,
+                    'model_stop_at_exit': model_stop_at_exit,
                 },
                 data, trades_dir
             )
@@ -2419,6 +2516,8 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     tp_close_px = getattr(tp_order, 'lmtPrice', None) if tp_order else None
     slip = _exit_slippage_metrics(
         dir_, exit_price, curr_stop or None, tp_close_px, reason, qty=qty,
+        broker_stop_at_exit=broker_stop_at_exit,
+        model_stop_at_exit=model_stop_at_exit,
     )
 
     _append_completed_trade_record(completed_trades, {
@@ -2427,6 +2526,7 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         'qty': qty, 'entry_price': entry_price, 'exit_price': exit_price,
         'pnl': pnl, 'r_multiple': r_multiple, 'reason': reason,
         'live_exit_type': _live_exit_type(reason),
+        'exit_path': _exit_path(reason),
         'duration': duration_str,
         'report_url': report_url,
         'params_snapshot': bracket.get('params_snapshot') or {},
@@ -2439,6 +2539,7 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         'slippage_usd': slip.get('slippage_usd'),
         'slippage_reference': slip.get('slippage_reference'),
         'model_stop_at_exit': slip.get('model_stop_at_exit'),
+        'broker_stop_at_exit': slip.get('broker_stop_at_exit'),
     })
 
     # Remove any non-terminal legs on this conId (includes **Inactive** TP after OCA replace races).

@@ -9,7 +9,14 @@ import core.execution as core_execution
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from core.execution import check_exits, _force_close_position
+from core.execution import (
+    check_exits,
+    _force_close_position,
+    _handle_protective_backup,
+    _handle_strategy_signal_exit,
+    _exit_path,
+)
+from core.protection import mark_trail_replace_grace, trail_replace_grace_active
 
 class TestExitLogic(unittest.TestCase):
     def test_short_exit_no_trigger(self):
@@ -424,6 +431,154 @@ class TestExitLogic(unittest.TestCase):
         )
 
         strategy.update_trailing_stop.assert_called_once()
+
+    def test_protective_backup_defers_when_stop_armed(self):
+        """P0: armed broker stop must not trigger software backup flatten."""
+        ib = MagicMock()
+        contract = MagicMock()
+        stop_order = MagicMock()
+        stop_order.orderType = "STP"
+        stop_order.auxPrice = 6630.0
+        stop_order.stopPrice = 6630.0
+        stop_order.lmtPrice = 0.0
+        stop_trade = MagicMock()
+        stop_trade.order = stop_order
+        stop_trade.orderStatus = MagicMock(status="Submitted", whyHeld="")
+        latest_row = {"close": 6635.0, "high": 6635.0, "low": 6625.0}
+        bracket = {"direction": -1, "position_dict": {"stop": 6630.0}}
+
+        old_force = core_execution._force_close_position
+        core_execution._force_close_position = MagicMock()
+        old_flag = os.environ.get("LIVE_BROKER_AUTHORITATIVE_EXIT")
+        os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = "1"
+        try:
+            closed = _handle_protective_backup(
+                ib, contract, bracket, [], [], MagicMock(), MagicMock(),
+                MagicMock(), latest_row, None, MagicMock(), stop_trade, -1,
+                stop_should_trigger=True, stop_price_for_breach=6630.0,
+            )
+            self.assertFalse(closed)
+            core_execution._force_close_position.assert_not_called()
+        finally:
+            core_execution._force_close_position = old_force
+            if old_flag is None:
+                os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
+            else:
+                os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+    def test_trail_replace_grace_skips_protective_backup(self):
+        bracket = {}
+        mark_trail_replace_grace(bracket, seconds=5.0)
+        self.assertTrue(trail_replace_grace_active(bracket))
+
+        ib = MagicMock()
+        stop_order = MagicMock()
+        stop_trade = MagicMock()
+        stop_trade.order = stop_order
+        stop_trade.orderStatus = MagicMock(status="Cancelled", whyHeld="")
+        latest_row = {"close": 100.0, "high": 101.0, "low": 99.0}
+
+        old_force = core_execution._force_close_position
+        core_execution._force_close_position = MagicMock()
+        old_flag = os.environ.get("LIVE_BROKER_AUTHORITATIVE_EXIT")
+        os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = "1"
+        try:
+            closed = _handle_protective_backup(
+                ib, MagicMock(), bracket, [], [], MagicMock(), MagicMock(),
+                MagicMock(), latest_row, None, MagicMock(), stop_trade, 1,
+                stop_should_trigger=True, stop_price_for_breach=99.5,
+                trail_grace_active=True,
+            )
+            self.assertFalse(closed)
+            core_execution._force_close_position.assert_not_called()
+        finally:
+            core_execution._force_close_position = old_force
+            if old_flag is None:
+                os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
+            else:
+                os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+    def test_strategy_signal_defers_stop_on_trail_grace(self):
+        """P0: strategy Stop Loss must defer during post-trail grace like protective backup."""
+        ib = MagicMock()
+        stop_trade = MagicMock()
+        stop_trade.orderStatus = MagicMock(status="Cancelled", whyHeld="")
+        old_force = core_execution._force_close_position
+        core_execution._force_close_position = MagicMock()
+        old_flag = os.environ.get("LIVE_BROKER_AUTHORITATIVE_EXIT")
+        os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = "1"
+        try:
+            closed = _handle_strategy_signal_exit(
+                ib, MagicMock(), {"position_dict": {"bars_held": 2}},
+                [], [], MagicMock(), MagicMock(), MagicMock(),
+                {"close": 100.0}, None, MagicMock(), stop_trade, MagicMock(),
+                -1, "Stop Loss", 100.0, stop_active=False, tp_active=False,
+                trail_grace_active=True,
+            )
+            self.assertFalse(closed)
+            core_execution._force_close_position.assert_not_called()
+        finally:
+            core_execution._force_close_position = old_force
+            if old_flag is None:
+                os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
+            else:
+                os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+    def test_strategy_signal_defers_stop_on_trail_ratchet_bar(self):
+        """P0: same-bar trail ratchet must not trigger software backup Stop Loss."""
+        ib = MagicMock()
+        stop_trade = MagicMock()
+        stop_trade.orderStatus = MagicMock(status="Submitted", whyHeld="")
+        old_force = core_execution._force_close_position
+        core_execution._force_close_position = MagicMock()
+        old_flag = os.environ.get("LIVE_BROKER_AUTHORITATIVE_EXIT")
+        os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = "1"
+        try:
+            closed = _handle_strategy_signal_exit(
+                ib, MagicMock(), {"position_dict": {"bars_held": 2}},
+                [], [], MagicMock(), MagicMock(), MagicMock(),
+                {"close": 100.0}, None, MagicMock(), stop_trade, MagicMock(),
+                -1, "Stop Loss", 100.0, stop_active=True, tp_active=False,
+                trail_ratchet_this_bar=True,
+            )
+            self.assertFalse(closed)
+            core_execution._force_close_position.assert_not_called()
+        finally:
+            core_execution._force_close_position = old_force
+            if old_flag is None:
+                os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
+            else:
+                os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+    def test_strategy_signal_defers_stop_when_broker_stop_armed(self):
+        """P0: armed broker stop must defer strategy Stop Loss (no cancel+market)."""
+        ib = MagicMock()
+        stop_trade = MagicMock()
+        stop_trade.orderStatus = MagicMock(status="Submitted", whyHeld="")
+        old_force = core_execution._force_close_position
+        core_execution._force_close_position = MagicMock()
+        old_flag = os.environ.get("LIVE_BROKER_AUTHORITATIVE_EXIT")
+        os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = "1"
+        try:
+            closed = _handle_strategy_signal_exit(
+                ib, MagicMock(), {"position_dict": {"bars_held": 2}},
+                [], [], MagicMock(), MagicMock(), MagicMock(),
+                {"close": 100.0}, None, MagicMock(), stop_trade, MagicMock(),
+                -1, "Stop Loss", 100.0, stop_active=True, tp_active=False,
+            )
+            self.assertFalse(closed)
+            core_execution._force_close_position.assert_not_called()
+        finally:
+            core_execution._force_close_position = old_force
+            if old_flag is None:
+                os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
+            else:
+                os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+    def test_exit_path_mapping(self):
+        self.assertEqual(_exit_path("Broker Stop"), "broker_stop")
+        self.assertEqual(_exit_path("Software Stop (backup)"), "software_backup")
+        self.assertEqual(_exit_path("Channel Exit (signal)"), "channel_signal")
 
     def test_broker_auth_defers_stop_loss_when_stop_armed(self):
         """Phase 2: no cancel+market on strategy SL when broker stop is Submitted and not breached."""

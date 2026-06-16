@@ -435,6 +435,61 @@ def _mean_trade_duration_minutes(trades_df, bar_minutes=None):
         return 0.0
 
 
+def _truthy_ga_flag(val) -> bool:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return int(val) != 0
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+from core.sim_fidelity import (
+    apply_conservative_stop_slippage,
+    ga_pessimistic_stops_enabled,
+    resolve_ga_stop_exit_price,
+    should_skip_same_bar_stop_after_trail,
+)
+
+
+def _ga_live_style_entry_enabled(param_dict_local=None) -> bool:
+    """GA fidelity: enter at signal-bar close (matches live market-at-close)."""
+    if param_dict_local and "GA_LIVE_STYLE_ENTRY" in param_dict_local:
+        return _truthy_ga_flag(param_dict_local["GA_LIVE_STYLE_ENTRY"].get("value"))
+    raw = os.environ.get("GA_LIVE_STYLE_ENTRY", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _ga_conservative_stop_slippage_pts(param_dict_local=None) -> float:
+    """GA fidelity: worsen stop fills by N points (0 = disabled)."""
+    if param_dict_local and "GA_CONSERVATIVE_STOP_SLIPPAGE" in param_dict_local:
+        v = param_dict_local["GA_CONSERVATIVE_STOP_SLIPPAGE"].get("value")
+        if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip() != "":
+            try:
+                return max(0.0, float(v))
+            except (TypeError, ValueError):
+                pass
+    raw = os.environ.get("GA_CONSERVATIVE_STOP_SLIPPAGE", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ga_apply_conservative_stop_fill(
+    price: float, direction: int, reason: str, param_dict_local=None,
+) -> float:
+    """Worsen stop-loss exit price to reduce optimistic GA stop assumptions."""
+    slip = _ga_conservative_stop_slippage_pts(param_dict_local)
+    if slip <= 0 or not reason or "stop" not in str(reason).lower():
+        return price
+    # Long stop: exit lower; short stop: exit higher
+    return price - slip * int(direction)
+
+
 def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=False, mask=None):
     default_result = {
         'sortino': 0,
@@ -512,6 +567,7 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     positions = []
     trades = []
     pending_entry = None # Track pending entry
+    live_style_entry = _ga_live_style_entry_enabled(param_dict_local)
     
     # Pre-calculate signals (already in columns)
     # Using itertuples is efficient enough for Python loop
@@ -555,16 +611,29 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
 
         # 2. Check exits first
         for pos in positions[:]:
-            strategy.update_trailing_stop(pos, row, df)
+            stop_updated_same_bar = strategy.update_trailing_stop(pos, row, df)
             should_exit, reason, price = strategy.check_exit(pos, row, df)
-            
+
+            if should_skip_same_bar_stop_after_trail(
+                should_exit, reason, stop_updated_same_bar, param_dict_local,
+            ):
+                continue
+
             if should_exit:
                 # Ensure transaction_cost is float
                 try:
                     t_cost = float(transaction_cost)
                 except (ValueError, TypeError):
                     t_cost = 0.0
-                    
+
+                price = resolve_ga_stop_exit_price(
+                    price,
+                    pos["direction"],
+                    reason,
+                    row,
+                    param_dict_local,
+                    stop_updated_same_bar=stop_updated_same_bar,
+                )
                 pnl = (price - pos['entry_price']) * pos['direction'] * 50 - t_cost
                 # Use End of Bar for Exit Time to match BB_Strategy_v4.py logic
                 exit_time = row.Index + pd.Timedelta(seconds=59)
@@ -577,13 +646,23 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
                 positions.remove(pos)
         
         # 3. Check entries (Vectorized lookup)
-        # Note: If we just executed a pending entry, we CANNOT generate another signal in the same bar (usually)
-        # But even if we could, we would just set pending_entry again for the NEXT bar.
         if len(positions) < strategy.max_open_trades and pending_entry is None:
             if row.entry_long_signal:
-                pending_entry = {'direction': 1, 'entry_price': row.close, 'stop': 0.0} # Init fields
+                if live_style_entry:
+                    pos = strategy.setup_position(row.close, 1, row, df)
+                    if 'stop' not in pos:
+                        pos['stop'] = 0.0
+                    positions.append(pos)
+                else:
+                    pending_entry = {'direction': 1, 'entry_price': row.close, 'stop': 0.0}
             elif row.entry_short_signal:
-                pending_entry = {'direction': -1, 'entry_price': row.close, 'stop': 0.0}
+                if live_style_entry:
+                    pos = strategy.setup_position(row.close, -1, row, df)
+                    if 'stop' not in pos:
+                        pos['stop'] = 0.0
+                    positions.append(pos)
+                else:
+                    pending_entry = {'direction': -1, 'entry_price': row.close, 'stop': 0.0}
     
     # Final cleanup (close open positions at end)
     for pos in positions:
@@ -2091,6 +2170,7 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
                      'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                      'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                      'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE',
+                     'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                      'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
                      'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
                      'ENABLE_FILTER_STACK_TRADE_PENALTY', 'INTERACTION_PENALTY_STRENGTH',
@@ -3079,6 +3159,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                      'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                      'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                      'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE',
+                     'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                      'ENABLE_FILTER_STACK_TRADE_PENALTY', 'INTERACTION_PENALTY_STRENGTH',
                      'INTERACTION_LOW_TRADES_BASE', 'INTERACTION_LOW_TRADES_PER_FILTER',
                      'INTERACTION_MIN_FILTERS']
@@ -4111,6 +4192,7 @@ def main():
                            'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                            'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT',
                            'GA_START_DATE', 'GA_END_DATE',
+                           'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                            'ENABLE_FILTER_STACK_TRADE_PENALTY', 'INTERACTION_PENALTY_STRENGTH',
                            'INTERACTION_LOW_TRADES_BASE', 'INTERACTION_LOW_TRADES_PER_FILTER',
                            'INTERACTION_MIN_FILTERS'],
@@ -4221,7 +4303,8 @@ def main():
                               'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                               'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                               'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT',
-                              'GA_START_DATE', 'GA_END_DATE', 
+                              'GA_START_DATE', 'GA_END_DATE',
+                              'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                               'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
                               'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
                               'NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 

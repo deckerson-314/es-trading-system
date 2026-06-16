@@ -192,6 +192,9 @@ def generate_unified_trade_report(
 
     reason = str(_trade_get(trade, "reason", "N/A"))
     live_exit_type = str(_trade_get(trade, "live_exit_type", "") or "")
+    exit_path = str(_trade_get(trade, "exit_path", "") or "")
+    broker_stop_exit = _trade_get(trade, "broker_stop_at_exit", None)
+    model_stop_exit = _trade_get(trade, "model_stop_at_exit", None)
     duration = str(_trade_get(trade, "duration", "N/A") or "N/A")
     stop_open = _trade_get(trade, "stop_at_open", _trade_get(trade, "stop", None))
     tp_open = _trade_get(trade, "tp_at_open", _trade_get(trade, "tp", None))
@@ -432,6 +435,9 @@ def generate_unified_trade_report(
         "Duration": duration,
         "Reason": reason,
         "Live Exit Type": live_exit_type or "N/A",
+        "Exit Path": exit_path or "N/A",
+        "Broker Stop @ Exit": "N/A" if broker_stop_exit is None else f"{float(broker_stop_exit):,.2f}",
+        "Model Stop @ Exit": "N/A" if model_stop_exit is None else f"{float(model_stop_exit):,.2f}",
         "Stop @ Open": "N/A" if stop_open is None else f"{float(stop_open):,.2f}",
         "TP @ Open": "N/A" if tp_open is None else f"{float(tp_open):,.2f}",
         "Stop @ Close": "N/A" if stop_close is None else f"{float(stop_close):,.2f}",

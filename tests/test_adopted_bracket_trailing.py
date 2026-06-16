@@ -210,7 +210,7 @@ class TestCheckExitsAdoptedBracket:
         }
         positions = [bracket]
 
-        with patch("core.execution.replace_trailing_stop_zero_gap", return_value=True) as mock_replace:
+        with patch("core.execution.replace_oca_exit_pair_zero_gap", return_value=True) as mock_replace:
             check_exits(
                 strategy,
                 ib,
@@ -290,7 +290,7 @@ class TestCheckExitsAdoptedBracket:
             "contract": contract,
         }
 
-        with patch("core.execution.replace_trailing_stop_zero_gap", return_value=True) as mock_replace:
+        with patch("core.execution.replace_oca_exit_pair_zero_gap", return_value=True) as mock_replace:
             check_exits(
                 strategy,
                 ib,

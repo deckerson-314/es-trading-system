@@ -204,6 +204,11 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
         # 5. Simulation Loop
         if not suppress_log: log("Simulating trades...", log_file)
         
+        from core.sim_fidelity import (
+            resolve_ga_stop_exit_price,
+            should_skip_same_bar_stop_after_trail,
+        )
+
         positions = []
         open_positions = []
         rows = df.itertuples()
@@ -224,10 +229,23 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
             
             # B. Check Exits
             for i, pos in enumerate(open_positions[:]):
-                strategy.update_trailing_stop(pos, row, df)
+                stop_updated_same_bar = strategy.update_trailing_stop(pos, row, df)
                 should_exit, reason, price = strategy.check_exit(pos, row, df)
+
+                if should_skip_same_bar_stop_after_trail(
+                    should_exit, reason, stop_updated_same_bar, params_dict,
+                ):
+                    continue
                 
                 if should_exit:
+                    price = resolve_ga_stop_exit_price(
+                        price,
+                        pos["direction"],
+                        reason,
+                        row,
+                        params_dict,
+                        stop_updated_same_bar=stop_updated_same_bar,
+                    )
                     exit_time = row.Index + pd.Timedelta(seconds=59) # End of the 1m bar 
                     pnl_points = (price - pos['entry_price']) * pos['direction']
                     pnl_currency = pnl_points * 50 - transaction_cost # Hardcoded ES multiplier

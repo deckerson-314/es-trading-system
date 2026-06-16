@@ -42,7 +42,7 @@ Initial Stop Loss (%),0.9925,0.01,1,float,Fixed stop loss
 Enable Trailing Stop,1,0,1,int,Use ATR trailing stop
 ATR Length for Trailing Stop,48,3,50,int,ATR period for trailing
 ATR Multiplier for Trailing Stop,0.1,0.1,8,float,Trailing distance
-Trailing Delay (bars),1,0,50,int,Wait before trailing starts
+Trailing Delay (bars),1,3,50,int,Wait before trailing starts
 Trailing Delay (minutes),13,0,300,int,Context-aware trailing delay (preferred when present)
 Take Profit ATR Multiplier,5.0304,0,6,float,Optional Take Profit (0=None)
 Err:510,,,,,
@@ -73,6 +73,9 @@ MIN_WIN_RATE,0.35,0.3,0.5,float,Minimum win rate threshold (trend following is o
 SORTINO_CAP,10,5,20,float,Maximum Sortino value before capping
 GA_START_DATE,2020-01-02,,,str,Start date for GA backtest
 GA_END_DATE,2025-10-10,,,str,End date for GA backtest
+GA_LIVE_STYLE_ENTRY,1,0,1,int,GA sim entry at signal-bar close like live (0=next-bar open)
+GA_CONSERVATIVE_STOP_SLIPPAGE,1,0,2,float,Extra stop-loss slippage pts in GA sim (0=exact stop fill)
+GA_PESSIMISTIC_STOPS,1,0,1,int,Pessimistic stops: defer same-bar trail+stop; fill stops at bar close
 WEIGHT_SORTINO,1,,,float,Fitness weight: Sortino Ratio
 WEIGHT_DRAWDOWN,-1,,,float,Fitness weight: Max Drawdown
 WEIGHT_PF,1,,,float,Fitness weight: Profit Factor
