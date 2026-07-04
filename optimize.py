@@ -244,6 +244,8 @@ strategy_name_cap = args.strategy.capitalize()
 if args.params == DEFAULT_PARAM_CSV:
     if args.strategy == 'trend':
         PARAM_CSV = os.path.join('strategies', 'trend', 'parameters', 'trend_strategy_params.csv')
+    elif args.strategy == 'session':
+        PARAM_CSV = os.path.join('strategies', 'session', 'parameters', 'session_strategy_params.csv')
     else:
         PARAM_CSV = args.params
 else:
@@ -446,19 +448,16 @@ def _truthy_ga_flag(val) -> bool:
 
 
 from core.sim_fidelity import (
-    apply_conservative_stop_slippage,
-    ga_pessimistic_stops_enabled,
-    resolve_ga_stop_exit_price,
-    should_skip_same_bar_stop_after_trail,
+    apply_conservative_entry_slippage,
+    ga_live_style_entry_enabled,
+    simulate_bar_exit,
 )
 
 
 def _ga_live_style_entry_enabled(param_dict_local=None) -> bool:
     """GA fidelity: enter at signal-bar close (matches live market-at-close)."""
-    if param_dict_local and "GA_LIVE_STYLE_ENTRY" in param_dict_local:
-        return _truthy_ga_flag(param_dict_local["GA_LIVE_STYLE_ENTRY"].get("value"))
-    raw = os.environ.get("GA_LIVE_STYLE_ENTRY", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    from core.sim_fidelity import ga_live_style_entry_enabled
+    return ga_live_style_entry_enabled(param_dict_local)
 
 
 def _ga_conservative_stop_slippage_pts(param_dict_local=None) -> float:
@@ -520,24 +519,16 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     # strategy = BollingerBandStrategy(param_dict_local) # REMOVED
     strategy.update_optimizable_params(params)
     
-    # Resample logic for multiple timeframes
-    # This must happen BEFORE indicator calculation
+    # Resample logic for multiple timeframes (live-parity rules; skip HTF-native input)
+    from core.monitoring import prepare_strategy_ohlcv, resample_mask_to_htf
+
     tf = getattr(strategy, 'timeframe', 1)
     if tf > 1:
-        # Resample OHLCV
-        df_in = df_in.resample(f'{tf}T').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }).dropna()
-        
-        # Resample Mask if present
-        if mask is not None:
-            mask = mask.resample(f'{tf}T').max().fillna(False).astype(bool)
-            # Reindex to match the resampled OHLCV (handling dropped bars)
-            mask = mask.reindex(df_in.index).fillna(False)
+        df_in, htf_native = prepare_strategy_ohlcv(df_in, tf)
+        if mask is not None and not htf_native:
+            mask = resample_mask_to_htf(mask, tf, df_in.index)
+        elif mask is not None:
+            mask = mask.reindex(df_in.index).fillna(False).astype(bool)
 
     try:
         # Calculate indicators & signals (Vectorized)
@@ -603,64 +594,87 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
         # 1. Process Pending (Execute at Next Open)
         if pending_entry:
             dir_ = pending_entry['direction']
-            # Execute at OPEN
-            pos = strategy.setup_position(row.open, dir_, row, df)
+            entry_px = apply_conservative_entry_slippage(row.open, dir_, param_dict_local)
+            pos = strategy.setup_position(entry_px, dir_, row, df)
             if 'stop' not in pos: pos['stop'] = 0.0 # Safety init
             positions.append(pos)
             pending_entry = None
 
         # 2. Check exits first
         for pos in positions[:]:
-            stop_updated_same_bar = strategy.update_trailing_stop(pos, row, df)
-            should_exit, reason, price = strategy.check_exit(pos, row, df)
-
-            if should_skip_same_bar_stop_after_trail(
-                should_exit, reason, stop_updated_same_bar, param_dict_local,
-            ):
+            should_exit, reason, price = simulate_bar_exit(strategy, pos, row, df, param_dict_local)
+            if not should_exit:
                 continue
 
-            if should_exit:
-                # Ensure transaction_cost is float
-                try:
-                    t_cost = float(transaction_cost)
-                except (ValueError, TypeError):
-                    t_cost = 0.0
+            # Ensure transaction_cost is float
+            try:
+                t_cost = float(transaction_cost)
+            except (ValueError, TypeError):
+                t_cost = 0.0
 
-                price = resolve_ga_stop_exit_price(
-                    price,
-                    pos["direction"],
-                    reason,
-                    row,
-                    param_dict_local,
-                    stop_updated_same_bar=stop_updated_same_bar,
-                )
-                pnl = (price - pos['entry_price']) * pos['direction'] * 50 - t_cost
-                # Use End of Bar for Exit Time to match BB_Strategy_v4.py logic
-                exit_time = row.Index + pd.Timedelta(seconds=59)
-                trades.append(pos | {
-                    'exit_time': exit_time,
-                    'exit_price': price,
-                    'pnl': pnl,
-                    'reason': reason
-                })
-                positions.remove(pos)
+            pnl = (price - pos['entry_price']) * pos['direction'] * 50 - t_cost
+            # Use End of Bar for Exit Time to match BB_Strategy_v4.py logic
+            exit_time = row.Index + pd.Timedelta(seconds=59)
+            trades.append(pos | {
+                'exit_time': exit_time,
+                'exit_price': price,
+                'pnl': pnl,
+                'reason': reason
+            })
+            positions.remove(pos)
         
         # 3. Check entries (Vectorized lookup)
         if len(positions) < strategy.max_open_trades and pending_entry is None:
             if row.entry_long_signal:
                 if live_style_entry:
-                    pos = strategy.setup_position(row.close, 1, row, df)
+                    entry_px = apply_conservative_entry_slippage(row.close, 1, param_dict_local)
+                    pos = strategy.setup_position(entry_px, 1, row, df)
                     if 'stop' not in pos:
                         pos['stop'] = 0.0
                     positions.append(pos)
+                    should_exit, reason, price = simulate_bar_exit(
+                        strategy, pos, row, df, param_dict_local,
+                    )
+                    if should_exit:
+                        try:
+                            t_cost = float(transaction_cost)
+                        except (ValueError, TypeError):
+                            t_cost = 0.0
+                        pnl = (price - pos['entry_price']) * pos['direction'] * 50 - t_cost
+                        exit_time = row.Index + pd.Timedelta(seconds=59)
+                        trades.append(pos | {
+                            'exit_time': exit_time,
+                            'exit_price': price,
+                            'pnl': pnl,
+                            'reason': reason,
+                        })
+                        positions.remove(pos)
                 else:
                     pending_entry = {'direction': 1, 'entry_price': row.close, 'stop': 0.0}
             elif row.entry_short_signal:
                 if live_style_entry:
-                    pos = strategy.setup_position(row.close, -1, row, df)
+                    entry_px = apply_conservative_entry_slippage(row.close, -1, param_dict_local)
+                    pos = strategy.setup_position(entry_px, -1, row, df)
                     if 'stop' not in pos:
                         pos['stop'] = 0.0
                     positions.append(pos)
+                    should_exit, reason, price = simulate_bar_exit(
+                        strategy, pos, row, df, param_dict_local,
+                    )
+                    if should_exit:
+                        try:
+                            t_cost = float(transaction_cost)
+                        except (ValueError, TypeError):
+                            t_cost = 0.0
+                        pnl = (price - pos['entry_price']) * pos['direction'] * 50 - t_cost
+                        exit_time = row.Index + pd.Timedelta(seconds=59)
+                        trades.append(pos | {
+                            'exit_time': exit_time,
+                            'exit_price': price,
+                            'pnl': pnl,
+                            'reason': reason,
+                        })
+                        positions.remove(pos)
                 else:
                     pending_entry = {'direction': -1, 'entry_price': row.close, 'stop': 0.0}
     
@@ -844,6 +858,30 @@ def create_individual():
     # Clamp to ensure values are within range (shouldn't be needed, but safety check)
     return clamp_individual(ind)
 
+
+def _maybe_diversify_initial_population(pop, param_dict_local):
+    """Optional stratified seeds (Trend exploration); controlled via param CSV."""
+    try:
+        raw = param_dict_local.get("GA_DIVERSE_SEED", {}).get("value", 0)
+        enabled = str(raw).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = False
+    if not enabled:
+        return 0
+    try:
+        frac = float(param_dict_local.get("GA_DIVERSE_SEED_FRACTION", {}).get("value", 0.6))
+    except (TypeError, ValueError):
+        frac = 0.6
+    try:
+        from strategies.trend.ga_exploration_seed import diversify_initial_population
+    except ImportError:
+        print("WARNING: GA_DIVERSE_SEED enabled but strategies.trend.ga_exploration_seed not found.")
+        return 0
+    n = diversify_initial_population(pop, param_keys, param_dict_local, clamp_individual, fraction=frac)
+    if n:
+        print(f"  Diverse seed: applied {n} stratified archetypes ({frac:.0%} of pop)")
+    return n
+
 def custom_mutate(ind):
     global PARAM_RANGES, param_keys, MUT_MU, MUT_SIGMA
     if PARAM_RANGES is None:
@@ -903,8 +941,8 @@ def core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local=
         params['Timeframe (minutes)'] = max(1, int(round(param_dict_local['Timeframe (minutes)']['value'])))
     apply_trailing_param_context(params, param_dict_local)
     if trailing_stop_enabled(params, param_dict_local):
-        params['Trailing Delay (bars)'] = resolve_trailing_delay_bars(
-            params, params.get('Timeframe (minutes)', 15))
+        sync_trailing_delay_params(
+            params, param_dict_local, params.get('Timeframe (minutes)', 15))
     apply_rsi_param_context(params, param_dict_local)
     apply_adx_param_context(params, param_dict_local)
     apply_sma_param_context(params, param_dict_local)
@@ -1536,29 +1574,23 @@ def clamp_params(raw_params, param_dict_local):
         clamped['Timeframe (minutes)'] = max(1, int(round(clamped['Timeframe (minutes)'])))
     if 'Max Open Trades' in clamped:
         clamped['Max Open Trades'] = max(1, int(round(clamped['Max Open Trades'])))
+    for pk in ('Channel Exit Sell Lookback (bars)', 'Channel Exit Buy Lookback (bars)'):
+        if pk in clamped:
+            clamped[pk] = max(1, int(round(clamped[pk])))
+    if 'Channel Exit ATR Offset' in clamped:
+        clamped['Channel Exit ATR Offset'] = max(0.0, float(clamped['Channel Exit ATR Offset']))
     return clamped
 
-def resolve_trailing_delay_bars(params_local, fallback_tf=15):
-    """
-    Resolve effective trailing delay bars from context-aware minutes when present.
-    """
-    tf = params_local.get('Timeframe (minutes)', fallback_tf)
-    try:
-        tf = max(1, int(round(float(tf))))
-    except Exception:
-        tf = max(1, int(fallback_tf))
+from strategies.trend.parameters import (
+    resolve_trailing_delay_bars as _resolve_trailing_delay_bars_core,
+    sync_trailing_delay_params,
+    exclude_trailing_delay_from_param_ranges,
+)
 
-    if 'Trailing Delay (minutes)' in params_local:
-        try:
-            mins = max(0.0, float(params_local['Trailing Delay (minutes)']))
-            return max(0, int(round(mins / tf)))
-        except Exception:
-            pass
 
-    try:
-        return max(0, int(round(float(params_local.get('Trailing Delay (bars)', 0)))))
-    except Exception:
-        return 0
+def resolve_trailing_delay_bars(params_local, param_dict_local=None, fallback_tf=15):
+    """Resolve effective trailing delay bars (single active GA gene: minutes or bars)."""
+    return _resolve_trailing_delay_bars_core(params_local, param_dict_local, fallback_tf)
 
 
 _TRAILING_CONTEXT_KEYS = (
@@ -1743,6 +1775,28 @@ def apply_maintenance_param_context(params_local, param_dict_local):
     return params_local
 
 
+# Parent toggle -> child genes stripped at evaluation when parent is off.
+# Genome slots may still mutate (dead dimensions); CSV export must preserve raw
+# genome values for children — not template back-fill after stripping.
+PARAM_CONTEXT_GROUPS = (
+    ('Enable Trailing Stop', _TRAILING_CONTEXT_KEYS),
+    ('Enable RSI Filter', _RSI_CONTEXT_KEYS),
+    ('Enable ADX Filter', _ADX_CONTEXT_KEYS),
+    ('Enable SMA Filter', _SMA_CONTEXT_KEYS),
+    ('Enable Volume Filter', _VOL_CONTEXT_KEYS),
+    ('Enable RTH Filter', _RTH_CONTEXT_KEYS),
+    ('Enable Maintenance Filter', _MAINT_CONTEXT_KEYS),
+)
+
+
+def context_child_param_keys():
+    """All parameter names that are inactive when their parent toggle is off."""
+    keys = []
+    for _, children in PARAM_CONTEXT_GROUPS:
+        keys.extend(children)
+    return tuple(keys)
+
+
 _LOOKBACK_TEMPLATE_KEYS = (
     'Buy Lookback (minutes)',
     'Sell Lookback (minutes)',
@@ -1812,6 +1866,19 @@ def apply_lookback_bars_from_minutes(params_local, param_dict_local):
         params_local['Buy Lookback'] = resolve_buy_lookback_bars(merged)
     if 'Sell Lookback (minutes)' in param_dict_local:
         params_local['Sell Lookback'] = resolve_sell_lookback_bars(merged)
+    apply_channel_exit_lookbacks(params_local, param_dict_local)
+    return params_local
+
+
+def apply_channel_exit_lookbacks(params_local, param_dict_local):
+    """Mirror entry lookbacks for channel exit when exit rows absent from CSV."""
+    if not param_dict_local:
+        return params_local
+    merged = merge_eval_params_for_lookback(params_local, param_dict_local)
+    if 'Channel Exit Sell Lookback (bars)' not in param_dict_local:
+        params_local['Channel Exit Sell Lookback (bars)'] = resolve_sell_lookback_bars(merged)
+    if 'Channel Exit Buy Lookback (bars)' not in param_dict_local:
+        params_local['Channel Exit Buy Lookback (bars)'] = resolve_buy_lookback_bars(merged)
     return params_local
 
 
@@ -2015,8 +2082,8 @@ def finalize_ga_solution_params(raw_params, param_dict):
     clamped_params['Timeframe (minutes)'] = max(1, int(round(clamped_params.get('Timeframe (minutes)', 15))))
     apply_trailing_param_context(clamped_params, param_dict)
     if trailing_stop_enabled(clamped_params, param_dict):
-        clamped_params['Trailing Delay (bars)'] = resolve_trailing_delay_bars(
-            clamped_params, clamped_params['Timeframe (minutes)'])
+        sync_trailing_delay_params(
+            clamped_params, param_dict, clamped_params['Timeframe (minutes)'])
     apply_rsi_param_context(clamped_params, param_dict)
     apply_adx_param_context(clamped_params, param_dict)
     apply_sma_param_context(clamped_params, param_dict)
@@ -2026,6 +2093,11 @@ def finalize_ga_solution_params(raw_params, param_dict):
     apply_lookback_bars_from_minutes(clamped_params, param_dict)
     if 'Max Open Trades' in clamped_params:
         clamped_params['Max Open Trades'] = max(1, int(round(clamped_params['Max Open Trades'])))
+    for pk in ('Channel Exit Sell Lookback (bars)', 'Channel Exit Buy Lookback (bars)'):
+        if pk in clamped_params:
+            clamped_params[pk] = max(1, int(round(clamped_params[pk])))
+    if 'Channel Exit ATR Offset' in clamped_params:
+        clamped_params['Channel Exit ATR Offset'] = max(0.0, float(clamped_params['Channel Exit ATR Offset']))
     if 'Enable ADX Filter' in clamped_params:
         clamped_params['Enable ADX Filter'] = int(round(clamped_params['Enable ADX Filter']))
     if 'ADX Period' in clamped_params:
@@ -2080,6 +2152,31 @@ def merge_solution_params_with_template(clamped_params, param_dict, param_df):
             default_val = row['Value']
         merged[name] = default_val
     return merged
+
+
+def build_solution_export_params(raw_params, param_dict, param_df, param_keys_local):
+    """
+    Build CSV export params: effective values for backtest parity plus raw genome
+    slots for every optimizable gene.
+
+    ``finalize_ga_solution_params`` strips context-dependent children when a parent
+    toggle is off (so fitness matches evaluation). ``merge_solution_params_with_template``
+    then back-filled template defaults into those holes — making every solution look
+    like it shared the same trailing delay / ATR mult when trailing was off.
+
+  Export overlays clamped genome values for all ``param_keys`` so inactive child
+    genes show their actual (dormant) alleles, while derived statistic rows should
+    use the returned ``effective_params``.
+    """
+    effective_params = finalize_ga_solution_params(dict(raw_params), param_dict)
+    genome_clamped = clamp_params(dict(raw_params), param_dict)
+    export_params = merge_solution_params_with_template(
+        effective_params, param_dict, param_df)
+    if param_keys_local:
+        for key in param_keys_local:
+            if key in genome_clamped:
+                export_params[key] = genome_clamped[key]
+    return export_params, effective_params
 
 
 # Helper function to extract chart HTML (moved to global scope)
@@ -2170,7 +2267,7 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
                      'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                      'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                      'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE',
-                     'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
+                     'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_CONSERVATIVE_ENTRY_SLIPPAGE', 'GA_CONSERVATIVE_CHANNEL_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                      'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
                      'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
                      'ENABLE_FILTER_STACK_TRADE_PENALTY', 'INTERACTION_PENALTY_STRENGTH',
@@ -3159,7 +3256,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                      'TARGET_TRADES_DAY', 'TRADES_PENALTY_WEIGHT', 'DD_WEIGHT',
                      'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                      'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT', 'GA_START_DATE', 'GA_END_DATE',
-                     'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
+                     'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_CONSERVATIVE_ENTRY_SLIPPAGE', 'GA_CONSERVATIVE_CHANNEL_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                      'ENABLE_FILTER_STACK_TRADE_PENALTY', 'INTERACTION_PENALTY_STRENGTH',
                      'INTERACTION_LOW_TRADES_BASE', 'INTERACTION_LOW_TRADES_PER_FILTER',
                      'INTERACTION_MIN_FILTERS']
@@ -4192,7 +4289,7 @@ def main():
                            'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                            'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT',
                            'GA_START_DATE', 'GA_END_DATE',
-                           'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
+                           'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_CONSERVATIVE_ENTRY_SLIPPAGE', 'GA_CONSERVATIVE_CHANNEL_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                            'ENABLE_FILTER_STACK_TRADE_PENALTY', 'INTERACTION_PENALTY_STRENGTH',
                            'INTERACTION_LOW_TRADES_BASE', 'INTERACTION_LOW_TRADES_PER_FILTER',
                            'INTERACTION_MIN_FILTERS'],
@@ -4304,14 +4401,15 @@ def main():
                               'DATA_SPLITS', 'DATA_SIZE', 'USE_INTERLEAVED_SPLIT', 'NUM_SPLIT_PERIODS',
                               'MIN_TRADES_DAY', 'MIN_TRADES_PEN_WEIGHT',
                               'GA_START_DATE', 'GA_END_DATE',
-                              'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
+                              'GA_LIVE_STYLE_ENTRY', 'GA_CONSERVATIVE_STOP_SLIPPAGE', 'GA_CONSERVATIVE_ENTRY_SLIPPAGE', 'GA_CONSERVATIVE_CHANNEL_SLIPPAGE', 'GA_PESSIMISTIC_STOPS',
                               'WEIGHT_SORTINO', 'WEIGHT_DRAWDOWN', 'WEIGHT_PF', 'WEIGHT_TRADES', 'WEIGHT_PNL', 'WEIGHT_PPT',
                               'MIN_TRADE_DURATION', 'MAX_WIN_RATE_CAP', 'LIMIT_MAX_LOSS', 'LIMIT_MIN_SORTINO',
                               'NORM_SORTINO_MAX', 'NORM_DD_MAX', 'NORM_PF_MAX', 'NORM_TRADES_MAX', 
                               'NORM_PNL_MAX', 'NORM_PROFIT_TRADE_MAX', 'MIN_WIN_RATE', 'SORTINO_CAP',
                               'ENABLE_FILTER_STACK_TRADE_PENALTY', 'INTERACTION_PENALTY_STRENGTH',
                               'INTERACTION_LOW_TRADES_BASE', 'INTERACTION_LOW_TRADES_PER_FILTER',
-                              'INTERACTION_MIN_FILTERS'])
+                              'INTERACTION_MIN_FILTERS',
+                              'GA_DIVERSE_SEED', 'GA_DIVERSE_SEED_FRACTION', 'MIN_PROFIT_PER_TRADE'])
     
     _skip_bars_lookback = set()
     if 'Buy Lookback (minutes)' in param_dict:
@@ -4329,6 +4427,8 @@ def main():
         if n in ga_criteria_params:
             continue
         if n in _skip_bars_lookback:
+            continue
+        if exclude_trailing_delay_from_param_ranges(n, param_dict):
             continue
         ptype = d.get('type', '')
         pmin = d.get('min')
@@ -4564,6 +4664,7 @@ def main():
             # CRITICAL FIX: Clamp initial population to ensure all values are within valid ranges
             for ind in pop:
                 clamp_individual(ind)
+            _maybe_diversify_initial_population(pop, param_dict)
             hof = tools.ParetoFront()  # Store Pareto-optimal solutions
             logbook = tools.Logbook()
             logbook.header = GA_LOGBOOK_HEADER_FULL
@@ -4578,6 +4679,7 @@ def main():
         # CRITICAL FIX: Clamp initial population to ensure all values are within valid ranges
         for ind in pop:
             clamp_individual(ind)
+        _maybe_diversify_initial_population(pop, param_dict)
         hof = tools.ParetoFront()  # Store Pareto-optimal solutions
         logbook = tools.Logbook()
         logbook.header = GA_LOGBOOK_HEADER_FULL
@@ -5286,8 +5388,8 @@ def main():
         best_params['Timeframe (minutes)'] = max(1, int(round(best_params['Timeframe (minutes)'])))
     apply_trailing_param_context(best_params, param_dict)
     if trailing_stop_enabled(best_params, param_dict):
-        best_params['Trailing Delay (bars)'] = resolve_trailing_delay_bars(
-            best_params, best_params.get('Timeframe (minutes)', 15))
+        sync_trailing_delay_params(
+            best_params, param_dict, best_params.get('Timeframe (minutes)', 15))
     apply_rsi_param_context(best_params, param_dict)
     apply_adx_param_context(best_params, param_dict)
     apply_sma_param_context(best_params, param_dict)
@@ -5787,15 +5889,18 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
                 flush=True,
             )
         raw_params = dict(zip(param_keys, ind))
-        clamped_params = finalize_ga_solution_params(raw_params, param_dict)
-        clamped_params = merge_solution_params_with_template(clamped_params, param_dict, param_df)
+        export_params, effective_params = build_solution_export_params(
+            raw_params, param_dict, param_df, param_keys)
 
         # Calculate Splits and Robustness for Top Solutions
-        is_periods_res, oos_periods_res = calculate_split_detail(clamped_params, is_periods, oos_periods, param_dict)
-        
+        is_periods_res, oos_periods_res = calculate_split_detail(
+            effective_params, is_periods, oos_periods, param_dict)
+
         # Get aggregate results for this solution
-        sol_is_res = run_backtest(clamped_params, in_sample, param_dict, suppress_output=True, mask=is_mask)
-        sol_oos_res = run_backtest(clamped_params, oos, param_dict, suppress_output=True, mask=oos_mask)
+        sol_is_res = run_backtest(
+            effective_params, in_sample, param_dict, suppress_output=True, mask=is_mask)
+        sol_oos_res = run_backtest(
+            effective_params, oos, param_dict, suppress_output=True, mask=oos_mask)
         
         # Calculate Robustness Evaluation
         robust = get_robustness_metrics(sol_is_res, sol_oos_res, is_periods_res, oos_periods_res)
@@ -5804,7 +5909,8 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         # Statistics must match aggregate run_backtest(IS) so manual replays can reproduce them.
         # (Previously we fell back to fitness[i], which are *normalized* objectives — not raw Sortino/PnL.)
         solutions_data.append({
-            'params': clamped_params,
+            'params': export_params,
+            'effective_params': effective_params,
             'sortino': float(sol_is_res.get('sortino', 0)),
             'max_dd': float(sol_is_res.get('max_drawdown', 0)),
             'profit_factor': float(sol_is_res.get('profit_factor', 0)),
@@ -5904,14 +6010,15 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
     row_delay = {
         'Name': 'Derived Trailing Delay (bars from minutes/timeframe)',
         'Type': 'statistic',
-        'Description': 'If Trailing Delay (minutes) exists, converted to bars via Timeframe; else uses Trailing Delay (bars).'
+        'Description': 'Effective trailing delay in bars using the active GA gene (minutes when optimizable, else bars).'
     }
     for sol_idx, sol_data in enumerate(solutions_data):
         col_name = f"Solution_{sol_idx}"
         if sol_data['is_selected']:
             col_name += "_SELECTED"
-        params_local = sol_data.get('params', {})
-        row_delay[col_name] = resolve_trailing_delay_bars(params_local, params_local.get('Timeframe (minutes)', 15))
+        params_local = sol_data.get('effective_params', sol_data.get('params', {}))
+        row_delay[col_name] = resolve_trailing_delay_bars(
+            params_local, param_dict, params_local.get('Timeframe (minutes)', 15))
     stats_rows.append(row_delay)
 
     row_rsi = {
@@ -5926,7 +6033,7 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         col_name = f"Solution_{sol_idx}"
         if sol_data['is_selected']:
             col_name += "_SELECTED"
-        params_local = sol_data.get('params', {})
+        params_local = sol_data.get('effective_params', sol_data.get('params', {}))
         row_rsi[col_name] = describe_effective_rsi_band(params_local, param_dict)
     stats_rows.append(row_rsi)
 
@@ -5940,7 +6047,8 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
             col_name = f"Solution_{sol_idx}"
             if sol_data['is_selected']:
                 col_name += "_SELECTED"
-            pl = merge_eval_params_for_lookback(sol_data.get('params', {}), param_dict)
+            pl = merge_eval_params_for_lookback(
+                sol_data.get('effective_params', sol_data.get('params', {})), param_dict)
             row_lb[col_name] = resolve_buy_lookback_bars(pl, pl.get('Timeframe (minutes)', 15))
         stats_rows.append(row_lb)
     if param_dict and 'Sell Lookback (minutes)' in param_dict:
@@ -5953,7 +6061,8 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
             col_name = f"Solution_{sol_idx}"
             if sol_data['is_selected']:
                 col_name += "_SELECTED"
-            pl = merge_eval_params_for_lookback(sol_data.get('params', {}), param_dict)
+            pl = merge_eval_params_for_lookback(
+                sol_data.get('effective_params', sol_data.get('params', {})), param_dict)
             row_ls[col_name] = resolve_sell_lookback_bars(pl, pl.get('Timeframe (minutes)', 15))
         stats_rows.append(row_ls)
 

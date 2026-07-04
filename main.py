@@ -84,6 +84,8 @@ from core.execution import (
     _close_all_positions,
     send_composite_status_notification,
     prune_dead_brackets,
+    purge_closed_brackets,
+    bracket_counts_as_open_exposure,
     _entry_trade_for_bracket,
     register_completed_trade_persist_hook,
     _live_exit_type,
@@ -158,6 +160,8 @@ if not args.params:
             args.params = r'strategies\bollinger\parameters\paper_params.csv'
     elif args.strategy.lower() == 'trend':
         args.params = r'strategies\trend\parameters\trend_strategy_params.csv'
+    elif args.strategy.lower() == 'session':
+        args.params = r'strategies\session\parameters\session_strategy_params.csv'
 
 # Validate Output Directory
 if not os.path.exists(args.output_dir):
@@ -239,6 +243,7 @@ bar_log = []
 completed_trades = []
 portfolio_realized_pnl = None
 last_data_receipt = {'time': datetime.now()}
+last_new_bar_receipt = {'time': datetime.now()}
 
 # Dashboard tracking
 connection_start_time = None
@@ -301,6 +306,8 @@ _last_maint_stall_log_mono = 0.0
 _last_maint_stall_reconnect_mono = 0.0
 _market_data_subscribed_mono = 0.0
 _STARTUP_STALL_GRACE_SEC = 180.0
+_RECONCILE_INTERVAL_SEC = 60.0
+_last_reconcile_mono = 0.0
 
 # Web directory
 WEB_DIR = os.path.join(os.getcwd(), 'web')
@@ -324,13 +331,6 @@ def _ib_finite_price(x):
 
 def _has_open_market_exposure(ib, contract, brackets) -> bool:
     """True when bot or IB still has a non-flat ES position / working bracket."""
-    if brackets:
-        for b in brackets:
-            if int(b.get("direction") or 0) == 0:
-                continue
-            trade = _entry_trade_for_bracket(ib, contract, b)
-            if trade and trade.filled():
-                return True
     if contract:
         try:
             for p in ib.positions():
@@ -338,6 +338,10 @@ def _has_open_market_exposure(ib, contract, brackets) -> bool:
                     return True
         except Exception:
             pass
+    if brackets:
+        for b in brackets:
+            if bracket_counts_as_open_exposure(ib, contract, b):
+                return True
     return False
 
 
@@ -549,6 +553,8 @@ def _bracket_position_rows_for_dashboard(ib, contract, brackets, current_price: 
     local_sym = getattr(contract, 'localSymbol', None) or getattr(contract, 'symbol', 'ES')
     sym = getattr(contract, 'symbol', 'ES')
     for bracket in brackets:
+        if bracket.get("_close_recorded"):
+            continue
         trade = _entry_trade_for_bracket(ib, contract, bracket)
         if not trade or not trade.filled():
             continue
@@ -862,7 +868,7 @@ def persist_completed_trades(path: str, trades: list, max_keep: int = 1000) -> N
     """
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
-    payload = [_serialize_trade_record(t) for t in trades[-max_keep:]]
+    payload = [_serialize_trade_record(t) for t in dedupe_completed_trades_near_fills(trades, window_sec=120, max_keep=max_keep)]
     basename = os.path.basename(path)
     tmp = os.path.join(d, f".{basename}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
@@ -1059,6 +1065,7 @@ def _sync_dashboard_heartbeat_fields() -> None:
     dashboard_state.is_connected = ib.isConnected()
     dashboard_state.bar_log = bar_log[-20:]
     dashboard_state.last_data_receipt_time = last_data_receipt['time']
+    dashboard_state.last_new_bar_time = last_new_bar_receipt['time']
     if data_ref['data'] is not None and not data_ref['data'].empty:
         dashboard_state.current_price = float(data_ref['data']['close'].iloc[-1])
 
@@ -1138,6 +1145,7 @@ async def _refresh_dashboard_chart_payload(state) -> bool:
                 _chart_tf,
                 completed_trades,
                 state.params,
+                positions,
             ),
             timeout=45.0,
         )
@@ -1166,6 +1174,7 @@ def _sync_dashboard_table_fields_blocking() -> None:
     """Refresh table panel fields from in-memory bot state + fast IB cache (no reqOpenOrders)."""
     if not dashboard_state:
         return
+    purge_closed_brackets(positions, live_tracker)
     dashboard_state.live_tracker = live_tracker[-200:]
     dashboard_state.bar_log = bar_log[-20:]
     dashboard_state.completed_trades = list(completed_trades[-1000:])
@@ -1529,6 +1538,7 @@ async def _run_full_dashboard_refresh(dash_path: str, status_path: str):
             dashboard_state.total_uptime_seconds = total_uptime_seconds
             dashboard_state.connection_start_time = connection_start_time
             dashboard_state.last_data_receipt_time = last_data_receipt['time']
+            dashboard_state.last_new_bar_time = last_new_bar_receipt['time']
             dashboard_state.live_tracker = live_tracker[-200:]
             dashboard_state.bar_log = bar_log[-20:]
             dashboard_state.completed_trades = list(completed_trades[-1000:])
@@ -1648,11 +1658,13 @@ def ensure_connected_and_subscribed():
             data_ref=data_ref, positions=positions, completed_trades=completed_trades,
             live_tracker=live_tracker, bar_log=bar_log, dashboard_state=dashboard_state,
             send_email_fn=custom_send_email, output_dir=args.output_dir,
-            last_data_receipt=last_data_receipt
+            last_data_receipt=last_data_receipt,
+            last_new_bar_receipt=last_new_bar_receipt,
         )
         logging.info(f"Subscribed to market data ({len(bars_obj)} bars)")
-        seed_data_ref_from_bars(bars_obj, data_ref)
+        seed_data_ref_from_bars(bars_obj, data_ref, output_dir=args.output_dir)
         last_data_receipt['time'] = datetime.now()
+        last_new_bar_receipt['time'] = datetime.now()
         global _market_data_subscribed_mono
         _market_data_subscribed_mono = time_module.monotonic()
     except ShutdownRequested:
@@ -1875,6 +1887,7 @@ async def main():
     bar_task = None
     global _status_heartbeat_task, _dashboard_refresh_task, _ui_task, _bar_task, _protection_task
     global _shutdown_watchdog_thread, _chart_refresh_loop_task, _full_dashboard_refresh_loop_task
+    global _last_reconcile_mono
 
     try:
         _acquire_single_instance_lock()
@@ -1955,7 +1968,8 @@ async def main():
             contract_symbol=contract.localSymbol,
             connection_start_time=datetime.now(),
             is_connected=True, params=params_dict,
-            last_data_receipt_time=last_data_receipt['time']
+            last_data_receipt_time=last_data_receipt['time'],
+            last_new_bar_time=last_new_bar_receipt['time'],
         )
 
         # Initialize Security Guard
@@ -2191,8 +2205,8 @@ async def main():
                     if dashboard_state and not _shutdown_requested:
                         dashboard_state.is_connected = True
                         dashboard_state.connection_start_time = connection_start_time
-                        dash_path = os.path.join(WEB_DIR, args.dashboard)
                         dashboard_state.last_data_receipt_time = last_data_receipt['time']
+                        dashboard_state.last_new_bar_time = last_new_bar_receipt['time']
                         dash_path = os.path.join(WEB_DIR, args.dashboard)
                         status_path = os.path.join(WEB_DIR, f"{args.mode.lower()}_status.js")
                         await _write_dashboard_files_async(
@@ -2200,11 +2214,27 @@ async def main():
                         )
                         add_to_live_tracker(live_tracker, 'info', 'Dashboard refreshed after reconnection')
 
+                # Periodic ghost-bracket reconciliation (startup-only reconcile missed mid-session closes)
+                mono = time_module.monotonic()
+                if mono - _last_reconcile_mono >= _RECONCILE_INTERVAL_SEC:
+                    _last_reconcile_mono = mono
+                    purge_closed_brackets(positions, live_tracker)
+                    try:
+                        reconcile_positions(
+                            ib, contract, positions, live_tracker,
+                            completed_trades=completed_trades,
+                            send_email_fn=custom_send_email,
+                            data=data_ref['data'],
+                            strategy=strategy,
+                        )
+                    except Exception as e:
+                        logging.error("Periodic reconciliation failed: %s", e)
+
                 # 15-Min Heartbeat Status (Enhanced with Charts)
                 now = datetime.now()
                 if (now - last_heartbeat_time).total_seconds() >= 900:
                     last_heartbeat_time = now
-                    if positions and not _shutdown_requested:
+                    if _has_open_market_exposure(ib, contract, positions) and not _shutdown_requested:
                         send_composite_status_notification(
                             ib, positions, data_ref['data'],
                             dashboard_state.account_info if dashboard_state else {},
@@ -2213,44 +2243,45 @@ async def main():
                     # (Removed 'else' block to skip flat status emails)
 
 
-                # Data liveness check
-                time_since = (now - last_data_receipt['time']).total_seconds()
+                # Bar pipeline liveness (new 1-min bars, not mere tick/update events)
+                time_since_bar = (now - last_new_bar_receipt['time']).total_seconds()
+                has_open = _has_open_market_exposure(ib, contract, positions)
                 subscribed_ago = (
                     time_module.monotonic() - _market_data_subscribed_mono
                     if _market_data_subscribed_mono
                     else _STARTUP_STALL_GRACE_SEC + 1
                 )
-                if time_since > 60 and subscribed_ago >= _STARTUP_STALL_GRACE_SEC:
+                if time_since_bar > 60 and subscribed_ago >= _STARTUP_STALL_GRACE_SEC:
                     now_eastern = datetime.now(EASTERN)
                     in_maint = is_strategy_in_maintenance_window(strategy, now_eastern)
-                    if in_maint and not positions:
+                    if in_maint and not has_open:
                         mono = time_module.monotonic()
                         if mono - _last_maint_stall_log_mono >= MAINTENANCE_DATA_STALL_LOG_INTERVAL_SEC:
                             logging.info(
                                 "No live bars for %.1fs during maintenance window; "
                                 "deferring aggressive data resubscribe (next log/reconnect in %ds)",
-                                time_since,
+                                time_since_bar,
                                 MAINTENANCE_DATA_STALL_RECONNECT_INTERVAL_SEC,
                             )
                             add_to_live_tracker(
                                 live_tracker,
                                 'info',
-                                f'Maintenance data pause ({time_since:.0f}s, flat)',
+                                f'Maintenance data pause ({time_since_bar:.0f}s, flat)',
                             )
                             _last_maint_stall_log_mono = mono
                         if mono - _last_maint_stall_reconnect_mono >= MAINTENANCE_DATA_STALL_RECONNECT_INTERVAL_SEC:
                             logging.info(
                                 "Maintenance window: periodic data resubscribe (%.1fs without live bars)",
-                                time_since,
+                                time_since_bar,
                             )
                             ensure_connected_and_subscribed()
                             _last_maint_stall_reconnect_mono = mono
                     else:
-                        if in_maint and positions:
+                        if in_maint and has_open:
                             logging.warning(
                                 "⚠️ DATA STALLED during maintenance with open position(s)! "
                                 "No bars for %.1fs. Restarting data...",
-                                time_since,
+                                time_since_bar,
                             )
                             add_to_live_tracker(
                                 live_tracker,
@@ -2259,18 +2290,17 @@ async def main():
                             )
                         else:
                             logging.warning(
-                                f"⚠️ DATA STALLED! No bars for {time_since:.1f}s. Restarting data..."
+                                f"⚠️ DATA STALLED! No new bars for {time_since_bar:.1f}s. Restarting data..."
                             )
                             add_to_live_tracker(live_tracker, 'warning', 'Data Stalled - Forcing Restart')
                         ensure_connected_and_subscribed()
-                        if time_since > 180 and positions:
+                        if time_since_bar > 180 and has_open:
                             msg = (
-                                f"No tick data received for {time_since:.1f}s!\n"
+                                f"No new 1-min bars for {time_since_bar:.1f}s!\n"
                                 f"Open brackets: {len(positions)}\n"
                                 f"Time: {now.strftime('%H:%M:%S')}"
                             )
                             custom_send_email("🚨 STALL: POS OPEN!", msg)
-                        last_data_receipt['time'] = now
 
                 await _interruptible_sleep(10)
 

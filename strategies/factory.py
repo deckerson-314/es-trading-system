@@ -33,10 +33,20 @@ class StrategyFactory:
         elif name == "trend":
             try:
                 from strategies.trend.strategy import TrendStrategy
-                logging.info(f"Factory: Loading TrendStrategy")
+                logging.info(f"Factory: Loading TrendStrategy (deprecated — prefer session)")
                 return TrendStrategy(params_dict)
             except ImportError as e:
                 logging.error(f"Factory: Failed to import TrendStrategy: {e}")
                 raise
+        elif name == "session" or name == "session_vwap":
+            try:
+                from strategies.session.strategy import SessionVwapStrategy
+                logging.info("Factory: Loading SessionVwapStrategy")
+                return SessionVwapStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import SessionVwapStrategy: {e}")
+                raise
         else:
-            raise ValueError(f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'trend']")
+            raise ValueError(
+                f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'session', 'trend']"
+            )
