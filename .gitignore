@@ -43,6 +43,7 @@ temp_plots/
 !Bollinger/parameters/BB_Strategy_Parameters.csv
 !Bollinger/parameters/genetic_results_*.csv
 !strategies/trend/parameters/*.csv
+!strategies/session/parameters/*.csv
 
 # Large data file specifically
 **/ES_full_1min_continuous_ratio_adjusted.csv
