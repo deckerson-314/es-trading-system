@@ -3,7 +3,7 @@
 **Date:** 2026-07-08  
 **Master doc:** [`docs/strategy_research.md`](strategy_research.md) — full learnings, attribution, literature comparison, next strategy spec.
 
-**Status:** Trend, Session, and ORB v1 **failed** OOS validation. **Next target:** `vwap_regime` (regime-switching VWAP pullback + deviation fade, ~1–4 trades/day).
+**Status:** Trend, Session, and ORB v1 **failed** OOS validation. **Active target:** `vwap_regime` (regime-switching VWAP pullback + deviation fade, ~1–4 trades/day).
 
 ---
 
@@ -66,6 +66,33 @@ python tools/analysis/strategy_attribution.py `
 | OOS+ HOF | 58 / 820 | |
 
 Attribution: SS − RS −$3.3k · entries anti-predictive. See `results/ga_analysis_orb_2026-07-06-1.md`.
+
+## Active strategy: `vwap_regime`
+
+**Class:** `VwapRegimeStrategy`  
+**CLI / GA:** `--strategy vwap_regime`  
+**Params:** `strategies/vwap_regime/parameters/vwap_regime_strategy_params.csv`
+
+### Logic (v1 — 2026-07-08)
+
+1. **Regime classifier** after OR: trend day (ADX high + price holds one VWAP side) vs range day (ADX low + VWAP crosses).
+2. **Trend mode:** VWAP pullback with session bias (long pullbacks above VWAP, short below).
+3. **Range mode:** VWAP deviation fade with rejection (literature-aligned Session fix).
+4. **Cap:** 2–5 entries/day (GA target ~2 trades/day).
+
+### Commands
+
+```powershell
+# GA (fresh)
+$env:STRATEGY = 'vwap_regime'
+python optimize.py --strategy vwap_regime --fresh
+
+# Attribution (after OOS export)
+python tools/analysis/strategy_attribution.py `
+  --trades Vwap_regime/output/genetic_trades_oos_YYYY-MM-DD-N.csv `
+  --param-csv strategies/vwap_regime/parameters/vwap_regime_strategy_params.csv `
+  --strategy vwap_regime
+```
 
 ## Pass gates (before deploy)
 

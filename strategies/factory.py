@@ -54,7 +54,15 @@ class StrategyFactory:
             except ImportError as e:
                 logging.error(f"Factory: Failed to import OrbAcceptanceStrategy: {e}")
                 raise
+        elif name == "vwap_regime" or name == "vwap":
+            try:
+                from strategies.vwap_regime.strategy import VwapRegimeStrategy
+                logging.info("Factory: Loading VwapRegimeStrategy")
+                return VwapRegimeStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import VwapRegimeStrategy: {e}")
+                raise
         else:
             raise ValueError(
-                f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'orb', 'session', 'trend']"
+                f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'orb', 'session', 'trend', 'vwap_regime']"
             )

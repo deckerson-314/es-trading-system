@@ -248,6 +248,8 @@ if args.params == DEFAULT_PARAM_CSV:
         PARAM_CSV = os.path.join('strategies', 'session', 'parameters', 'session_strategy_params.csv')
     elif args.strategy == 'orb':
         PARAM_CSV = os.path.join('strategies', 'orb', 'parameters', 'orb_strategy_params.csv')
+    elif args.strategy == 'vwap_regime':
+        PARAM_CSV = os.path.join('strategies', 'vwap_regime', 'parameters', 'vwap_regime_strategy_params.csv')
     else:
         PARAM_CSV = args.params
 else:

@@ -1,0 +1,99 @@
+Name,Value,Min,Max,Type,Description
+=== Strategy Config ===,,,,,
+Enable Long Trades,TRUE,,,bool,Allow long entries
+Enable Short Trades,TRUE,,,bool,Allow short entries
+Max Open Trades,1,1,1,int,Max concurrent trades
+Transaction Cost (Per Trade),15,15,15,float,Friction per round-trip
+Timeframe (minutes),5,3,15,int,Bar size for VWAP regime logic
+=== Session Timing ===,,,,,
+Opening Range (minutes),30,15,45,int,OR window from RTH open
+Min OR Width (pts),4,2,12,float,Skip dead sessions (OR too tight)
+Max OR Width (pts),40,20,55,float,Skip chaotic opens (OR too wide)
+Trade Start After OR (min),15,0,45,int,Buffer after OR before entries
+Trade End Before RTH Close (min),30,15,90,int,Stop new trades N min before close
+Max Entries Per Day,3,2,5,int,Cap entries per session (~handful/day)
+=== Regime Classifier ===,,,,,
+Enable ADX Filter,1,0,1,int,ADX gates for trend vs range
+ADX Period,14,10,21,int,ADX lookback
+Min Trend ADX,20,15,28,float,Trend-day floor (pullback mode)
+Max Range ADX,22,15,28,float,Range-day cap (fade mode)
+Min ATR (pts),1,0.5,3,float,Min volatility to trade
+Max ATR (pts),25,10,40,float,Max volatility (crisis skip)
+Trend Side Pct,0.62,0.55,0.75,float,Fraction of post-OR bars on one VWAP side
+Min VWAP Crosses,2,1,4,int,Range day: min VWAP crosses since OR
+=== Trend: VWAP Pullback ===,,,,,
+Pullback Touch Buffer (pts),1.0,0.25,3,float,Touch zone around VWAP
+Pullback Confirm Bars,1,1,3,int,Rejection bars at VWAP
+Trend Target R Multiple,1.5,1.0,3.0,float,TP = entry +/- R * risk
+=== Range: VWAP Deviation Fade ===,,,,,
+Min VWAP Extension (pts),8,4,18,float,Min distance from VWAP before fade
+Fade Band ATR Multiplier,1.75,1.2,2.5,float,ATR band around VWAP for extension
+Fade Confirm Bars,2,1,3,int,Bars reverting toward VWAP
+=== RTH / Maintenance ===,,,,,
+Enable RTH Filter,1,1,1,int,LOCKED: RTH session only
+RTH Start (HH:MM),09:30,,,str,RTH open Eastern
+RTH End (HH:MM),16:00,,,str,RTH close Eastern
+RTH Exit Buffer (minutes),15,10,30,int,Force flat before close
+Enable Maintenance Filter,1,1,1,int,LOCKED: maintenance windows
+Daily Maintenance Start (HH:MM),17:00,,,str,Daily maintenance start
+Daily Maintenance End (HH:MM),17:30,,,str,Daily maintenance end
+Weekend Maintenance Start Day,4,4,4,int,Friday
+Weekend Maintenance Start Time (HH:MM),17:00,,,str,Friday maintenance start
+Weekend Maintenance End Day,6,6,6,int,Sunday
+Weekend Maintenance End Time (HH:MM),18:00,,,str,Sunday maintenance end
+Maintenance Buffer Minutes,15,5,30,int,Buffer around maintenance
+=== Exit Logic ===,,,,,
+Stop ATR Multiplier,1.25,0.8,2.0,float,Initial stop distance
+TP VWAP Buffer (pts),1.0,0,2,float,Range mode: exit near VWAP
+Max Hold (bars),36,18,72,int,Time stop (~1.5-6h at TF=5)
+Enable Trailing Stop,0,0,1,int,Optional ATR trail after delay
+Trailing Delay (bars),3,2,8,int,Bars before trail ratchet
+ATR Multiplier for Trailing Stop,2,1.5,3.5,float,Trail distance if enabled
+=== GA Criteria ===,,,,,
+POP_SIZE,400,400,400,int,Population
+NUM_GEN,200,200,200,int,Generations
+CX_PB,0.5,0.5,0.5,float,Crossover
+MUT_PB,0.35,0.35,0.35,float,Mutation rate
+MUT_MU,0,0,0,float,Mutation mean
+MUT_SIGMA,0.25,0.25,0.25,float,Mutation sigma
+TARGET_TRADES_DAY,2.0,2.0,2.0,float,Target ~handful/day
+TRADES_PENALTY_WEIGHT,0.4,0.4,0.4,float,Excess trade penalty
+DD_WEIGHT,0.6,0.6,0.6,float,Drawdown weight
+DATA_SPLITS,0.65,0.65,0.65,float,IS fraction per interleaved slice
+DATA_SIZE,0,0,0,int,0 = full history
+USE_INTERLEAVED_SPLIT,TRUE,TRUE,TRUE,bool,Interleaved IS/OOS
+NUM_SPLIT_PERIODS,11,11,11,int,OOS slices
+MIN_TRADES_DAY,0.25,0.25,0.25,float,Min activity floor
+MIN_PROFIT_PER_TRADE,25,25,25,float,Min profit/trade norm
+MIN_TRADES_PEN_WEIGHT,-150,-150,-150,float,Low-trade penalty
+NORM_SORTINO_MAX,8,8,8,float,Sortino cap
+NORM_DD_MAX,80000,80000,80000,float,DD norm cap
+NORM_PF_MAX,2.5,2.5,2.5,float,PF norm cap
+NORM_TRADES_MAX,3.0,3.0,3.0,float,Trades/day norm (1-4 band)
+NORM_PNL_MAX,150000,150000,150000,float,PnL norm cap
+NORM_PROFIT_TRADE_MAX,150,150,150,float,PPT norm cap
+MIN_WIN_RATE,0.42,0.42,0.42,float,Min win rate
+SORTINO_CAP,8,8,8,float,Sortino cap
+GA_START_DATE,2020-01-02,2020-01-02,2020-01-02,str,Backtest start
+GA_END_DATE,2025-10-10,2025-10-10,2025-10-10,str,Backtest end
+GA_LIVE_STYLE_ENTRY,1,1,1,int,LOCKED: enter signal-bar close
+GA_CONSERVATIVE_STOP_SLIPPAGE,1,1,1,float,LOCKED
+GA_CONSERVATIVE_ENTRY_SLIPPAGE,1,1,1,float,LOCKED
+GA_CONSERVATIVE_CHANNEL_SLIPPAGE,0.25,0.25,0.25,float,LOCKED
+GA_PESSIMISTIC_STOPS,1,1,1,int,LOCKED
+GA_DIVERSE_SEED,0,0,0,int,Off for v1
+WEIGHT_SORTINO,1,,,float,Fitness: Sortino
+WEIGHT_DRAWDOWN,-1.2,,,float,Fitness: drawdown
+WEIGHT_PF,2,,,float,Fitness: profit factor
+WEIGHT_TRADES,0.8,,,float,Fitness: trades/day
+WEIGHT_PNL,1,,,float,Fitness: total PnL
+WEIGHT_PPT,1.2,,,float,Fitness: profit/trade
+MIN_TRADE_DURATION,20,20,20,float,Min avg hold minutes
+MAX_WIN_RATE_CAP,0.75,0.75,0.75,float,Suspicious win-rate cap
+LIMIT_MAX_LOSS,35000,35000,35000,float,Severe loss gate
+LIMIT_MIN_SORTINO,0.4,0.4,0.4,float,Severe Sortino gate
+ENABLE_FILTER_STACK_TRADE_PENALTY,0,0,0,int,Off
+INTERACTION_PENALTY_STRENGTH,0,0,0,float,Unused
+INTERACTION_LOW_TRADES_BASE,0,0,0,float,Unused
+INTERACTION_LOW_TRADES_PER_FILTER,0,0,0,float,Unused
+INTERACTION_MIN_FILTERS,0,0,0,int,Unused
