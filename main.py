@@ -162,6 +162,8 @@ if not args.params:
         args.params = r'strategies\trend\parameters\trend_strategy_params.csv'
     elif args.strategy.lower() == 'session':
         args.params = r'strategies\session\parameters\session_strategy_params.csv'
+    elif args.strategy.lower() == 'orb':
+        args.params = r'strategies\orb\parameters\orb_strategy_params.csv'
 
 # Validate Output Directory
 if not os.path.exists(args.output_dir):

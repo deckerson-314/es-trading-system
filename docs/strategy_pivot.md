@@ -1,58 +1,89 @@
-# Strategy Pivot: Trend → Session VWAP
+# Strategy Pivot History
 
-**Date:** 2026-07-04  
-**Status:** Trend/Donchian **deprecated** for optimization and deploy. **Session VWAP mean reversion** is the active intraday research target.
+**Date:** 2026-07-08  
+**Master doc:** [`docs/strategy_research.md`](strategy_research.md) — full learnings, attribution, literature comparison, next strategy spec.
 
-## Why we abandoned Trend
+**Status:** Trend, Session, and ORB v1 **failed** OOS validation. **Next target:** `vwap_regime` (regime-switching VWAP pullback + deviation fade, ~1–4 trades/day).
 
-Attribution and entry-edge analysis on Jul-03 OOS showed:
+---
 
-- Strategy **SS - RS ~ -$36k** — entry selection is anti-predictive vs random OOS entries.
-- Direction beats opposite only **~38%** at the same timestamps.
-- **70%** of exits via stop loss; maintenance/TP paths are profitable but rare.
-- Donchian breakout at bar close **chases** extensions; industry trend systems enter at the **level**, not the spike close.
+## Session VWAP → ORB (historical)
 
-The Trend module remains in the repo for historical GA artifacts and parity replay. Do **not** deploy or run fresh GA on Trend without explicit experiment need.
+**Date:** 2026-07-06  
+**Status:** Session deprecated; ORB v1 completed 2026-07-08 — **failed** Sol #0 OOS gates.
 
-## Research summary (2025–2026 intraday ES)
+## Why we abandoned Session VWAP
 
-| Theme | Rationale |
-|-------|-----------|
-| **VWAP mean reversion** | Institutional anchor; fade extensions on range days |
-| **Opening range regime** | Skip trend explosions (wide OR) and dead opens (tight OR) |
-| **ADX cap** | Mean reversion when ADX low; avoid trend days |
-| **Session time windows** | Trade after OR; flat before close |
-| **Attribution gate** | `tools/analysis/strategy_attribution.py` before GA sign-off |
+Jul-04 (v1) and Jul-05 (v2) GA both failed OOS gates:
 
-ORB-with-confirmation and order-flow filters are documented as future enhancements.
+| Run | OOS PnL (Sol #0) | OOS PF | OOS-profitable HOF |
+|-----|------------------|--------|-------------------|
+| v1 Jul-04 | −$10,151 | 0.61 | 0 / 1,196 |
+| v2 Jul-05 | −$18,453 | 0.35 | 0 / 2,164 |
 
-## New strategy: `session`
+Attribution (corrected RNG):
 
-**Class:** `SessionVwapStrategy`  
-**CLI / GA:** `--strategy session`  
-**Params:** `strategies/session/parameters/session_strategy_params.csv`
+- **v1:** SS − RS MC med ~ −$8.5k — mild entry failure; exits also hurt.
+- **v2:** SS − RS ~ −$13.6k — entry selection worse; opposite-direction diagnostic +$11.7k but not a deployable sign flip.
 
-### Logic (v1)
+VWAP fade chases reversion in a market where session extensions often **continue** (momentum). Tighter v2 geometry increased trade count without fixing edge.
 
-1. Compute **session VWAP** (RTH bars only, daily reset).
-2. After **opening range** (default 30 min), fade extensions below/above VWAP when price **reverts** toward VWAP.
-3. Regime: ADX ≤ cap, OR width in band, ATR in band.
-4. Exit: stop (ATR), target VWAP, max hold, RTH/maintenance flat.
+## New strategy: `orb`
+
+**Class:** `OrbAcceptanceStrategy`  
+**CLI / GA:** `--strategy orb`  
+**Params:** `strategies/orb/parameters/orb_strategy_params.csv`
+
+### Logic (v1 — 2026-07-06)
+
+1. Build **opening range** (default 30 min RTH) — reuse `strategies/session/indicators.py`.
+2. After OR completes, require **N consecutive closes** beyond OR high/low (+ buffer) — **acceptance**, not first-touch fade.
+3. **Regime:** OR width band, **min ADX** (momentum day), optional **VWAP alignment** (long ≥ VWAP, short ≤ VWAP), ATR band.
+4. **Exit:** stop at **opposite OR** (classic) or ATR; target = **k × OR width** measured move; RTH/maintenance/time flat.
+5. **Cap:** max 1 entry per session day by default (sparse ORB).
 
 ### Commands
 
 ```powershell
 # GA (fresh)
-$env:STRATEGY = 'session'
-python optimize.py --strategy session --fresh
+$env:STRATEGY = 'orb'
+python optimize.py --strategy orb --fresh
 
 # Attribution (after OOS export)
 python tools/analysis/strategy_attribution.py `
-  --trades Session/output/genetic_trades_oos_YYYY-MM-DD-N.csv `
-  --param-csv strategies/session/parameters/session_strategy_params.csv
+  --trades Orb/output/genetic_trades_oos_YYYY-MM-DD-N.csv `
+  --param-csv strategies/orb/parameters/orb_strategy_params.csv `
+  --strategy orb
 ```
+
+### ORB v1 result (2026-07-08)
+
+| Metric | Sol #0 | Best HOF (Sol #534) |
+|--------|--------|---------------------|
+| OOS PnL | −$2,861 | +$3,525 (slices) |
+| OOS PF | 0.68 | 1.33 |
+| OOS trades (contiguous) | 34 | — |
+| OOS+ HOF | 58 / 820 | |
+
+Attribution: SS − RS −$3.3k · entries anti-predictive. See `results/ga_analysis_orb_2026-07-06-1.md`.
+
+## Pass gates (before deploy)
+
+- Contiguous OOS PnL > 0 (Solution #0 or selected candidate)
+- SS − RS MC median > −$2k
+- OOS PF > 1.0
+- Attribution run on OOS export
+
+## Deprecated strategies
+
+| Strategy | Reason |
+|----------|--------|
+| **trend** | Donchian chase; SS − RS ~ −$28k Jul-03 |
+| **session** | VWAP fade; 0/2164 OOS-profitable Jul-05 |
+| **orb** | Long-OR acceptance; Sol #0 OOS −$2.9k Jul-06 |
 
 ## Preserved infrastructure
 
 - GA engine, sim fidelity, paper/backtest parity, attribution, live IB execution — unchanged.
-- Bollinger strategy — unchanged (separate product line).
+- Bollinger — separate product line.
+- Session indicators (VWAP, OR) — shared by ORB.

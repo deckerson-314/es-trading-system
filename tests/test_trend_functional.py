@@ -582,22 +582,106 @@ class TestChannelExit:
             df=df
         )
 
-        # Create a "crash" bar where low drops below donchian_low
-        donchian_low = row['donchian_low']
+        # Create a "crash" bar where low drops below donchian_exit_low
+        donchian_exit_low = row.get('donchian_exit_low', row['donchian_low'])
         crash_row = pd.Series({
             'high': 100.0,
-            'low': donchian_low - 5.0,  # Well below the channel
-            'close': donchian_low - 3.0,
-            'donchian_low': donchian_low,
+            'low': donchian_exit_low - 5.0,  # Well below the exit channel
+            'close': donchian_exit_low - 3.0,
+            'donchian_low': row['donchian_low'],
             'donchian_high': row['donchian_high'],
+            'donchian_exit_low': donchian_exit_low,
+            'donchian_exit_high': row.get('donchian_exit_high', row['donchian_high']),
+            'atr': row.get('atr', 1.0),
         }, name=df.index[test_row_idx] + pd.Timedelta(minutes=1))
 
         should_exit, reason, price = strategy.check_exit(position, crash_row, df)
 
-        assert should_exit, "Should exit when low < donchian_low"
-        # Could be 'Stop Loss' or 'Channel Exit' depending on which triggers first
-        # With 99% SL, the channel exit should trigger first
+        assert should_exit, "Should exit when low < donchian_exit_low"
         assert reason in ('Channel Exit', 'Stop Loss'), f"Unexpected exit reason: {reason}"
+
+    def test_channel_exit_uses_separate_exit_lookback(self):
+        """Long channel exit should use donchian_exit_low, not entry donchian_low."""
+        strategy = make_strategy(**{
+            'Initial Stop Loss (%)': 99.0,
+            'Buy Lookback': 3,
+            'Sell Lookback': 3,
+            'Channel Exit Sell Lookback (bars)': 10,
+        })
+
+        position = strategy.setup_position(
+            entry_price=100.0, direction=1,
+            row=pd.Series({'high': 100, 'low': 100, 'close': 100}, name=pd.Timestamp('2025-06-01')),
+            df=None
+        )
+
+        # Entry floor breached (98) but still above exit floor (95).
+        hold_row = pd.Series({
+            'high': 100.0,
+            'low': 96.0,
+            'close': 97.0,
+            'donchian_low': 98.0,
+            'donchian_high': 105.0,
+            'donchian_exit_low': 95.0,
+            'donchian_exit_high': 105.0,
+            'atr': 1.0,
+        }, name=pd.Timestamp('2025-06-01 10:01'))
+
+        should_exit, reason, _ = strategy.check_exit(position, hold_row, None)
+        assert not should_exit, "Should use exit band; entry band break alone is insufficient"
+
+        exit_row = hold_row.copy()
+        exit_row['low'] = 94.0
+        exit_row['close'] = 94.5
+        should_exit, reason, price = strategy.check_exit(position, exit_row, None)
+        assert should_exit and reason == 'Channel Exit'
+        assert abs(float(price) - 95.0) < 1e-6
+
+    def test_channel_exit_atr_offset_delays_exit(self):
+        """Positive ATR offset loosens channel exit (requires deeper break)."""
+        strategy = make_strategy(**{
+            'Initial Stop Loss (%)': 99.0,
+            'Buy Lookback': 3,
+            'Sell Lookback': 3,
+            'Channel Exit ATR Offset': 2.0,
+        })
+        strategy.channel_exit_atr_offset = 2.0
+
+        df = make_ohlcv(15, base_price=100, trend=0, volatility=1.0)
+        df = strategy.calculate_indicators(df)
+        row = df.iloc[-1]
+
+        position = strategy.setup_position(
+            entry_price=100.0, direction=1,
+            row=pd.Series(row, name=df.index[-1]),
+            df=df
+        )
+
+        exit_floor = row['donchian_exit_low']
+        atr = float(row.get('atr', 2.0))
+        buffered_level = exit_floor - 2.0 * atr
+
+        shallow_row = pd.Series({
+            'high': 100.0,
+            'low': exit_floor - 0.5,
+            'close': exit_floor - 0.25,
+            'donchian_exit_low': exit_floor,
+            'donchian_exit_high': row['donchian_exit_high'],
+            'donchian_low': row['donchian_low'],
+            'donchian_high': row['donchian_high'],
+            'atr': atr,
+        }, name=df.index[-1] + pd.Timedelta(minutes=1))
+
+        should_exit, _, _ = strategy.check_exit(position, shallow_row, df)
+        assert not should_exit, "Shallow break above buffered level should not exit"
+
+        deep_row = shallow_row.copy()
+        deep_row['low'] = buffered_level - 1.0
+        deep_row['close'] = buffered_level - 0.5
+
+        should_exit, reason, price = strategy.check_exit(position, deep_row, df)
+        assert should_exit and reason == 'Channel Exit'
+        assert abs(float(price) - buffered_level) < 1e-6
 
 
 # ═══════════════════════════════════════════════════════════════════════════

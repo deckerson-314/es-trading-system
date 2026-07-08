@@ -559,7 +559,10 @@ def run_attribution(
     cfg: AttributionConfig | None = None,
 ) -> AttributionReport:
     cfg = cfg or AttributionConfig()
-    rng = random.Random(cfg.seed)
+    # Independent RNG streams per quadrant (SR must not consume RS draws).
+    rng_sr = random.Random(cfg.seed + 1)
+    rng_rs = random.Random(cfg.seed + 3)
+    rng_rr = random.Random(cfg.seed + 4)
 
     if oos_mask is None:
         oos_mask = pd.Series(True, index=ohlcv.index)
@@ -567,10 +570,10 @@ def run_attribution(
     ss_legs = trades_to_ss_legs(trades, cfg)
     enrich_legs(ohlcv, ss_legs, cfg)
 
-    sr_legs = build_sr_legs(ss_legs, ohlcv, cfg, rng)
+    sr_legs = build_sr_legs(ss_legs, ohlcv, cfg, rng_sr)
     enrich_legs(ohlcv, sr_legs, cfg)
 
-    rs_legs = build_rs_legs(ss_legs, ohlcv, oos_mask, cfg, rng)
+    rs_legs = build_rs_legs(ss_legs, ohlcv, oos_mask, cfg, rng_rs)
     enrich_legs(ohlcv, rs_legs, cfg)
 
     hold_med = statistics.median(max(1.0, leg.hold_minutes) for leg in ss_legs)
@@ -585,15 +588,21 @@ def run_attribution(
                 hold_med,
                 hold_spread,
                 cfg,
-                rng,
+                rng_rr,
             )
         )
 
     sr_mc: list[float] = []
-    rng_sr = random.Random(cfg.seed + 1)
+    rng_sr_mc = random.Random(cfg.seed + 1)
     for _ in range(cfg.mc_runs):
-        batch = build_sr_legs(ss_legs, ohlcv, cfg, rng_sr)
+        batch = build_sr_legs(ss_legs, ohlcv, cfg, rng_sr_mc)
         sr_mc.append(sum(leg.pnl_usd for leg in batch))
+
+    rs_mc: list[float] = []
+    rng_rs_mc = random.Random(cfg.seed + 3)
+    for _ in range(cfg.mc_runs):
+        batch = build_rs_legs(ss_legs, ohlcv, oos_mask, cfg, rng_rs_mc)
+        rs_mc.append(sum(leg.pnl_usd for leg in batch))
 
     report = AttributionReport(
         source=source or "trades",
@@ -629,6 +638,7 @@ def run_attribution(
             Quadrant.RS,
             "Random Entry / Hold-Matched Exit",
             cfg,
+            mc_totals=rs_mc,
         ),
         "RR": aggregate_quadrant(
             [],
@@ -638,12 +648,24 @@ def run_attribution(
             mc_totals=rr_mc,
         ),
     }
-    # RR point estimate = MC median
+    # MC-null quadrants use median total PnL as point estimate (not a single lucky draw).
+    n_trades = len(ss_legs)
+    friction = -cfg.transaction_cost * n_trades
     rr = report.quadrants["RR"]
-    rr.trade_count = len(ss_legs)
+    rr.trade_count = n_trades
     rr.net_pnl_usd = rr.mc_median_usd or 0.0
-    rr.expectancy_usd = (rr.mc_median_usd or 0.0) / max(len(ss_legs), 1)
-    rr.friction_floor_usd = -cfg.transaction_cost * len(ss_legs)
+    rr.expectancy_usd = (rr.mc_median_usd or 0.0) / max(n_trades, 1)
+    rr.friction_floor_usd = friction
+
+    rs = report.quadrants["RS"]
+    if rs.mc_median_usd is not None:
+        rs.net_pnl_usd = rs.mc_median_usd
+        rs.expectancy_usd = rs.mc_median_usd / max(n_trades, 1)
+
+    sr = report.quadrants["SR"]
+    if sr.mc_median_usd is not None:
+        sr.net_pnl_usd = sr.mc_median_usd
+        sr.expectancy_usd = sr.mc_median_usd / max(n_trades, 1)
 
     return report
 
@@ -656,7 +678,7 @@ def format_quadrant_table(report: AttributionReport) -> str:
     for key in ("SS", "SR", "RS", "RR"):
         q = report.quadrants[key]
         pnl = f"${q.net_pnl_usd:,.0f}"
-        if key == "RR" and q.mc_median_usd is not None:
+        if key in ("SR", "RS", "RR") and q.mc_median_usd is not None:
             pnl = f"${q.mc_median_usd:,.0f} (MC med)"
         cap = f"{q.capture_ratio_median:.2f}" if key != "RR" else "n/a"
         mfe = f"{q.mfe_median_pts:.1f}" if key != "RR" else "n/a"
@@ -749,8 +771,10 @@ def format_report_text(report: AttributionReport) -> str:
     elif ss.net_pnl_usd > rr_med:
         lines.append("- SS beats RR null: some structural edge exists (verify OOS stability).")
 
-    exit_effect = ss.net_pnl_usd - sr.net_pnl_usd
-    entry_effect = ss.net_pnl_usd - rs.net_pnl_usd
+    sr_ref = sr.mc_median_usd if sr.mc_median_usd is not None else sr.net_pnl_usd
+    rs_ref = rs.mc_median_usd if rs.mc_median_usd is not None else rs.net_pnl_usd
+    exit_effect = ss.net_pnl_usd - sr_ref
+    entry_effect = ss.net_pnl_usd - rs_ref
     lines.append(
         f"- Exit path effect (SS - SR): ${exit_effect:,.0f}  "
         f"(positive => strategy exits help vs time-only random hold)"

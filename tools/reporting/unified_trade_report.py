@@ -214,6 +214,10 @@ def generate_unified_trade_report(
     bar_window = max(60, min(600, 24 * int(tf_mins)))
     seg_1m = _segment_for_trade(df, entry_time, exit_time, bars=bar_window) if not df.empty else df
     seg_plot = _resample_segment_htf(seg_1m, tf_mins) if tf_mins > 1 else seg_1m
+    entry_time, exit_time = _pair_align_entry_exit(entry_time, exit_time)
+    from tools.reporting.chart_donchian import apply_donchian_position_mask
+
+    seg_plot = apply_donchian_position_mask(seg_plot, [(entry_time, exit_time)])
     tl_x, tl_stop, tl_tp = _load_timeline_traces(
         entry_time,
         exit_time,
@@ -256,8 +260,10 @@ def generate_unified_trade_report(
         for col, color, dash, name in [
             ("upper", "royalblue", "dash", "Upper BB"),
             ("lower", "royalblue", "dash", "Lower BB"),
-            ("donchian_high", "deepskyblue", "dot", "Donchian High"),
-            ("donchian_low", "deepskyblue", "dot", "Donchian Low"),
+            ("donchian_high", "deepskyblue", "dot", "Entry Donchian High"),
+            ("donchian_low", "deepskyblue", "dot", "Entry Donchian Low"),
+            ("donchian_exit_high", "darkorange", "dash", "Exit Donchian High"),
+            ("donchian_exit_low", "teal", "dash", "Exit Donchian Low"),
             ("vwap", "orange", "solid", "VWAP"),
             ("sma_regime", "gray", "solid", "SMA"),
         ]:

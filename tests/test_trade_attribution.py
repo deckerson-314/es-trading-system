@@ -11,6 +11,7 @@ from core.trade_attribution import (
     AttributionConfig,
     Quadrant,
     TradeLeg,
+    build_rs_legs,
     build_sr_legs,
     direction_diagnostics,
     enrich_legs,
@@ -128,3 +129,36 @@ def test_run_attribution_smoke():
     assert set(report.quadrants.keys()) == {"SS", "SR", "RS", "RR"}
     assert report.quadrants["SS"].trade_count == 2
     assert report.quadrants["RR"].mc_median_usd is not None
+    assert report.quadrants["RS"].mc_median_usd is not None
+    assert report.quadrants["RS"].net_pnl_usd == report.quadrants["RS"].mc_median_usd
+
+
+def test_rs_independent_of_sr_rng():
+    import random
+
+    ohlcv = _synthetic_ohlcv()
+    oos_mask = pd.Series(True, index=ohlcv.index)
+    cfg = AttributionConfig(seed=7)
+    ss = [
+        TradeLeg(
+            entry_time=ohlcv.index[5],
+            exit_time=ohlcv.index[15],
+            entry_price=5005.0,
+            exit_price=5015.0,
+            direction=1,
+            quadrant=Quadrant.SS,
+        )
+    ]
+    ss[0].compute_pnl(cfg)
+
+    rs_only = sum(
+        leg.pnl_usd
+        for leg in build_rs_legs(ss, ohlcv, oos_mask, cfg, random.Random(cfg.seed + 3))
+    )
+    rng_sr = random.Random(cfg.seed + 1)
+    build_sr_legs(ss, ohlcv, cfg, rng_sr)
+    rs_after_sr = sum(
+        leg.pnl_usd
+        for leg in build_rs_legs(ss, ohlcv, oos_mask, cfg, random.Random(cfg.seed + 3))
+    )
+    assert rs_only == rs_after_sr

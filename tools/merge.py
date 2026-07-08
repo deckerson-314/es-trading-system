@@ -1,0 +1,1 @@
+from pathlib import Path\nexec(open(r"C:/Trading/tools/build_list.py",encoding="utf-8").read())\nextra=open(r"C:/Trading/tools/extra.txt",encoding="utf-8").read().splitlines()\nLIST+=extra\nPath(r"C:/Trading/tools/ga_cmp.py").write_text(chr(10).join(LIST)+chr(10),encoding="utf-8")\nprint("wrote",len(LIST))\n

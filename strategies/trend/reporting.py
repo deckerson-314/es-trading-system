@@ -19,6 +19,8 @@ def group_params_for_display(params_dict_local):
     groups = {
         'Entry Criteria': ['Enable Long Trades', 'Enable Short Trades', 'Buy Lookback', 'Sell Lookback'],
         'Exit Criteria': ['Initial Stop Loss (%)', 'Take Profit ATR Multiplier', 
+                         'Channel Exit Sell Lookback (bars)', 'Channel Exit Buy Lookback (bars)',
+                         'Channel Exit ATR Offset',
                          'Enable Trailing Stop', 'ATR Multiplier for Trailing Stop', 
                          'ATR Length for Trailing Stop', 'Trailing Delay (bars)'],
         'Risk Management': ['Initial Capital', 'Position Sizing (% of Equity)', 'Max Open Trades', 
@@ -163,6 +165,10 @@ def generate_near_miss_plot(near_miss_idx, df, output_dir, version, sol_name=Non
             segment = df.iloc[start_idx:end_idx].copy()
         except:
             return None
+
+        from tools.reporting.chart_donchian import apply_donchian_position_mask
+
+        segment = apply_donchian_position_mask(segment, [])
             
         # Create plot
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
@@ -177,8 +183,11 @@ def generate_near_miss_plot(near_miss_idx, df, output_dir, version, sol_name=Non
         
         # Technicals
         if 'donchian_high' in segment.columns:
-            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_high'], line=dict(color='blue', dash='dash', width=1), name='D-High'), row=1, col=1)
-            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_low'], line=dict(color='blue', dash='dash', width=1), name='D-Low'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_high'], line=dict(color='blue', dash='dash', width=1), name='Entry D-High'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_low'], line=dict(color='blue', dash='dash', width=1), name='Entry D-Low'), row=1, col=1)
+        if 'donchian_exit_high' in segment.columns:
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_exit_high'], line=dict(color='darkorange', dash='dot', width=1.2), name='Exit D-High'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=segment.index, y=segment['donchian_exit_low'], line=dict(color='teal', dash='dot', width=1.2), name='Exit D-Low'), row=1, col=1)
         
         if 'sma_regime' in segment.columns:
             fig.add_trace(go.Scatter(x=segment.index, y=segment['sma_regime'], line=dict(color='gray', width=1), name='SMA'), row=1, col=1)

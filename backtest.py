@@ -108,7 +108,7 @@ def load_ga_params(ga_file, solution_idx):
         print(f"Error parsing GA params: {e}")
         raise
 
-def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, start_date=None, end_date=None, dashboard_path=None, params_source=None):
+def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, start_date=None, end_date=None, dashboard_path=None, params_source=None, assume_htf_native=None, paper_active_ranges=None):
     """
     Run backtest using StrategyFactory.
     """
@@ -165,17 +165,19 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
             log(f"ERROR initializing strategy: {e}", log_file)
             return result_package
 
-        # 3. Timeframe Resampling
+        # 3. Timeframe — live-parity resample (or pass-through for HTF-native live_data.csv)
+        from core.monitoring import prepare_strategy_ohlcv
+
         tf = getattr(strategy, 'timeframe', 1)
         if tf > 1:
-            if not suppress_log: log(f"Resampling data to {tf} minute candles...", log_file)
-            df = df.resample(f'{tf}T').agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna()
+            if assume_htf_native is None:
+                assume_htf_native = 'live_data' in os.path.basename(str(data_path)).lower()
+            df, htf_native = prepare_strategy_ohlcv(df, tf, assume_htf_native=assume_htf_native)
+            if not suppress_log:
+                if htf_native:
+                    log(f"Using HTF-native data ({len(df)} bars; skip re-resample)", log_file)
+                else:
+                    log(f"Resampling 1m data to {tf} minute candles (closed=right)...", log_file)
 
         # 4. Calculate Indicators & Filters
         if not suppress_log: log("Calculating indicators...", log_file)
@@ -205,8 +207,10 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
         if not suppress_log: log("Simulating trades...", log_file)
         
         from core.sim_fidelity import (
-            resolve_ga_stop_exit_price,
-            should_skip_same_bar_stop_after_trail,
+            apply_conservative_entry_slippage,
+            bar_active_for_paper_bot,
+            ga_live_style_entry_enabled,
+            simulate_bar_exit,
         )
 
         positions = []
@@ -219,55 +223,93 @@ def run_backtest(strategy_name, data_path, params_dict, suppress_log=False, star
             transaction_cost = 15.0 # Standard default if missing from CSV
         
         pending_entry = None
+        live_style_entry = ga_live_style_entry_enabled(params_dict)
+        tf_mins = max(1, int(getattr(strategy, "timeframe", 1) or 1))
         
         for row in rows:
-            # A. Execute Pending Entry
+            # A. Execute Pending Entry (next-bar open when live-style entry is off)
             if pending_entry:
-                 pos = strategy.setup_position(row.open, pending_entry['direction'], row, df)
+                 dir_ = pending_entry['direction']
+                 entry_px = apply_conservative_entry_slippage(row.open, dir_, params_dict)
+                 pos = strategy.setup_position(entry_px, dir_, row, df)
                  open_positions.append(pos)
                  pending_entry = None
             
             # B. Check Exits
             for i, pos in enumerate(open_positions[:]):
-                stop_updated_same_bar = strategy.update_trailing_stop(pos, row, df)
-                should_exit, reason, price = strategy.check_exit(pos, row, df)
-
-                if should_skip_same_bar_stop_after_trail(
-                    should_exit, reason, stop_updated_same_bar, params_dict,
-                ):
+                should_exit, reason, price = simulate_bar_exit(strategy, pos, row, df, params_dict)
+                if not should_exit:
                     continue
+
+                exit_time = row.Index if tf_mins > 1 else row.Index + pd.Timedelta(seconds=59)
+                pnl_points = (price - pos['entry_price']) * pos['direction']
+                pnl_currency = pnl_points * 50 - transaction_cost # Hardcoded ES multiplier
                 
-                if should_exit:
-                    price = resolve_ga_stop_exit_price(
-                        price,
-                        pos["direction"],
-                        reason,
-                        row,
-                        params_dict,
-                        stop_updated_same_bar=stop_updated_same_bar,
-                    )
-                    exit_time = row.Index + pd.Timedelta(seconds=59) # End of the 1m bar 
-                    pnl_points = (price - pos['entry_price']) * pos['direction']
-                    pnl_currency = pnl_points * 50 - transaction_cost # Hardcoded ES multiplier
-                    
-                    positions.append({
-                        'entry_time': pos['entry_time'],
-                        'exit_time': exit_time,
-                        'pnl_currency': pnl_currency,
-                        'pnl_points': pnl_points,
-                        'direction': pos['direction'],
-                        'entry_price': pos['entry_price'],
-                        'exit_price': price,
-                        'reason': reason
-                    })
-                    open_positions.pop(i)
+                positions.append({
+                    'entry_time': pos['entry_time'],
+                    'exit_time': exit_time,
+                    'pnl_currency': pnl_currency,
+                    'pnl_points': pnl_points,
+                    'direction': pos['direction'],
+                    'entry_price': pos['entry_price'],
+                    'exit_price': price,
+                    'reason': reason
+                })
+                open_positions.pop(i)
             
             # C. Check Entries
             if not open_positions:
-                 if row.entry_long_signal:
-                     pending_entry = {'direction': 1}
-                 elif row.entry_short_signal:
-                     pending_entry = {'direction': -1}
+                 bar_ok = bar_active_for_paper_bot(row.Index, paper_active_ranges)
+                 if bar_ok and row.entry_long_signal:
+                     if live_style_entry:
+                         entry_px = apply_conservative_entry_slippage(row.close, 1, params_dict)
+                         pos = strategy.setup_position(entry_px, 1, row, df)
+                         open_positions.append(pos)
+                         should_exit, reason, price = simulate_bar_exit(
+                             strategy, pos, row, df, params_dict,
+                         )
+                         if should_exit:
+                             exit_time = row.Index if tf_mins > 1 else row.Index + pd.Timedelta(seconds=59)
+                             pnl_points = (price - pos['entry_price']) * pos['direction']
+                             pnl_currency = pnl_points * 50 - transaction_cost
+                             positions.append({
+                                 'entry_time': pos['entry_time'],
+                                 'exit_time': exit_time,
+                                 'pnl_currency': pnl_currency,
+                                 'pnl_points': pnl_points,
+                                 'direction': pos['direction'],
+                                 'entry_price': pos['entry_price'],
+                                 'exit_price': price,
+                                 'reason': reason,
+                             })
+                             open_positions.pop()
+                     else:
+                         pending_entry = {'direction': 1}
+                 elif bar_ok and row.entry_short_signal:
+                     if live_style_entry:
+                         entry_px = apply_conservative_entry_slippage(row.close, -1, params_dict)
+                         pos = strategy.setup_position(entry_px, -1, row, df)
+                         open_positions.append(pos)
+                         should_exit, reason, price = simulate_bar_exit(
+                             strategy, pos, row, df, params_dict,
+                         )
+                         if should_exit:
+                             exit_time = row.Index if tf_mins > 1 else row.Index + pd.Timedelta(seconds=59)
+                             pnl_points = (price - pos['entry_price']) * pos['direction']
+                             pnl_currency = pnl_points * 50 - transaction_cost
+                             positions.append({
+                                 'entry_time': pos['entry_time'],
+                                 'exit_time': exit_time,
+                                 'pnl_currency': pnl_currency,
+                                 'pnl_points': pnl_points,
+                                 'direction': pos['direction'],
+                                 'entry_price': pos['entry_price'],
+                                 'exit_price': price,
+                                 'reason': reason,
+                             })
+                             open_positions.pop()
+                     else:
+                         pending_entry = {'direction': -1}
                      
         # 6. Results
         if positions:

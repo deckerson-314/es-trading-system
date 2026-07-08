@@ -246,6 +246,8 @@ if args.params == DEFAULT_PARAM_CSV:
         PARAM_CSV = os.path.join('strategies', 'trend', 'parameters', 'trend_strategy_params.csv')
     elif args.strategy == 'session':
         PARAM_CSV = os.path.join('strategies', 'session', 'parameters', 'session_strategy_params.csv')
+    elif args.strategy == 'orb':
+        PARAM_CSV = os.path.join('strategies', 'orb', 'parameters', 'orb_strategy_params.csv')
     else:
         PARAM_CSV = args.params
 else:
@@ -569,26 +571,32 @@ def run_backtest(params, df_in, param_dict_local, suppress_output=True, debug=Fa
     # Track time for jump detection (only if mask provided)
     last_time = None
     tf_delta = pd.Timedelta(minutes=strategy.timeframe * 5) # 5x timeframe buffer for gaps
+    calendar_gap = pd.Timedelta(hours=4)
 
     for row in df.itertuples():
         # Initialize last_time on the first iteration
         if last_time is None:
             last_time = row.Index
-            
-        # Jump Detection: Close positions if we jumped over OOS periods
-        if mask is not None:
-            if (row.Index - last_time) > tf_delta:
-                for pos in positions[:]:
-                    # Close at open of new period
-                    pnl = (row.open - pos['entry_price']) * pos['direction'] * 50 - transaction_cost
-                    trades.append(pos | {
-                        'exit_time': row.Index,
-                        'exit_price': row.open,
-                        'pnl': pnl,
-                        'reason': 'Gap: Period Transition'
-                    })
-                    positions.remove(pos)
-                pending_entry = None
+
+        gap = row.Index - last_time
+        gap_close = gap > max(tf_delta, calendar_gap)
+        # Jump Detection: Close positions on interleaved-mask gaps or calendar/session gaps.
+        if positions and gap_close:
+            gap_reason = (
+                "Gap: Period Transition"
+                if mask is not None and gap > tf_delta
+                else "Gap: Session Break"
+            )
+            for pos in positions[:]:
+                pnl = (row.open - pos['entry_price']) * pos['direction'] * 50 - transaction_cost
+                trades.append(pos | {
+                    'exit_time': row.Index,
+                    'exit_price': row.open,
+                    'pnl': pnl,
+                    'reason': gap_reason
+                })
+                positions.remove(pos)
+            pending_entry = None
 
         last_time = row.Index
         # 1. Process Pending (Execute at Next Open)
@@ -2247,7 +2255,7 @@ def generate_convergence_html(pop, param_keys, param_dict, chosen_params=None):
                         'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
                         'ATR Length for Filter', 'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 
                         'Enable Trend Filter', 'Trend EMA Length',
-                        'Enable ADX Filter', 'ADX Period', 'Max ADX Threshold',
+                        'Enable ADX Filter', 'ADX Period', 'Min ADX Threshold', 'Max ADX Threshold',
                         'RTH Start (HH:MM)', 'RTH End (HH:MM)',
                         'Enable RTH Filter', 'Volume MA Length', 'Max Volume Multiplier', 'Timeframe (minutes)',
                         'Max Open Trades', 'RTH Exit Buffer (minutes)', 'Enable Maintenance Filter',
@@ -3234,7 +3242,7 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                         'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
                         'ATR Length for Filter', 'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 
                         'Enable Trend Filter', 'Trend EMA Length',
-                        'Enable ADX Filter', 'ADX Period', 'Max ADX Threshold',
+                        'Enable ADX Filter', 'ADX Period', 'Min ADX Threshold', 'Max ADX Threshold',
                         'RTH Start (HH:MM)', 'RTH End (HH:MM)',
                         'Enable RTH Filter', 'Volume MA Length', 'Max Volume Multiplier', 'Timeframe (minutes)',
                         'Max Open Trades', 'RTH Exit Buffer (minutes)', 'Enable Maintenance Filter',
@@ -4275,7 +4283,7 @@ def main():
                               'Long Trigger (% From Lower Band)', 'Short Entry on Wick Touch', 
                               'Short Entry on Body in Zone', 'Short Trigger (% From Upper Band)',
                                'ATR Length for Filter', 'Max ATR Filter (Points)', 'Min ATR Filter (Points)', 
-                               'Enable ADX Filter', 'ADX Period', 'Max ADX Threshold',
+                               'Enable ADX Filter', 'ADX Period', 'Min ADX Threshold', 'Max ADX Threshold',
                                'RTH Start (HH:MM)', 'RTH End (HH:MM)',
                               'Enable RTH Filter', 'Volume MA Length', 'Max Volume Multiplier', 'Timeframe (minutes)',
                               'Max Open Trades'],

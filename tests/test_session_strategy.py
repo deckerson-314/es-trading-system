@@ -26,6 +26,9 @@ def _session_params():
         "Enable ADX Filter": {"value": 0},
         "Enable RTH Filter": {"value": 0},
         "Enable Maintenance Filter": {"value": 0},
+        "Reversion Confirm Bars": {"value": 1},
+        "Stop ATR Multiplier": {"value": 1.0},
+        "TP VWAP Buffer (pts)": {"value": 0.5},
         "ATR Length": {"value": 5},
     }
 
@@ -78,3 +81,56 @@ def test_entry_signals_are_boolean_series():
     long_sig, short_sig = strat.calculate_entry_signals(df)
     assert len(long_sig) == len(df)
     assert long_sig.dtype == bool or str(long_sig.dtype) == "bool"
+
+
+def test_reversion_confirm_bars_reduces_entries():
+    df = _synthetic_session_df()
+    p1 = _session_params()
+    p1["Reversion Confirm Bars"] = {"value": 1}
+    p2 = _session_params()
+    p2["Reversion Confirm Bars"] = {"value": 3}
+    s1 = SessionVwapStrategy(p1)
+    s2 = SessionVwapStrategy(p2)
+    d1 = s1.calculate_indicators(df.copy())
+    d2 = s2.calculate_indicators(df.copy())
+    l1, s1sig = s1.calculate_entry_signals(d1)
+    l2, s2sig = s2.calculate_entry_signals(d2)
+    assert (l1.sum() + s1sig.sum()) >= (l2.sum() + s2sig.sum())
+
+
+def test_setup_position_tp_on_correct_side_of_entry():
+    strat = SessionVwapStrategy(_session_params())
+    df = _synthetic_session_df()
+    df = strat.calculate_indicators(df)
+    row = df.iloc[20]
+    long_pos = strat.setup_position(float(row["close"]), 1, row, df)
+    short_pos = strat.setup_position(float(row["close"]), -1, row, df)
+    assert long_pos["tp"] > long_pos["entry_price"]
+    assert short_pos["tp"] < short_pos["entry_price"]
+    assert long_pos["target_vwap"] == row["vwap"]
+
+
+def test_check_exit_flattens_in_maintenance():
+    strat = SessionVwapStrategy(_session_params())
+    pos = {
+        "direction": -1,
+        "stop": 9999.0,
+        "tp": 4900.0,
+        "bars_held": 2,
+    }
+    row = pd.Series(
+        {
+            "high": 5010.0,
+            "low": 5000.0,
+            "close": 5005.0,
+            "force_exit": False,
+            "force_exit_rth": False,
+            "in_maintenance": True,
+            "vwap": 5002.0,
+        },
+        name=pd.Timestamp("2024-06-03 17:05"),
+    )
+    should_exit, reason, price = strat.check_exit(pos, row, None)
+    assert should_exit
+    assert reason == "Maintenance Exit"
+    assert price == 5005.0

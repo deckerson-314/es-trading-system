@@ -90,6 +90,9 @@ DEFAULT_PHASE_A: frozenset[str] = frozenset(
 DEFAULT_PHASE_B: frozenset[str] = frozenset(
     {
         "Initial Stop Loss (%)",
+        "Channel Exit Sell Lookback (bars)",
+        "Channel Exit Buy Lookback (bars)",
+        "Channel Exit ATR Offset",
         "Enable Trailing Stop",
         "ATR Length for Trailing Stop",
         "ATR Multiplier for Trailing Stop",

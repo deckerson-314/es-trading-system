@@ -125,6 +125,43 @@ def test_apply_maintenance_param_context_drops_when_disabled():
     assert d.get('Enable Maintenance Filter') is False
 
 
+def test_build_solution_export_params_preserves_genome_when_trailing_off():
+  """Inactive trailing child genes must export raw genome slots, not template fill."""
+  pd = {
+      'Enable Trailing Stop': {'type': 'int', 'min': 0, 'max': 1, 'value': 1},
+      'Trailing Delay (bars)': {'type': 'int', 'min': 3, 'max': 50, 'value': 28},
+      'ATR Multiplier for Trailing Stop': {'type': 'float', 'min': 0.5, 'max': 8, 'value': 3.7652},
+      'ATR Length for Trailing Stop': {'type': 'int', 'min': 1, 'max': 100, 'value': 1},
+      'Timeframe (minutes)': {'type': 'int', 'min': 1, 'max': 20, 'value': 14},
+  }
+  import pandas as pdi
+  param_df = pdi.DataFrame([
+      {'Name': k, 'Value': v['value'], 'Min': v['min'], 'Max': v['max'], 'Type': v['type']}
+      for k, v in pd.items()
+  ])
+  raw = {
+      'Enable Trailing Stop': 0,
+      'Trailing Delay (bars)': 17,
+      'ATR Multiplier for Trailing Stop': 2.25,
+      'ATR Length for Trailing Stop': 22,
+      'Timeframe (minutes)': 14,
+  }
+  keys = list(raw.keys())
+  export, effective = o.build_solution_export_params(raw, pd, param_df, keys)
+  assert export['Enable Trailing Stop'] == 0
+  assert export['Trailing Delay (bars)'] == 17
+  assert export['ATR Multiplier for Trailing Stop'] == 2.25
+  assert export['ATR Length for Trailing Stop'] == 22
+  assert 'Trailing Delay (bars)' not in effective
+  assert effective.get('Enable Trailing Stop') == 0
+
+
+def test_param_context_groups_cover_trailing_children():
+    children = set(o.context_child_param_keys())
+    for key in o._TRAILING_CONTEXT_KEYS:
+        assert key in children
+
+
 def test_apply_rth_and_maintenance_independent():
     d = {
         'Enable RTH Filter': 0,
@@ -147,3 +184,123 @@ def test_resolve_lookback_bars_from_minutes():
     assert o.resolve_buy_lookback_bars(p) == 10
     p2 = {'Timeframe (minutes)': 5, 'Buy Lookback': 40}
     assert o.resolve_buy_lookback_bars(p2) == 40
+
+
+def test_trailing_delay_active_gene_prefers_minutes_when_both_optimizable():
+    from strategies.trend.parameters import (
+        TRAILING_DELAY_BARS,
+        TRAILING_DELAY_MINUTES,
+        active_trailing_delay_gene_key,
+        exclude_trailing_delay_from_param_ranges,
+    )
+
+    param_dict = {
+        TRAILING_DELAY_MINUTES: {'type': 'int', 'min': 0, 'max': 300, 'value': 13},
+        TRAILING_DELAY_BARS: {'type': 'int', 'min': 3, 'max': 50, 'value': 1},
+    }
+    assert active_trailing_delay_gene_key(param_dict) == TRAILING_DELAY_MINUTES
+    assert exclude_trailing_delay_from_param_ranges(TRAILING_DELAY_BARS, param_dict)
+    assert not exclude_trailing_delay_from_param_ranges(TRAILING_DELAY_MINUTES, param_dict)
+
+
+def test_trailing_delay_bars_gene_when_minutes_fixed():
+    from strategies.trend.parameters import (
+        TRAILING_DELAY_BARS,
+        TRAILING_DELAY_MINUTES,
+        active_trailing_delay_gene_key,
+        resolve_trailing_delay_bars,
+    )
+
+    param_dict = {
+        TRAILING_DELAY_MINUTES: {'type': 'int', 'min': 0, 'max': 0, 'value': 13},
+        TRAILING_DELAY_BARS: {'type': 'int', 'min': 3, 'max': 50, 'value': 1},
+    }
+    assert active_trailing_delay_gene_key(param_dict) == TRAILING_DELAY_BARS
+    params = {'Timeframe (minutes)': 12, TRAILING_DELAY_BARS: 5}
+    assert resolve_trailing_delay_bars(params, param_dict, 12) == 5
+
+
+def test_trailing_delay_bars_gene_ignores_template_minutes():
+    from strategies.trend.parameters import (
+        TRAILING_DELAY_BARS,
+        TRAILING_DELAY_MINUTES,
+        resolve_trailing_delay_bars,
+    )
+
+    param_dict = {
+        TRAILING_DELAY_MINUTES: {'type': 'int', 'min': 0, 'max': 0, 'value': 13},
+        TRAILING_DELAY_BARS: {'type': 'int', 'min': 3, 'max': 50, 'value': 1},
+    }
+    params = {
+        'Timeframe (minutes)': 12,
+        TRAILING_DELAY_BARS: 5,
+        TRAILING_DELAY_MINUTES: 13,
+    }
+    assert resolve_trailing_delay_bars(params, param_dict, 12) == 5
+
+
+def test_trailing_delay_minutes_gene_converts_to_bars():
+    from strategies.trend.parameters import resolve_trailing_delay_bars
+
+    param_dict = {
+        'Trailing Delay (minutes)': {'type': 'int', 'min': 0, 'max': 300, 'value': 13},
+        'Trailing Delay (bars)': {'type': 'int', 'min': 3, 'max': 50, 'value': 1},
+    }
+    params = {'Timeframe (minutes)': 13, 'Trailing Delay (minutes)': 26, 'Trailing Delay (bars)': 99}
+    assert resolve_trailing_delay_bars(params, param_dict, 13) == 2
+
+
+def test_sync_trailing_delay_params_bars_gene():
+    from strategies.trend.parameters import sync_trailing_delay_params
+
+    param_dict = {
+        'Trailing Delay (minutes)': {'type': 'int', 'min': 0, 'max': 0, 'value': 13},
+        'Trailing Delay (bars)': {'type': 'int', 'min': 3, 'max': 50, 'value': 1},
+    }
+    params = {'Timeframe (minutes)': 10, 'Trailing Delay (bars)': 4}
+    sync_trailing_delay_params(params, param_dict, 10)
+    assert params['Trailing Delay (bars)'] == 4
+    assert params['Trailing Delay (minutes)'] == 40
+
+
+def test_resolve_channel_exit_lookbacks_fallback_to_entry():
+    from strategies.trend.parameters import (
+        resolve_channel_exit_buy_lookback,
+        resolve_channel_exit_sell_lookback,
+        resolve_channel_exit_atr_offset,
+    )
+
+    assert resolve_channel_exit_sell_lookback({}, None, 7) == 7
+    assert resolve_channel_exit_buy_lookback({}, None, 9) == 9
+    assert resolve_channel_exit_atr_offset({}, None) == 0.0
+
+
+def test_resolve_channel_exit_lookbacks_from_template():
+    from strategies.trend.parameters import (
+        resolve_channel_exit_buy_lookback,
+        resolve_channel_exit_sell_lookback,
+        resolve_channel_exit_atr_offset,
+    )
+
+    param_dict = {
+        'Channel Exit Sell Lookback (bars)': {'type': 'int', 'min': 3, 'max': 50, 'value': 12},
+        'Channel Exit Buy Lookback (bars)': {'type': 'int', 'min': 3, 'max': 50, 'value': 15},
+        'Channel Exit ATR Offset': {'type': 'float', 'min': 0, 'max': 2, 'value': 0.5},
+    }
+    assert resolve_channel_exit_sell_lookback({}, param_dict, 7) == 12
+    assert resolve_channel_exit_buy_lookback({}, param_dict, 9) == 15
+    assert resolve_channel_exit_atr_offset({}, param_dict) == 0.5
+
+
+def test_apply_channel_exit_lookbacks_mirrors_entry_when_absent():
+    param_dict = {
+        'Buy Lookback (minutes)': {'type': 'float', 'min': 10, 'max': 5000, 'value': 140},
+        'Sell Lookback (minutes)': {'type': 'float', 'min': 10, 'max': 5000, 'value': 98},
+        'Timeframe (minutes)': {'type': 'int', 'min': 1, 'max': 20, 'value': 14},
+    }
+    params = {'Timeframe (minutes)': 14}
+    o.apply_lookback_bars_from_minutes(params, param_dict)
+    assert params['Buy Lookback'] == 10
+    assert params['Sell Lookback'] == 7
+    assert params['Channel Exit Buy Lookback (bars)'] == 10
+    assert params['Channel Exit Sell Lookback (bars)'] == 7

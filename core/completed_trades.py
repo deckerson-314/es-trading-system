@@ -128,8 +128,37 @@ def same_fill_event(a: dict, b: dict, window_sec: float = 120.0) -> bool:
     return True
 
 
+def suppress_phantom_orphan_trades(trades: list, window_sec: float = 180.0) -> list:
+    """Drop orphan auto-closes that immediately follow an opposite-direction broker exit."""
+    if not trades:
+        return []
+    drop = set()
+    for i, tr in enumerate(trades):
+        if str(tr.get("reason") or "") != "Orphan Auto-Close":
+            continue
+        xt = normalize_trade_ts(tr.get("exit_time"))
+        if xt is None:
+            continue
+        orphan_dir = str(tr.get("direction") or "").upper()
+        for j, other in enumerate(trades):
+            if i == j:
+                continue
+            reason_o = str(other.get("reason") or "")
+            if "Take Profit" not in reason_o and "Broker Stop" not in reason_o:
+                continue
+            xo = normalize_trade_ts(other.get("exit_time"))
+            if xo is None or abs((xt - xo).total_seconds()) > window_sec:
+                continue
+            other_dir = str(other.get("direction") or "").upper()
+            if orphan_dir and other_dir and orphan_dir != other_dir:
+                drop.add(i)
+                break
+    return [t for idx, t in enumerate(trades) if idx not in drop]
+
+
 def dedupe_completed_trades_near_fills(trades: list, window_sec: float = 120.0, max_keep: int = 1000) -> list:
     """Collapse near-duplicate rows from CSV + log backfill + live close for the same exit."""
+    trades = suppress_phantom_orphan_trades(trades)
     if not trades:
         return []
     items = list(trades)

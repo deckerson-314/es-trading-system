@@ -6,8 +6,9 @@ Max Open Trades,1,1,1,int,Max concurrent trades
 Transaction Cost (Per Trade),15,15,15,float,Friction per round-trip
 Timeframe (minutes),5,3,15,int,Bar size for session logic
 === Entry: VWAP Mean Reversion ===,,,,,
-Min VWAP Extension (pts),8,4,20,float,Min distance from VWAP before fade
+Min VWAP Extension (pts),10,6,24,float,Min distance from VWAP before fade (v2 wider buffer)
 Entry Band ATR Multiplier,1.5,0.8,3,float,ATR band around VWAP for extension
+Reversion Confirm Bars,2,1,3,int,Consecutive bars reverting toward VWAP before entry
 ATR Length,14,7,21,int,ATR period for bands and stops
 Opening Range (minutes),30,15,60,int,OR window from RTH open
 Min OR Width (pts),4,2,12,float,Skip dead sessions (OR too tight)
@@ -17,7 +18,7 @@ Trade End Before RTH Close (min),30,15,60,int,Stop new trades N min before close
 === Regime Filters ===,,,,,
 Enable ADX Filter,1,0,1,int,Range-day filter (ADX cap)
 ADX Period,14,10,21,int,ADX lookback
-Max ADX Threshold,22,15,30,float,Trade mean reversion when ADX below cap
+Max ADX Threshold,22,15,28,float,Trade mean reversion when ADX below cap (v2 tighter max)
 Min ATR (pts),1,0.5,3,float,Min volatility to trade
 Max ATR (pts),25,10,40,float,Max volatility (crisis skip)
 Enable RTH Filter,1,1,1,int,LOCKED: RTH session only
@@ -33,9 +34,9 @@ Weekend Maintenance End Day,6,6,6,int,Sunday
 Weekend Maintenance End Time (HH:MM),18:00,,,str,Sunday maintenance end
 Maintenance Buffer Minutes,15,5,30,int,Buffer around maintenance
 === Exit Logic ===,,,,,
-Stop ATR Multiplier,1.25,0.8,2.5,float,Initial stop distance (ATR)
-TP VWAP Buffer (pts),1,0,3,float,Exit when within N pts of VWAP
-Max Hold (bars),36,12,72,int,Time stop (~3h at TF=5)
+Stop ATR Multiplier,1.0,0.8,1.5,float,Initial stop distance (v2 capped; was 2.5 max)
+TP VWAP Buffer (pts),0.5,0,2,float,Exit when within N pts of VWAP (v2 tighter)
+Max Hold (bars),48,24,96,int,Time stop (~2-8h at TF=5-15; v2 longer hold band)
 Enable Trailing Stop,0,0,1,int,Optional ATR trail after delay
 Trailing Delay (bars),3,2,8,int,Bars before trail ratchet
 ATR Multiplier for Trailing Stop,2,1.5,3.5,float,Trail distance if enabled
@@ -53,7 +54,7 @@ DATA_SPLITS,0.65,0.65,0.65,float,IS fraction per interleaved slice
 DATA_SIZE,0,0,0,int,0 = full history
 USE_INTERLEAVED_SPLIT,TRUE,TRUE,TRUE,bool,Interleaved IS/OOS
 NUM_SPLIT_PERIODS,11,11,11,int,OOS slices
-MIN_TRADES_DAY,0.2,0.2,0.2,float,Min activity floor
+MIN_TRADES_DAY,0.15,0.15,0.15,float,Min activity floor (v2 slightly lower for fewer signals)
 MIN_PROFIT_PER_TRADE,20,20,20,float,Min profit/trade norm
 MIN_TRADES_PEN_WEIGHT,-150,-150,-150,float,Low-trade penalty
 NORM_SORTINO_MAX,8,8,8,float,Sortino cap
@@ -62,7 +63,7 @@ NORM_PF_MAX,2.5,2.5,2.5,float,PF norm cap
 NORM_TRADES_MAX,1.5,1.5,1.5,float,Trades/day norm
 NORM_PNL_MAX,150000,150000,150000,float,PnL norm cap
 NORM_PROFIT_TRADE_MAX,120,120,120,float,PPT norm cap
-MIN_WIN_RATE,0.45,0.45,0.45,float,Min win rate (MR expects > trend)
+MIN_WIN_RATE,0.42,0.42,0.42,float,Min win rate (v2 allows sub-50% MR skew)
 SORTINO_CAP,8,8,8,float,Sortino cap
 GA_START_DATE,2020-01-02,2020-01-02,2020-01-02,str,Backtest start
 GA_END_DATE,2025-10-10,2025-10-10,2025-10-10,str,Backtest end
@@ -71,16 +72,16 @@ GA_CONSERVATIVE_STOP_SLIPPAGE,1,1,1,float,LOCKED
 GA_CONSERVATIVE_ENTRY_SLIPPAGE,1,1,1,float,LOCKED
 GA_CONSERVATIVE_CHANNEL_SLIPPAGE,0.25,0.25,0.25,float,LOCKED
 GA_PESSIMISTIC_STOPS,1,1,1,int,LOCKED
-GA_DIVERSE_SEED,0,0,0,int,Off for session v1
+GA_DIVERSE_SEED,0,0,0,int,Off for session v2
 WEIGHT_SORTINO,1,,,float,Fitness: Sortino
 WEIGHT_DRAWDOWN,-1.2,,,float,Fitness: drawdown
 WEIGHT_PF,2,,,float,Fitness: profit factor
 WEIGHT_TRADES,1,,,float,Fitness: trades/day
-WEIGHT_PNL,0.6,,,float,Fitness: total PnL
-WEIGHT_PPT,1.2,,,float,Fitness: profit/trade (MR focus)
+WEIGHT_PNL,0.8,,,float,Fitness: total PnL (v2 up-weight contiguous edge)
+WEIGHT_PPT,1.4,,,float,Fitness: profit/trade (MR focus)
 MIN_TRADE_DURATION,15,15,15,float,Min avg hold minutes
-MAX_WIN_RATE_CAP,0.92,0.92,0.92,float,Suspicious win-rate cap
-LIMIT_MAX_LOSS,40000,40000,40000,float,Severe loss gate
+MAX_WIN_RATE_CAP,0.88,0.88,0.88,float,Suspicious win-rate cap (v2 lower; wide stops inflated WR)
+LIMIT_MAX_LOSS,35000,35000,35000,float,Severe loss gate (v2 tighter)
 LIMIT_MIN_SORTINO,0.4,0.4,0.4,float,Severe Sortino gate
 ENABLE_FILTER_STACK_TRADE_PENALTY,0,0,0,int,Off
 INTERACTION_PENALTY_STRENGTH,0,0,0,float,Unused

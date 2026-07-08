@@ -1,0 +1,19 @@
+{
+  "write_seq": 1,
+  "write_label": "",
+  "connected": true,
+  "wall_ts": "2026-06-29T09:14:47.474870-04:00",
+  "html_bytes": 37970,
+  "chart_points": 0,
+  "timings_ms": {
+    "write_status_js_ms": 0.8,
+    "generate_html_ms": 0.4,
+    "write_html_ms": 1.6,
+    "write_tables_json_ms": 1.3,
+    "total_ms": 4.2
+  },
+  "last_data_receipt": null,
+  "data_age_sec": null,
+  "health_name": "dashboard_health.json",
+  "error": null
+}

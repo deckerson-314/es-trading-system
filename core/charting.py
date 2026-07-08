@@ -39,6 +39,10 @@ def create_trade_chart(df: pd.DataFrame, entry_time: datetime, exit_time: dateti
         if plot_df.empty or len(plot_df) < 2:
             logging.warning(f"Charting failed: Filtered plot_df is too small ({len(plot_df)} bars) for range {start_time} to {end_time}")
             return False
+
+        from tools.reporting.chart_donchian import apply_donchian_position_mask
+
+        plot_df = apply_donchian_position_mask(plot_df, [(entry_time, exit_time)])
             
         # Ensure required columns exist
         required = ['open', 'high', 'low', 'close']
@@ -84,6 +88,7 @@ def create_trade_chart(df: pd.DataFrame, entry_time: datetime, exit_time: dateti
             # 1. Add Indicators (Donchian/Bollinger) if they exist
             indicator_map = {
                 'donchian_high': 'cyan', 'donchian_low': 'cyan', 'donchian_mid': 'blue',
+                'donchian_exit_high': 'darkorange', 'donchian_exit_low': 'teal',
                 'upper_band': 'orange', 'lower_band': 'orange', 'mid_band': 'gray',
                 'ema_200': 'darkred', 'vwap': 'purple'
             }

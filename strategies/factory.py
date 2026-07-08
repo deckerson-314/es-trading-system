@@ -41,12 +41,20 @@ class StrategyFactory:
         elif name == "session" or name == "session_vwap":
             try:
                 from strategies.session.strategy import SessionVwapStrategy
-                logging.info("Factory: Loading SessionVwapStrategy")
+                logging.info("Factory: Loading SessionVwapStrategy (deprecated — prefer orb)")
                 return SessionVwapStrategy(params_dict)
             except ImportError as e:
                 logging.error(f"Factory: Failed to import SessionVwapStrategy: {e}")
                 raise
+        elif name == "orb" or name == "orb_acceptance":
+            try:
+                from strategies.orb.strategy import OrbAcceptanceStrategy
+                logging.info("Factory: Loading OrbAcceptanceStrategy")
+                return OrbAcceptanceStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import OrbAcceptanceStrategy: {e}")
+                raise
         else:
             raise ValueError(
-                f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'session', 'trend']"
+                f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'orb', 'session', 'trend']"
             )

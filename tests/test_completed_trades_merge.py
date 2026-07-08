@@ -92,8 +92,37 @@ class TestCompletedTradesMerge(unittest.TestCase):
             completed_trade_quality_score(rows[0]),
         )
 
-
-class TestTradeOpenHelpers(unittest.TestCase):
+    def test_suppress_phantom_orphan_after_broker_tp(self):
+        rows = [
+            {
+                "exit_time": "2026-06-22T09:30:40",
+                "entry_time": "2026-06-22T06:32:07",
+                "direction": "LONG",
+                "exit_price": 7583.5,
+                "pnl": 1220.5,
+                "reason": "Broker Take Profit",
+            },
+            {
+                "exit_time": "2026-06-22T09:31:14",
+                "entry_time": None,
+                "direction": "SHORT",
+                "exit_price": 7585.5,
+                "pnl": 70.5,
+                "reason": "Orphan Auto-Close",
+            },
+            {
+                "exit_time": "2026-06-22T09:31:34",
+                "entry_time": "2026-06-22T06:32:07",
+                "direction": "LONG",
+                "exit_price": 7583.5,
+                "pnl": 1220.5,
+                "reason": "Broker Take Profit",
+            },
+        ]
+        out = dedupe_completed_trades_near_fills(rows, window_sec=120, max_keep=10)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["direction"], "LONG")
+        self.assertEqual(out[0]["reason"], "Broker Take Profit")
     def test_wait_for_entry_fill_polls_until_filled(self):
         ib = MagicMock()
         contract = MagicMock()

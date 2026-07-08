@@ -1,7 +1,7 @@
 """
 Session VWAP Mean Reversion Strategy
 ====================================
-Intraday ES strategy aligned with 2025-2026 practice:
+Intraday ES strategy (DEPRECATED — use `orb`). See strategies/session/DEPRECATED.md.
 
 - **Fade VWAP extensions** in range-bound sessions (ADX cap, opening-range regime).
 - **Session structure**: trade after opening range completes; flat before close.
@@ -59,6 +59,9 @@ class SessionVwapStrategy(Strategy):
         # Entry: VWAP extension + revert
         self.min_extension_pts = float(get_param_value(p, "Min VWAP Extension (pts)", 8.0))
         self.entry_atr_mult = float(get_param_value(p, "Entry Band ATR Multiplier", 1.5))
+        self.reversion_confirm_bars = max(
+            1, int(get_param_value(p, "Reversion Confirm Bars", 2))
+        )
         self.atr_length = int(get_param_value(p, "ATR Length", 14))
 
         # Opening range regime
@@ -111,13 +114,19 @@ class SessionVwapStrategy(Strategy):
     @property
     def min_bars_required(self) -> int:
         or_bars = max(1, self.opening_range_minutes // max(1, self.timeframe))
-        return max(self.atr_length, self.adx_period, or_bars) + 20
+        return max(
+            self.atr_length,
+            self.adx_period,
+            or_bars,
+            self.reversion_confirm_bars,
+        ) + 20
 
     def get_param_structure(self) -> dict:
         return {
             "Entry Criteria": {
                 "Timeframe (minutes)": self.timeframe,
                 "Min VWAP Extension (pts)": self.min_extension_pts,
+                "Reversion Confirm Bars": self.reversion_confirm_bars,
                 "Entry Band ATR Multiplier": self.entry_atr_mult,
                 "Opening Range (minutes)": self.opening_range_minutes,
                 "Min OR Width (pts)": self.min_or_width_pts,
@@ -142,6 +151,7 @@ class SessionVwapStrategy(Strategy):
         mapping = {
             "Timeframe (minutes)": ("timeframe", int),
             "Min VWAP Extension (pts)": ("min_extension_pts", float),
+            "Reversion Confirm Bars": ("reversion_confirm_bars", int),
             "Entry Band ATR Multiplier": ("entry_atr_mult", float),
             "Opening Range (minutes)": ("opening_range_minutes", int),
             "Min OR Width (pts)": ("min_or_width_pts", float),
@@ -206,22 +216,11 @@ class SessionVwapStrategy(Strategy):
         )
 
         # Minutes from RTH open per bar (for trade window)
-        times = df.index.time
-        rth_open = self.rth_start
-        mins_from_open = pd.Series(
-            [
-                (t.hour * 60 + t.minute) - (rth_open.hour * 60 + rth_open.minute)
-                if in_rth.iloc[i]
-                else -1
-                for i, t in enumerate(times)
-            ],
-            index=df.index,
-        )
-        df["mins_from_rth_open"] = mins_from_open
+        bar_mins = df.index.hour * 60 + df.index.minute
+        open_mins = self.rth_start.hour * 60 + self.rth_start.minute
+        df["mins_from_rth_open"] = (bar_mins - open_mins).where(in_rth, -1)
         rth_close_mins = self.rth_end.hour * 60 + self.rth_end.minute
-        df["mins_to_rth_close"] = rth_close_mins - (
-            df.index.hour * 60 + df.index.minute
-        )
+        df["mins_to_rth_close"] = rth_close_mins - bar_mins
 
         return df
 
@@ -230,20 +229,32 @@ class SessionVwapStrategy(Strategy):
         in_maint = df["in_maintenance"] if "in_maintenance" in df.columns else pd.Series(False, index=df.index)
 
         dist = df["close"] - df["vwap"]
-        dist_prev = dist.shift(1)
 
-        # Revert toward VWAP after extension (fade, not chase)
-        revert_up = (dist > dist_prev) & (dist < 0)
-        revert_down = (dist < dist_prev) & (dist > 0)
-        extended_low = (dist_prev <= -self.min_extension_pts) | (
-            df["low"].shift(1) <= df["vwap_lower"].shift(1)
-        )
-        extended_high = (dist_prev >= self.min_extension_pts) | (
-            df["high"].shift(1) >= df["vwap_upper"].shift(1)
-        )
+        # Revert toward VWAP after extension (fade, not chase).
+        # Require N consecutive bars moving toward VWAP — skip the first touch bar.
+        revert_up = (dist > dist.shift(1)) & (dist < 0)
+        revert_down = (dist < dist.shift(1)) & (dist > 0)
+        confirm_up = revert_up
+        confirm_down = revert_down
+        for lag in range(1, self.reversion_confirm_bars):
+            confirm_up = confirm_up & revert_up.shift(lag)
+            confirm_down = confirm_down & revert_down.shift(lag)
 
-        long_sig = extended_low & revert_up
-        short_sig = extended_high & revert_down
+        lookback = self.reversion_confirm_bars
+        extended_low = (
+            (dist.shift(lookback) <= -self.min_extension_pts)
+            | (df["low"].shift(lookback) <= df["vwap_lower"].shift(lookback))
+        )
+        extended_high = (
+            (dist.shift(lookback) >= self.min_extension_pts)
+            | (df["high"].shift(lookback) >= df["vwap_upper"].shift(lookback))
+        )
+        # Still extended enough to have a meaningful VWAP target (not already at mean).
+        room_long = dist <= -max(1.0, self.tp_vwap_buffer_pts)
+        room_short = dist >= max(1.0, self.tp_vwap_buffer_pts)
+
+        long_sig = extended_low & confirm_up & room_long
+        short_sig = extended_high & confirm_down & room_short
 
         # Regime: range day via ADX
         if self.enable_adx_filter and "adx" in df.columns:
@@ -284,17 +295,19 @@ class SessionVwapStrategy(Strategy):
     def setup_position(self, entry_price, direction, row, df=None):
         atr = float(row["atr"]) if "atr" in row and not pd.isna(row["atr"]) else 4.0
         vwap = float(row["vwap"]) if "vwap" in row and not pd.isna(row["vwap"]) else entry_price
+        stop_dist = max(2.0, self.stop_atr_mult * atr)
+        min_tp_dist = max(2.0, 0.35 * stop_dist)
 
         if direction == 1:
-            stop = entry_price - self.stop_atr_mult * atr
+            stop = entry_price - stop_dist
             tp = vwap - self.tp_vwap_buffer_pts
-            if tp <= entry_price:
-                tp = entry_price + max(2.0, 0.5 * self.stop_atr_mult * atr)
+            if tp <= entry_price + min_tp_dist:
+                tp = entry_price + min_tp_dist
         else:
-            stop = entry_price + self.stop_atr_mult * atr
+            stop = entry_price + stop_dist
             tp = vwap + self.tp_vwap_buffer_pts
-            if tp >= entry_price:
-                tp = entry_price - max(2.0, 0.5 * self.stop_atr_mult * atr)
+            if tp >= entry_price - min_tp_dist:
+                tp = entry_price - min_tp_dist
 
         return {
             "entry_time": row.Index if not isinstance(row, pd.Series) else row.name,
@@ -317,11 +330,13 @@ class SessionVwapStrategy(Strategy):
         if isinstance(row, pd.Series):
             force_exit = bool(row.get("force_exit", False))
             force_exit_rth = bool(row.get("force_exit_rth", False))
+            in_maintenance = bool(row.get("in_maintenance", False))
         else:
             force_exit = bool(getattr(row, "force_exit", False))
             force_exit_rth = bool(getattr(row, "force_exit_rth", False))
+            in_maintenance = bool(getattr(row, "in_maintenance", False))
 
-        if force_exit:
+        if force_exit or in_maintenance:
             return True, "Maintenance Exit", close
         if force_exit_rth:
             return True, "RTH Exit", close

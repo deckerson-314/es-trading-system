@@ -26,6 +26,7 @@ from core.protection import (
     stop_order_is_armed,
     stop_order_is_pending,
     trail_replace_grace_active,
+    trail_stop_protection_pending,
     wire_bracket_entry_from_ib,
     _find_protective_stop_trade_for_position,
     _find_trade_for_order,
@@ -393,9 +394,12 @@ def _handle_protective_backup(
     return False
 
   if trail_grace_active:
+    st = stop_trade.orderStatus.status if stop_trade and stop_trade.orderStatus else "?"
     logging.info(
-      "Protective backup deferred: post-trail grace (stop %.2f)",
+      "Protective backup deferred: awaiting broker stop arm "
+      "(stop %.2f, status=%s)",
       stop_price_for_breach,
+      st,
     )
     return False
 
@@ -500,6 +504,26 @@ def _exit_channel_signal(
       es_pos = [p for p in ib.positions() if p.contract.conId == bracket_contract.conId]
       if not es_pos or es_pos[0].position == 0:
         used_limit = True
+        latest_row = (
+            data.iloc[-1]
+            if data is not None and not data.empty
+            else {"close": float(hint or 0)}
+        )
+        stop_trade, stop_order = _resolve_stop_trade_for_bracket(
+            ib, bracket_contract, bracket,
+        )
+        tp_trade = (
+            _find_trade_for_order(ib, bracket_contract, tp_order)
+            if tp_order
+            else None
+        )
+        _record_trade_close(
+            ib, bracket_contract, bracket, entry_trade, stop_order, tp_order,
+            stop_trade, tp_trade, dir_, latest_row, positions,
+            completed_trades, live_tracker, send_email_fn, data,
+            reason="Channel Exit (signal)", strategy=strategy,
+        )
+        return
     except Exception as e:
       logging.warning("Channel limit @ %.2f failed (%s); falling back to market", hint, e)
 
@@ -689,6 +713,15 @@ def _invoke_completed_trade_persist_hook() -> None:
 
 
 def _append_completed_trade_record(completed_trades: list, record: dict, max_keep: int = 1000) -> None:
+    from core.completed_trades import merge_trade_records, same_fill_event
+
+    for i, existing in enumerate(completed_trades):
+        if same_fill_event(existing, record):
+            completed_trades[i] = merge_trade_records([existing, record])
+            if len(completed_trades) > max_keep:
+                del completed_trades[:-max_keep]
+            _invoke_completed_trade_persist_hook()
+            return
     completed_trades.append(record)
     if len(completed_trades) > max_keep:
         del completed_trades[:-max_keep]
@@ -963,6 +996,43 @@ def _cancel_bracket_working_orders(ib, contract, bracket) -> None:
                 ib.cancelOrder(o)
             except Exception:
                 pass
+
+
+def purge_closed_brackets(positions, live_tracker=None) -> int:
+    """Drop brackets already recorded as closed (ghost rows after channel exit races)."""
+    if not positions:
+        return 0
+    n = 0
+    for bracket in positions[:]:
+        if not bracket.get("_close_recorded"):
+            continue
+        positions.remove(bracket)
+        n += 1
+    if n:
+        logging.info("Purged %s closed bracket(s) from in-memory tracking", n)
+        if live_tracker is not None:
+            add_to_live_tracker(live_tracker, "info", f"Purged {n} closed bracket(s)")
+    return n
+
+
+def bracket_counts_as_open_exposure(ib, contract, bracket) -> bool:
+    """True when a tracked bracket still represents live market risk."""
+    if not bracket or bracket.get("_close_recorded"):
+        return False
+    if int(bracket.get("direction") or 0) == 0:
+        return False
+    trade = _entry_trade_for_bracket(ib, contract, bracket)
+    if not (trade and trade.filled()):
+        return False
+    bracket_contract = bracket.get("contract", contract)
+    if bracket_contract:
+        try:
+            for p in ib.positions():
+                if p.contract.conId == bracket_contract.conId:
+                    return abs(float(p.position or 0)) >= 1
+        except Exception:
+            pass
+    return False
 
 
 def prune_dead_brackets(ib, contract, positions, live_tracker=None) -> int:
@@ -1553,6 +1623,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                     delattr(check_exits, '_maint_warned')
             return
 
+    purge_closed_brackets(positions, live_tracker)
     prune_dead_brackets(ib, contract, positions, live_tracker)
 
     # --- Per-bracket exit checks ---
@@ -1863,6 +1934,11 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
             stop_active = _protective_order_active(stop_trade)
             stop_armed = stop_order_is_armed(stop_trade)
             tp_active = _protective_order_active(tp_trade)
+            trail_stop_pending = trail_stop_protection_pending(
+                bracket,
+                stop_trade,
+                trail_ratchet_this_bar=trail_ratchet_this_bar,
+            )
 
             # Post-trail breach uses refreshed broker stop (not pre-trail snapshot).
             live_stop_order = stop_trade.order if stop_trade else stop_order
@@ -1893,7 +1969,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                 ib, bracket_contract, bracket, positions, completed_trades,
                 live_tracker, send_email_fn, entry_trade, latest_row, data, strategy,
                 stop_trade, dir_, stop_should_trigger, stop_price_for_breach,
-                trail_grace_active=trail_replace_grace_active(bracket),
+                trail_grace_active=trail_stop_pending,
             ):
                 continue
 
@@ -1910,7 +1986,7 @@ def check_exits(strategy, ib, contract, data, positions, completed_trades,
                             live_tracker, send_email_fn, entry_trade, latest_row, data, strategy,
                             stop_trade, tp_trade, dir_, exit_reason, exit_price_hint,
                             stop_armed, tp_active,
-                            trail_grace_active=trail_replace_grace_active(bracket),
+                            trail_grace_active=trail_stop_pending,
                             trail_ratchet_this_bar=trail_ratchet_this_bar,
                         )
                         if closed:
@@ -2264,7 +2340,10 @@ def _send_trade_close_notification(ib, bracket, dir_, entry_price, exit_price, p
 
 def send_composite_status_notification(ib, positions, data, account_info, send_email_fn):
     """Send a single status email with reports and charts for all active positions."""
-    if not positions:
+    open_positions = [
+        b for b in (positions or []) if not b.get("_close_recorded")
+    ]
+    if not open_positions:
         return
 
     now = datetime.now()
@@ -2273,7 +2352,7 @@ def send_composite_status_notification(ib, positions, data, account_info, send_e
 
     os.makedirs('temp', exist_ok=True)
 
-    for i, bracket in enumerate(positions):
+    for i, bracket in enumerate(open_positions):
         try:
             dir_ = bracket.get('direction', 0)
             entry_price = bracket.get('entry_price', 0)
@@ -2313,8 +2392,14 @@ def send_composite_status_notification(ib, positions, data, account_info, send_e
 
     if all_reports:
         # Subject summary
-        total_pnl = sum((data['close'].iloc[-1] - b.get('entry_price', 0)) * b.get('direction', 0) * 50 for b in positions if not data.empty)
-        pos_summary = "/".join(["L" if b.get('direction') == 1 else "S" for b in positions])
+        total_pnl = sum(
+            (data['close'].iloc[-1] - b.get('entry_price', 0)) * b.get('direction', 0) * 50
+            for b in open_positions
+            if not data.empty
+        )
+        pos_summary = "/".join(
+            ["L" if b.get('direction') == 1 else "S" for b in open_positions]
+        )
         subj = f"STAT: {pos_summary} PNL:${total_pnl:,.0f}"
         
         body = "\n\n" + ("\n" + "="*60 + "\n").join(all_reports)
@@ -2337,6 +2422,32 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
                         completed_trades, live_tracker, send_email_fn, data, 
                         reason='Unknown', strategy=None):
     """Record a completed trade and clean up. Improved reason discovery."""
+    if bracket.get("_close_recorded"):
+        logging.info(
+            "Skipping duplicate trade close record (already recorded: %s)",
+            bracket.get("_close_reason") or reason,
+        )
+        if bracket in positions:
+            positions.remove(bracket)
+        return
+    bracket["_close_recorded"] = True
+    try:
+        exit_trade = _record_trade_close_body(
+            ib, contract, bracket, entry_trade, stop_order, tp_order,
+            stop_trade, tp_trade, dir_, latest_row, positions,
+            completed_trades, live_tracker, send_email_fn, data,
+            reason=reason, strategy=strategy,
+        )
+    finally:
+        if bracket in positions:
+            positions.remove(bracket)
+
+
+def _record_trade_close_body(ib, contract, bracket, entry_trade, stop_order, tp_order,
+                        stop_trade, tp_trade, dir_, latest_row, positions,
+                        completed_trades, live_tracker, send_email_fn, data, 
+                        reason='Unknown', strategy=None):
+    """Inner close recorder; caller must set ``_close_recorded`` and purge ``positions``."""
     # Determine exit reason from orders if not explicitly provided or marked as Manual
     exit_trade = None
     entry_perm = (
@@ -2507,6 +2618,7 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
     )
 
     logging.info(f"TRADE CLOSE: {reason} @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
+    bracket["_close_reason"] = reason
     add_to_live_tracker(live_tracker, 'trade',
         f"CLOSE ({reason}): @ ${exit_price:.2f}, PNL: ${pnl:,.2f}")
     
@@ -2547,6 +2659,4 @@ def _record_trade_close(ib, contract, bracket, entry_trade, stop_order, tp_order
         cancel_residual_orders_when_flat_on_contract(ib, contract, live_tracker)
     except Exception as e:
         logging.error(f"Error during final orphan cleanup: {e}")
-
-    if bracket in positions:
-        positions.remove(bracket)
+    return exit_trade

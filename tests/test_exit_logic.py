@@ -3,6 +3,8 @@ import pandas as pd
 from unittest.mock import MagicMock
 import sys
 import os
+from datetime import datetime
+import pytz
 
 import core.execution as core_execution
 
@@ -16,7 +18,11 @@ from core.execution import (
     _handle_strategy_signal_exit,
     _exit_path,
 )
-from core.protection import mark_trail_replace_grace, trail_replace_grace_active
+from core.protection import (
+    mark_trail_replace_grace,
+    trail_replace_grace_active,
+    trail_stop_protection_pending,
+)
 
 class TestExitLogic(unittest.TestCase):
     def test_short_exit_no_trigger(self):
@@ -574,6 +580,66 @@ class TestExitLogic(unittest.TestCase):
                 os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
             else:
                 os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+    def test_trail_arm_wait_defers_backup_when_stop_pending(self):
+        """After grace expires, keep deferring backup until broker stop arms."""
+        bracket = {"trail_replace_at": datetime.now(pytz.utc)}
+        stop_order = MagicMock()
+        stop_order.orderType = "STP"
+        stop_order.auxPrice = 7585.5
+        stop_trade = MagicMock()
+        stop_trade.order = stop_order
+        stop_trade.orderStatus = MagicMock(status="PendingSubmit", whyHeld="")
+
+        self.assertTrue(
+            trail_stop_protection_pending(bracket, stop_trade, trail_ratchet_this_bar=False)
+        )
+
+        old_force = core_execution._force_close_position
+        core_execution._force_close_position = MagicMock()
+        old_flag = os.environ.get("LIVE_BROKER_AUTHORITATIVE_EXIT")
+        os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = "1"
+        try:
+            closed = _handle_protective_backup(
+                ib=MagicMock(),
+                bracket_contract=MagicMock(),
+                bracket=bracket,
+                positions=[],
+                completed_trades=[],
+                live_tracker=MagicMock(),
+                send_email_fn=MagicMock(),
+                entry_trade=MagicMock(),
+                latest_row={"close": 7592.25, "high": 7592.25, "low": 7591.25},
+                data=None,
+                strategy=MagicMock(),
+                stop_trade=stop_trade,
+                dir_=-1,
+                stop_should_trigger=True,
+                stop_price_for_breach=7585.5,
+                trail_grace_active=True,
+            )
+            self.assertFalse(closed)
+            core_execution._force_close_position.assert_not_called()
+        finally:
+            core_execution._force_close_position = old_force
+            if old_flag is None:
+                os.environ.pop("LIVE_BROKER_AUTHORITATIVE_EXIT", None)
+            else:
+                os.environ["LIVE_BROKER_AUTHORITATIVE_EXIT"] = old_flag
+
+    def test_trail_arm_wait_clears_when_stop_armed(self):
+        bracket = {"trail_replace_at": datetime.now(pytz.utc)}
+        stop_order = MagicMock()
+        stop_order.orderType = "STP"
+        stop_order.auxPrice = 7585.5
+        stop_trade = MagicMock()
+        stop_trade.order = stop_order
+        stop_trade.orderStatus = MagicMock(status="Submitted", whyHeld="")
+
+        self.assertFalse(
+            trail_stop_protection_pending(bracket, stop_trade, trail_ratchet_this_bar=False)
+        )
+        self.assertNotIn("trail_replace_at", bracket)
 
     def test_exit_path_mapping(self):
         self.assertEqual(_exit_path("Broker Stop"), "broker_stop")

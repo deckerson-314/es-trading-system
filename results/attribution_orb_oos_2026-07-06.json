@@ -1,0 +1,159 @@
+{
+  "source": "c:\\Trading\\Orb\\output\\genetic_trades_oos_2026-07-06-1.csv",
+  "trade_count": 34,
+  "config": {
+    "point_multiplier": 50.0,
+    "transaction_cost": 15.0,
+    "mc_runs": 200,
+    "seed": 42,
+    "min_excursion_pts": 0.25
+  },
+  "quadrants": {
+    "SS": {
+      "quadrant": "SS",
+      "label": "Strategy Entry / Strategy Exit",
+      "trade_count": 34,
+      "net_pnl_usd": -2860.8075738346406,
+      "gross_profit_usd": 6021.692426165405,
+      "gross_loss_usd": -8882.500000000045,
+      "win_rate": 32.35294117647059,
+      "profit_factor": 0.6779276584481142,
+      "expectancy_usd": -84.14139923043061,
+      "avg_hold_minutes": 315.92549019607844,
+      "mfe_median_pts": 7.494999999999891,
+      "mae_median_pts": 7.5499999999999545,
+      "mfe_mae_ratio": 0.992715231788071,
+      "capture_ratio_median": -0.44776119402981696,
+      "pct_mae_before_mfe": 91.17647058823529,
+      "mfe_minutes_median": 15.0,
+      "mae_minutes_median": 20.0,
+      "pct_mfe_gt_5_close_neg": 38.23529411764706,
+      "friction_floor_usd": -510.0,
+      "mc_median_usd": null,
+      "mc_p5_usd": null,
+      "mc_p95_usd": null,
+      "mc_pct_positive": null
+    },
+    "SR": {
+      "quadrant": "SR",
+      "label": "Strategy Entry / Random Exit",
+      "trade_count": 34,
+      "net_pnl_usd": -3734.999999999943,
+      "gross_profit_usd": 7323.9999999999645,
+      "gross_loss_usd": -25556.999999999898,
+      "win_rate": 47.05882352941177,
+      "profit_factor": 0.28657510662440794,
+      "expectancy_usd": -109.85294117646892,
+      "avg_hold_minutes": 567.6470588235294,
+      "mfe_median_pts": 6.814999999999827,
+      "mae_median_pts": 7.445000000000164,
+      "mfe_mae_ratio": 0.9153794492947854,
+      "capture_ratio_median": -0.051275510204139875,
+      "pct_mae_before_mfe": 94.11764705882354,
+      "mfe_minutes_median": 19.0,
+      "mae_minutes_median": 24.5,
+      "pct_mfe_gt_5_close_neg": 29.41176470588235,
+      "friction_floor_usd": -510.0,
+      "mc_median_usd": -3734.999999999943,
+      "mc_p5_usd": -27411.999999999975,
+      "mc_p95_usd": 7754.0000000000555,
+      "mc_pct_positive": 26.0
+    },
+    "RS": {
+      "quadrant": "RS",
+      "label": "Random Entry / Hold-Matched Exit",
+      "trade_count": 34,
+      "net_pnl_usd": 442.24999999992406,
+      "gross_profit_usd": 3889.0000000000236,
+      "gross_loss_usd": -9040.000000000033,
+      "win_rate": 41.1764705882353,
+      "profit_factor": 0.43019911504424885,
+      "expectancy_usd": 13.007352941174236,
+      "avg_hold_minutes": 413.11764705882354,
+      "mfe_median_pts": 4.645000000000209,
+      "mae_median_pts": 5.019999999999982,
+      "mfe_mae_ratio": 0.9252988047809215,
+      "capture_ratio_median": -0.08333333333353635,
+      "pct_mae_before_mfe": 79.41176470588235,
+      "mfe_minutes_median": 17.0,
+      "mae_minutes_median": 14.5,
+      "pct_mfe_gt_5_close_neg": 20.58823529411765,
+      "friction_floor_usd": -510.0,
+      "mc_median_usd": 442.24999999992406,
+      "mc_p5_usd": -11752.499999999996,
+      "mc_p95_usd": 10906.000000000076,
+      "mc_pct_positive": 52.5
+    },
+    "RR": {
+      "quadrant": "RR",
+      "label": "Random Entry / Random Exit",
+      "trade_count": 34,
+      "net_pnl_usd": -198.50000000008095,
+      "gross_profit_usd": 0.0,
+      "gross_loss_usd": 0.0,
+      "win_rate": 0.0,
+      "profit_factor": 0.0,
+      "expectancy_usd": -5.838235294120028,
+      "avg_hold_minutes": 0.0,
+      "mfe_median_pts": 0.0,
+      "mae_median_pts": 0.0,
+      "mfe_mae_ratio": 0.0,
+      "capture_ratio_median": 0.0,
+      "pct_mae_before_mfe": 0.0,
+      "mfe_minutes_median": 0.0,
+      "mae_minutes_median": 0.0,
+      "pct_mfe_gt_5_close_neg": 0.0,
+      "friction_floor_usd": -510.0,
+      "mc_median_usd": -198.50000000008095,
+      "mc_p5_usd": -7419.500000000062,
+      "mc_p95_usd": 5279.0000000000055,
+      "mc_pct_positive": 45.5
+    }
+  },
+  "direction": {
+    "pct_strategy_beats_opposite": 32.35294117647059,
+    "median_edge_pts": -7.119999999999891,
+    "opposite_net_pnl_usd": 1840.8075738346406,
+    "coinflip_mc_median_usd": -246.54810654129506,
+    "coinflip_mc_pct_positive": 46.5
+  },
+  "horizon_edges": [
+    {
+      "horizon_minutes": 30,
+      "median_close_pts_strategy": 1.509999999999991,
+      "median_close_pts_opposite": -1.509999999999991,
+      "median_edge_pts": 3.019999999999982
+    },
+    {
+      "horizon_minutes": 60,
+      "median_close_pts_strategy": -0.04999999999972715,
+      "median_close_pts_opposite": 0.04999999999972715,
+      "median_edge_pts": -0.0999999999994543
+    },
+    {
+      "horizon_minutes": 120,
+      "median_close_pts_strategy": -2.2500000000002274,
+      "median_close_pts_opposite": 2.2500000000002274,
+      "median_edge_pts": -4.500000000000455
+    },
+    {
+      "horizon_minutes": 240,
+      "median_close_pts_strategy": -3.6100000000001273,
+      "median_close_pts_opposite": 3.6100000000001273,
+      "median_edge_pts": -7.220000000000255
+    },
+    {
+      "horizon_minutes": 480,
+      "median_close_pts_strategy": -5.519999999999982,
+      "median_close_pts_opposite": 5.519999999999982,
+      "median_edge_pts": -11.039999999999964
+    }
+  ],
+  "notes": [
+    "SS = actual strategy entry and exit (exported trades).",
+    "SR = strategy entry with random hold from empirical distribution; exit at bar close.",
+    "RS = random OOS entry/direction with hold matched to paired strategy trade; exit at bar close.",
+    "RR = Monte Carlo random entry, direction, and hold (matched count and hold distribution).",
+    "Path-dependent strategy exits on random entries require exit-engine replay (future work)."
+  ]
+}

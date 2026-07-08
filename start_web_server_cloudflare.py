@@ -4,7 +4,10 @@ HTTP server for Trading Strategy Dashboards with Cloudflare Tunnel support
 Cloudflare Tunnel is a free alternative to ngrok with no bandwidth limits
 """
 
+import logging
 import os
+import re
+import socket
 import sys
 import http.server
 import socketserver
@@ -12,11 +15,24 @@ import webbrowser
 import threading
 import time
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 # Configuration
 PORT = 8000
 WEB_DIR = Path(__file__).parent / 'web'
+ROOT_DIR = Path(__file__).parent
+sys.path.insert(0, str(ROOT_DIR))
+
+from tools.notifications.email_service import send_email
+
+_TUNNEL_URL_RE = re.compile(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com')
+_TUNNEL_REGISTERED_RE = re.compile(r'Registered tunnel connection', re.I)
+_TUNNEL_FAILED_RE = re.compile(
+    r'(?:Register tunnel error|initial tunnel connection failed|'
+    r'failed to request quick Tunnel|Cloudflared reached the Cloudflare edge)',
+    re.I,
+)
 
 class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Custom handler to serve from web directory and add CORS headers"""
@@ -37,60 +53,167 @@ class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {format % args}")
 
 def start_cloudflare_tunnel(port):
-    """Start Cloudflare Tunnel if available"""
+    """Start Cloudflare Tunnel if available; return (process, public_url or None)."""
     try:
-        # Check if cloudflared is available
-        result = subprocess.run(['cloudflared', '--version'], 
-                              capture_output=True, 
-                              text=True, 
-                              timeout=2)
-        if result.returncode == 0:
-            print("\n" + "="*60)
-            print("Starting Cloudflare Tunnel...")
-            print("="*60)
-            print("Cloudflare Tunnel provides:")
-            print("  - FREE unlimited bandwidth")
-            print("  - No account required for basic use")
-            print("  - Permanent subdomain option (with account)")
-            print("="*60)
-            
-            # Start cloudflared in background (let output pass through to parent terminal)
-            cloudflared_process = subprocess.Popen(
-                ['cloudflared', 'tunnel', '--url', f'http://127.0.0.1:{port}', '--protocol', 'http2'],
-                text=True
-            )
-            
-            # Wait a moment for tunnel to establish
-            time.sleep(4)
-            
-            # Try to extract URL from output (cloudflared prints it to stderr)
-            try:
-                # Give it a moment to output the URL
-                time.sleep(1)
-                # The URL is typically printed to stderr
-                # For now, we'll just indicate it's running
-                print(f"\nCloudflare Tunnel active!")
-                print(f"Check the output above for your public URL")
-                print(f"(Usually starts with: https://xxxx-xxxx.trycloudflare.com)")
-                print(f"Access from anywhere using that URL")
-                print("="*60 + "\n")
-                return cloudflared_process, None
-            except:
-                print("Warning: Cloudflare Tunnel started but couldn't extract URL")
-                print("   Check the output above for the public URL")
-                return cloudflared_process, None
+        result = subprocess.run(
+            ['cloudflared', '--version'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            return None, None
     except FileNotFoundError:
         print("\nWarning: cloudflared not found.")
         print("   Install from: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/")
         print("   Or use localhost only (http://127.0.0.1:8000)\n")
         return None, None
     except Exception as e:
+        print(f"\nWarning: Error checking cloudflared: {e}")
+        print("   Continuing with localhost only...\n")
+        return None, None
+
+    print("\n" + "=" * 60)
+    print("Starting Cloudflare Tunnel...")
+    print("=" * 60)
+    print("Cloudflare Tunnel provides:")
+    print("  - FREE unlimited bandwidth")
+    print("  - No account required for basic use")
+    print("  - Permanent subdomain option (with account)")
+    print("=" * 60)
+
+    tunnel_state = {"url": None, "registered": False, "failed": False, "error": None}
+
+    def _launch_cloudflared(extra_args=None):
+        cmd = ['cloudflared', 'tunnel', '--url', f'http://127.0.0.1:{port}']
+        if extra_args:
+            cmd.extend(extra_args)
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+    def _start_output_reader(process):
+        def _read_tunnel_output():
+            for line in process.stdout:
+                print(line, end='')
+                if tunnel_state["url"] is None:
+                    match = _TUNNEL_URL_RE.search(line)
+                    if match:
+                        tunnel_state["url"] = match.group(0)
+                if _TUNNEL_REGISTERED_RE.search(line):
+                    tunnel_state["registered"] = True
+                if _TUNNEL_FAILED_RE.search(line):
+                    tunnel_state["failed"] = True
+                    tunnel_state["error"] = line.strip()
+
+        reader = threading.Thread(target=_read_tunnel_output, daemon=True)
+        reader.start()
+
+    def _wait_for_registration(process, timeout_sec=25):
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if tunnel_state["registered"]:
+                return True
+            if tunnel_state["failed"] or process.poll() is not None:
+                return False
+            time.sleep(0.25)
+        return tunnel_state["registered"]
+
+    try:
+        # Default protocol is QUIC; forcing http2 often fails on quick tunnels.
+        cloudflared_process = _launch_cloudflared()
+        _start_output_reader(cloudflared_process)
+        registered = _wait_for_registration(cloudflared_process)
+        if not registered:
+            if cloudflared_process.poll() is None:
+                cloudflared_process.terminate()
+                try:
+                    cloudflared_process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    cloudflared_process.kill()
+            print("\nWarning: Cloudflare quick tunnel failed to register.")
+            if tunnel_state["error"]:
+                print(f"   Last error: {tunnel_state['error']}")
+            print("   Local dashboard still works at http://127.0.0.1:{0}".format(port))
+            print("   Retry tunnel later or run: cloudflared tunnel --url http://127.0.0.1:{0}".format(port))
+            print("=" * 60 + "\n")
+            return None, None
+
+        public_url = tunnel_state["url"]
+        if public_url:
+            print("\nCloudflare Tunnel active!")
+            print(f"Public URL: {public_url}")
+            print(f"Access from anywhere: {public_url}")
+        else:
+            print("\nCloudflare Tunnel registered (public URL not detected in output).")
+            print("   Check output above for https://....trycloudflare.com")
+        print("=" * 60 + "\n")
+        return cloudflared_process, public_url
+    except Exception as e:
         print(f"\nWarning: Error starting Cloudflare Tunnel: {e}")
         print("   Continuing with localhost only...\n")
         return None, None
 
+
+def send_startup_email(port: int, local_ip: str, public_url: str | None = None) -> bool:
+    """Notify via email (same service as paper bot) with dashboard links."""
+    local_url = f"http://127.0.0.1:{port}"
+    lan_url = f"http://{local_ip}:{port}" if local_ip else None
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hostname = socket.gethostname()
+
+    lines = [
+        "Trading dashboard web server started.",
+        "",
+        f"Time:   {now}",
+        f"Host:   {hostname}",
+        f"Port:   {port}",
+        "",
+        f"Local:  {local_url}",
+    ]
+    if lan_url and local_ip not in ("localhost", "127.0.0.1"):
+        lines.append(f"LAN:    {lan_url}")
+    elif lan_url:
+        lines.append(f"LAN:    (unavailable — using {local_ip})")
+
+    if public_url:
+        lines.extend([
+            f"Public: {public_url}",
+            "",
+            "Quick links (public):",
+            f"  Hub:   {public_url}/index.html",
+            f"  Paper: {public_url}/dashboard_paper.html",
+        ])
+    else:
+        lines.extend([
+            "Public: (none — Cloudflare tunnel unavailable or URL pending)",
+        ])
+
+    lines.extend([
+        "",
+        "Quick links (local):",
+        f"  Hub:   {local_url}/index.html",
+        f"  Paper: {local_url}/dashboard_paper.html",
+    ])
+    if lan_url and local_ip not in ("localhost", "127.0.0.1"):
+        lines.extend([
+            "",
+            "Quick links (LAN):",
+            f"  Hub:   {lan_url}/index.html",
+            f"  Paper: {lan_url}/dashboard_paper.html",
+        ])
+
+    subject = f"[WEB] START: Dashboard server (port {port})"
+    return send_email(subject, "\n".join(lines))
+
 def main():
     """Start the web server"""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
     # Fix Windows console encoding issues for Unicode (emojis)
     try:
         if sys.platform == 'win32':
@@ -371,6 +494,12 @@ def main():
         
         # Try to start Cloudflare Tunnel
         cloudflared_process, public_url = start_cloudflare_tunnel(PORT)
+
+        local_ip = get_local_ip()
+        if send_startup_email(PORT, local_ip, public_url):
+            print("Startup notification email sent.")
+        else:
+            print("Startup notification email not sent (check .env EMAIL_* credentials).")
         
         # Open browser
         try:

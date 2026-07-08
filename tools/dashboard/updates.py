@@ -113,6 +113,7 @@ class DashboardState:
     
     current_price: float = 0.0
     last_data_receipt_time: Optional[datetime] = None
+    last_new_bar_time: Optional[datetime] = None
     
     # Statistics
     dashboard_stats: Dict[str, Any] = field(default_factory=lambda: {
@@ -176,7 +177,8 @@ def format_dashboard_datetime(ts: Any) -> str:
 
 # Indicator columns: last value in each HTF bucket (matches live aggregation).
 _CHART_INDICATOR_COLS = (
-    'donchian_high', 'donchian_low', 'upper', 'lower', 'mid', 'atr',
+    'donchian_high', 'donchian_low', 'donchian_exit_high', 'donchian_exit_low',
+    'upper', 'lower', 'mid', 'atr',
     'atr_filter', 'adx', 'rsi', 'sma_regime',
 )
 
@@ -229,6 +231,7 @@ def build_chart_payload_with_indicators(
     timeframe_mins: int = 1,
     completed_trades: Optional[List[Dict[str, Any]]] = None,
     params: Optional[Dict[str, Any]] = None,
+    open_positions: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Refresh strategy indicators on a bar snapshot, then serialize for Plotly."""
     if pd is None or df is None or getattr(df, 'empty', True):
@@ -247,7 +250,7 @@ def build_chart_payload_with_indicators(
             )
             work = df
     return build_chart_payload_from_df(
-        work, max_bars, timeframe_mins, completed_trades, params
+        work, max_bars, timeframe_mins, completed_trades, params, open_positions
     )
 
 
@@ -257,6 +260,7 @@ def build_chart_payload_from_df(
     timeframe_mins: int = 1,
     completed_trades: Optional[List[Dict[str, Any]]] = None,
     params: Optional[Dict[str, Any]] = None,
+    open_positions: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Serialize OHLC for Plotly; resample 1m history to the strategy timeframe when >1."""
     if pd is None or df is None or getattr(df, 'empty', True):
@@ -298,6 +302,18 @@ def build_chart_payload_from_df(
         d = d.tail(int(max_bars))
         if len(d) < 2:
             return None
+
+        from tools.reporting.chart_donchian import (
+            apply_donchian_position_mask,
+            position_windows_from_sources,
+        )
+
+        windows = position_windows_from_sources(
+            completed_trades=completed_trades,
+            open_positions=open_positions,
+            chart_end=d.index[-1],
+        )
+        d = apply_donchian_position_mask(d, windows)
     except Exception:
         logging.debug('build_chart_payload_from_df failed', exc_info=True)
         return None
@@ -340,6 +356,12 @@ def build_chart_payload_from_df(
     if 'donchian_low' in d.columns:
         s = d['donchian_low'].ffill()
         payload['donchian_low'] = [jfloat(v) for v in s.tolist()]
+    if 'donchian_exit_high' in d.columns:
+        s = d['donchian_exit_high'].ffill()
+        payload['donchian_exit_high'] = [jfloat(v) for v in s.tolist()]
+    if 'donchian_exit_low' in d.columns:
+        s = d['donchian_exit_low'].ffill()
+        payload['donchian_exit_low'] = [jfloat(v) for v in s.tolist()]
     for col in ('atr', 'atr_filter', 'adx', 'rsi', 'sma_regime'):
         if col in d.columns:
             payload[col] = [jfloat(v) for v in d[col].ffill().tolist()]
@@ -347,8 +369,11 @@ def build_chart_payload_from_df(
     if thresholds:
         payload['thresholds'] = thresholds
     if completed_trades:
+        from core.completed_trades import dedupe_completed_trades_near_fills
+
+        deduped = dedupe_completed_trades_near_fills(completed_trades, window_sec=120, max_keep=300)
         markers = []
-        for tr in completed_trades[-300:]:
+        for tr in deduped:
             et = tr.get('entry_time')
             xt = tr.get('exit_time')
             ep = jfloat(tr.get('entry_price'))
@@ -666,6 +691,9 @@ def render_bar_log_panel(state: DashboardState) -> str:
 def render_completed_trades_panel(state: DashboardState) -> str:
     if not state.completed_trades:
         return """        <div style="padding: 20px; text-align: center; color: #7f8c8d; background: #f8f9fa; border-radius: 8px;">No completed trades</div>"""
+    from core.completed_trades import dedupe_completed_trades_near_fills
+
+    trades = dedupe_completed_trades_near_fills(state.completed_trades, window_sec=120, max_keep=200)
     html = """        <table>
             <thead>
                 <tr>
@@ -684,7 +712,7 @@ def render_completed_trades_panel(state: DashboardState) -> str:
             </thead>
             <tbody>
 """
-    for trade in reversed(state.completed_trades[-200:]):
+    for trade in reversed(trades):
         pnl = float(trade.get('pnl', 0) or 0)
         r_mult = float(trade.get('r_multiple', 0) or 0)
         pnl_class = 'positive' if pnl > 0 else 'negative' if pnl < 0 else ''
@@ -878,13 +906,16 @@ def generate_dashboard_html(
     total_uptime = state.total_uptime_seconds + current_uptime
     
     # Status
-    # Ensure last_data_receipt_time is offset-aware for comparison
+    # Stale detection uses last completed 1-min bar, not mere tick/update events.
+    last_bar = getattr(state, "last_new_bar_time", None) or state.last_data_receipt_time
+    if last_bar and last_bar.tzinfo is None:
+        last_bar = EASTERN.localize(last_bar)
+    time_since_data = (now_eastern - last_bar).total_seconds() if last_bar else 0
+    is_stale = time_since_data > DASHBOARD_DATA_STALE_SERVER_SEC
+
     last_receipt = state.last_data_receipt_time
     if last_receipt and last_receipt.tzinfo is None:
         last_receipt = EASTERN.localize(last_receipt)
-        
-    time_since_data = (now_eastern - last_receipt).total_seconds() if last_receipt else 0
-    is_stale = time_since_data > DASHBOARD_DATA_STALE_SERVER_SEC
 
     status_class = "disconnected" if not state.is_connected else "stale" if is_stale else "online"
     stale_lbl = f"DATA: STALE ({DASHBOARD_DATA_STALE_SERVER_SEC}s+)"
@@ -993,7 +1024,7 @@ def generate_dashboard_html(
             <div>
                 <strong id="dash-status-text" style="font-size: 1.2em;">{status_text}</strong>
                 <span style="opacity: 0.8; margin-left: 10px;">[{state.mode.upper()}]</span>
-                <span id="dash-last-data-line" style="margin-left: 20px; opacity: 0.9;">{f'Last Data: {state.last_data_receipt_time.strftime("%H:%M:%S")} ({int(time_since_data)}s ago)' if state.last_data_receipt_time else ''}</span>
+                <span id="dash-last-data-line" style="margin-left: 20px; opacity: 0.9;">{f'Last Bar: {(getattr(state, "last_new_bar_time", None) or state.last_data_receipt_time).strftime("%H:%M:%S")} ({int(time_since_data)}s ago)' if (getattr(state, "last_new_bar_time", None) or state.last_data_receipt_time) else ''}</span>
             </div>
             <div style="text-align: right; font-size: 0.9em;">
                 <div>Uptime: {format_duration(total_uptime)}</div>
@@ -1127,8 +1158,8 @@ def generate_dashboard_html(
             if (st.last_update_iso && lastUpdateElem) {
                 lastUpdateElem.dataset.timestamp = st.last_update_iso;
             }
-            if (st.last_data_receipt_iso && lastDataElem) {
-                lastDataElem.dataset.timestamp = st.last_data_receipt_iso;
+            if ((st.last_new_bar_iso || st.last_data_receipt_iso) && lastDataElem) {
+                lastDataElem.dataset.timestamp = st.last_new_bar_iso || st.last_data_receipt_iso;
             }
             var statusText = document.getElementById('dash-status-text');
             var statusBar = document.getElementById('dash-status-bar');
@@ -1149,14 +1180,14 @@ def generate_dashboard_html(
             if (lastUpdateLine && st.last_update) {
                 lastUpdateLine.textContent = 'Last Update: ' + st.last_update;
             }
-            if (lastDataLine && st.last_data_receipt_iso) {
-                var d = new Date(st.last_data_receipt_iso);
+            if (lastDataLine && (st.last_new_bar_iso || st.last_data_receipt_iso)) {
+                var d = new Date(st.last_new_bar_iso || st.last_data_receipt_iso);
                 if (!isNaN(d.getTime())) {
                     var sec = Math.max(0, Math.round((Date.now() - d) / 1000));
                     var hh = ('0' + d.getHours()).slice(-2);
                     var mm = ('0' + d.getMinutes()).slice(-2);
                     var ss = ('0' + d.getSeconds()).slice(-2);
-                    lastDataLine.textContent = 'Last Data: ' + hh + ':' + mm + ':' + ss + ' (' + sec + 's ago)';
+                    lastDataLine.textContent = 'Last Bar: ' + hh + ':' + mm + ':' + ss + ' (' + sec + 's ago)';
                 }
             }
         }
@@ -1247,6 +1278,10 @@ def generate_dashboard_html(
                     if (p.l) eat(p.l[i]);
                     if (p.o) eat(p.o[i]);
                     if (p.c) eat(p.c[i]);
+                    if (p.donchian_high) eat(p.donchian_high[i]);
+                    if (p.donchian_low) eat(p.donchian_low[i]);
+                    if (p.donchian_exit_high) eat(p.donchian_exit_high[i]);
+                    if (p.donchian_exit_low) eat(p.donchian_exit_low[i]);
                 }
                 if (p.trade_markers) {
                     for (var k = 0; k < p.trade_markers.length; k++) {
@@ -1267,11 +1302,17 @@ def generate_dashboard_html(
                 return [lo - pad, hi + pad];
             }
             if (anyNonNull(p.donchian_high))
-                traces.push({ type: 'scatter', x: p.times, y: p.donchian_high, name: 'Donchian high',
+                traces.push({ type: 'scatter', x: p.times, y: p.donchian_high, name: 'Entry Donchian high',
                     line: { color: '#1565c0', width: 1.2 }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
             if (anyNonNull(p.donchian_low))
-                traces.push({ type: 'scatter', x: p.times, y: p.donchian_low, name: 'Donchian low',
+                traces.push({ type: 'scatter', x: p.times, y: p.donchian_low, name: 'Entry Donchian low',
                     line: { color: '#c62828', width: 1.2 }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
+            if (anyNonNull(p.donchian_exit_high))
+                traces.push({ type: 'scatter', x: p.times, y: p.donchian_exit_high, name: 'Exit Donchian high',
+                    line: { color: '#ef6c00', width: 1.4, dash: 'dash' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
+            if (anyNonNull(p.donchian_exit_low))
+                traces.push({ type: 'scatter', x: p.times, y: p.donchian_exit_low, name: 'Exit Donchian low',
+                    line: { color: '#00838f', width: 1.4, dash: 'dash' }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
             if (anyNonNull(p.sma_regime))
                 traces.push({ type: 'scatter', x: p.times, y: p.sma_regime, name: 'SMA',
                     line: { color: '#6b7280', width: 1.2 }, mode: 'lines', xaxis: 'x', yaxis: 'y' });
@@ -1561,7 +1602,10 @@ def build_status_payload(state: DashboardState) -> Dict[str, Any]:
     lr = state.last_data_receipt_time
     if lr and lr.tzinfo is None:
         lr = EASTERN.localize(lr)
-    data_age = (now_et - lr).total_seconds() if lr else 0
+    lnb = getattr(state, "last_new_bar_time", None) or lr
+    if lnb and lnb.tzinfo is None:
+        lnb = EASTERN.localize(lnb)
+    data_age = (now_et - lnb).total_seconds() if lnb else 0
     return {
         'mode': state.mode.upper(),
         'port': state.port,
@@ -1575,6 +1619,7 @@ def build_status_payload(state: DashboardState) -> Dict[str, Any]:
         'last_update': now_et.strftime('%Y-%m-%d %H:%M:%S'),
         'last_update_iso': now_et.isoformat(),
         'last_data_receipt_iso': lr.isoformat() if lr else None,
+        'last_new_bar_iso': lnb.isoformat() if lnb else None,
         'data_stale': data_age > DASHBOARD_DATA_STALE_SERVER_SEC,
         'client_id_halted': bool(getattr(state, 'client_id_trading_halted', False)),
         'client_id_expected': int(getattr(state, 'client_id_expected', 0) or 0),

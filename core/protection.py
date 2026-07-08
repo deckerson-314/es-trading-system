@@ -331,14 +331,38 @@ def _trail_replace_grace_seconds() -> float:
         return 3.0
 
 
+def _trail_replace_arm_wait_seconds() -> float:
+    """Max time after trail replace to wait for stop PendingSubmit -> Submitted."""
+    raw = os.environ.get("LIVE_TRAIL_REPLACE_ARM_WAIT_SEC", "30")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _trail_replace_at(bracket):
+    if not bracket:
+        return None
+    ts = bracket.get("trail_replace_at")
+    if ts is None:
+        return None
+    return ts if getattr(ts, "tzinfo", None) else pytz.utc.localize(ts)
+
+
 def mark_trail_replace_grace(bracket, seconds: float = None) -> None:
     """Skip software backup briefly after a successful trail replace (let IB fill)."""
     if bracket is None:
         return
+    bracket["trail_replace_at"] = datetime.now(pytz.utc)
     sec = _trail_replace_grace_seconds() if seconds is None else max(0.0, float(seconds))
     if sec <= 0:
         return
     bracket["trail_replace_grace_until"] = datetime.now(pytz.utc) + timedelta(seconds=sec)
+
+
+def clear_trail_replace_arm_wait(bracket) -> None:
+    if bracket is not None:
+        bracket.pop("trail_replace_at", None)
 
 
 def trail_replace_grace_active(bracket) -> bool:
@@ -352,6 +376,45 @@ def trail_replace_grace_active(bracket) -> bool:
         bracket.pop("trail_replace_grace_until", None)
         return False
     return True
+
+
+def trail_stop_protection_pending(
+    bracket,
+    stop_trade,
+    *,
+    trail_ratchet_this_bar: bool = False,
+) -> bool:
+    """
+    True when software exit paths should defer so a post-trail broker stop can arm.
+
+    Covers the fixed post-replace grace window and an extended arm-wait period
+    while the stop is still PendingSubmit / PreSubmitted.
+    """
+    if not bracket:
+        return False
+
+    if stop_order_is_armed(stop_trade):
+        clear_trail_replace_arm_wait(bracket)
+        return False
+
+    if trail_replace_grace_active(bracket):
+        return True
+
+    replace_at = _trail_replace_at(bracket)
+    if replace_at is not None:
+        elapsed = (datetime.now(pytz.utc) - replace_at).total_seconds()
+        if elapsed > _trail_replace_arm_wait_seconds():
+            clear_trail_replace_arm_wait(bracket)
+            return False
+        if stop_order_is_pending(stop_trade):
+            return True
+        if stop_trade is None or not _protective_order_active(stop_trade):
+            return True
+
+    if trail_ratchet_this_bar:
+        return True
+
+    return False
 
 
 def trail_replace_in_progress(positions) -> bool:
@@ -1784,8 +1847,34 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None, complet
                     add_to_live_tracker(live_tracker, 'warning',
                         f"Closed orphaned position: {pos.position} contracts")
                         
-                # --- NEW: Record orphaned closure to dashboard ---
+                # --- Record orphaned closure (skip phantom churn after tracked TP fill) ---
                 if completed_trades is not None:
+                    from core.execution import _append_completed_trade_record
+                    from core.completed_trades import normalize_trade_ts
+
+                    skip_record = False
+                    now_naive = datetime.now()
+                    for tr in reversed(completed_trades[-8:]):
+                        reason_s = str(tr.get("reason") or "")
+                        if "Take Profit" not in reason_s and "Broker Stop" not in reason_s:
+                            continue
+                        xt = normalize_trade_ts(tr.get("exit_time"))
+                        if xt is None:
+                            continue
+                        if abs((now_naive - xt).total_seconds()) > 180:
+                            break
+                        tracked_dir = str(tr.get("direction") or "").upper()
+                        orphan_dir = "LONG" if pos.position > 0 else "SHORT"
+                        if tracked_dir and tracked_dir != orphan_dir:
+                            logging.warning(
+                                "Skipping orphan trade record: likely post-close phantom "
+                                "(%s after recent %s)",
+                                orphan_dir,
+                                reason_s,
+                            )
+                            skip_record = True
+                            break
+
                     exit_price = close_trade.fills[0].execution.price if close_trade and close_trade.fills else (data['close'].iloc[-1] if data is not None and not data.empty else 0)
                     pnl = 0
                     if close_trade and close_trade.fills:
@@ -1793,17 +1882,16 @@ def close_orphaned_positions(ib, contract, positions, live_tracker=None, complet
                             if f.commissionReport and hasattr(f.commissionReport, 'realizedPNL'):
                                 pnl = f.commissionReport.realizedPNL; break
 
-                    entry_price = getattr(pos, 'avgCost', 0) / 50.0  # ES multiplier
-                    completed_trades.append({
-                        'exit_time': datetime.now(), 'entry_time': None,
-                        'direction': 'LONG' if pos.position > 0 else 'SHORT',
-                        'qty': abs(pos.position), 'entry_price': entry_price, 'exit_price': exit_price,
-                        'pnl': pnl, 'r_multiple': 0, 'reason': 'Orphan Auto-Close',
-                        'duration': 'Auto-Closed',
-                        'stop_at_close': None, 'tp_at_close': None,
-                    })
-                    if len(completed_trades) > 1000:
-                        del completed_trades[:-1000]
+                    if not skip_record:
+                        entry_price = getattr(pos, 'avgCost', 0) / 50.0  # ES multiplier
+                        _append_completed_trade_record(completed_trades, {
+                            'exit_time': datetime.now(), 'entry_time': None,
+                            'direction': 'LONG' if pos.position > 0 else 'SHORT',
+                            'qty': abs(pos.position), 'entry_price': entry_price, 'exit_price': exit_price,
+                            'pnl': pnl, 'r_multiple': 0, 'reason': 'Orphan Auto-Close',
+                            'duration': 'Auto-Closed',
+                            'stop_at_close': None, 'tp_at_close': None,
+                        })
 
             except Exception as e:
                 logging.error(f"Failed to close orphaned position: {e}")
@@ -1967,13 +2055,34 @@ def enforce_stop_invariant(ib, positions, strategy, data, live_tracker=None, con
         protect_existing_positions(ib, pos.contract, positions, strategy, data, live_tracker=live_tracker)
 
 
+def _ib_position_qty_for_bracket(ib, contract, bracket) -> float:
+    """Signed IB position size for bracket contract (0 if flat or missing)."""
+    bc = bracket.get("contract") or contract
+    con_id = getattr(bc, "conId", None)
+    if con_id is None:
+        return 0.0
+    for p in ib.positions():
+        if p.contract.conId == con_id:
+            return float(p.position)
+    return 0.0
+
+
 def check_and_recreate_tp_orders(ib, contract, positions, strategy, data, live_tracker=None):
     """Recreate missing TP orders for tracked positions that should have one."""
     if contract is None or data is None or data.empty:
         return
 
     for bracket in positions[:]:
+        if bracket.get("_close_recorded"):
+            continue
+
         direction = bracket.get('direction', 0)
+        ib_pos = _ib_position_qty_for_bracket(ib, contract, bracket)
+        if ib_pos == 0:
+            continue
+        if (direction == 1 and ib_pos <= 0) or (direction == -1 and ib_pos >= 0):
+            continue
+
         tp_order = bracket.get('takeProfit')
 
         # Skip if no TP expected
@@ -2096,6 +2205,11 @@ def reconcile_positions(ib, contract, positions, live_tracker=None,
         
         # 2. Iterate through our internal tracking list
         for bracket in positions[:]:
+            if bracket.get("_close_recorded"):
+                if bracket in positions:
+                    positions.remove(bracket)
+                continue
+
             direction = bracket.get('direction')
             qty = 0
             # Resolve quantity from available order handles

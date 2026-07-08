@@ -39,11 +39,7 @@ class TrendStrategy(Strategy):
         self.atr_mult_ts = float(get_param_value(self.params_dict, 'ATR Multiplier for Trailing Stop', 3.0))
         self.trailing_delay = int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5))
         self.trailing_delay_minutes = get_param_value(self.params_dict, 'Trailing Delay (minutes)', None)
-        self.trailing_delay = self._resolve_trailing_delay_bars(
-            self.trailing_delay_minutes,
-            self.trailing_delay,
-            self.timeframe,
-        )
+        self.trailing_delay = self._resolve_trailing_delay_from_params(self.timeframe)
         
         # Take Profit
         self.tp_mult_atr = float(get_param_value(self.params_dict, 'Take Profit ATR Multiplier', 0.0)) # 0 = disabled
@@ -51,6 +47,16 @@ class TrendStrategy(Strategy):
         # Entry Logic (Donchian / Dual Thrust)
         self.lookback_buy = int(get_param_value(self.params_dict, 'Buy Lookback', 20))
         self.lookback_sell = int(get_param_value(self.params_dict, 'Sell Lookback', 20))
+        from strategies.trend.parameters import (
+            resolve_channel_exit_buy_lookback,
+            resolve_channel_exit_sell_lookback,
+            resolve_channel_exit_atr_offset,
+        )
+        self.channel_exit_lookback_buy = resolve_channel_exit_buy_lookback(
+            {}, self.params_dict, self.lookback_buy)
+        self.channel_exit_lookback_sell = resolve_channel_exit_sell_lookback(
+            {}, self.params_dict, self.lookback_sell)
+        self.channel_exit_atr_offset = resolve_channel_exit_atr_offset({}, self.params_dict)
         
         # Filter Logic
         adx_filter_val = get_param_value(self.params_dict, 'Enable ADX Filter', False)
@@ -119,6 +125,8 @@ class TrendStrategy(Strategy):
         lookbacks = [
             self.lookback_buy,
             self.lookback_sell,
+            self.channel_exit_lookback_buy,
+            self.channel_exit_lookback_sell,
             self.atr_length_ts,
             self.adx_period if self.enable_adx_filter else 0,
             self.atr_filter_period,
@@ -146,6 +154,9 @@ class TrendStrategy(Strategy):
             },
             'Exit Criteria': {
                 'Initial SL (%)': self.initial_sl_pct,
+                'Channel Exit Sell LB': self.channel_exit_lookback_sell,
+                'Channel Exit Buy LB': self.channel_exit_lookback_buy,
+                'Channel Exit ATR Offset': self.channel_exit_atr_offset,
                 'Trailing Stop': self.enable_trailing,
                 'Trail Delay (bars)': self.trailing_delay,
                 'Trail Delay (minutes)': self.trailing_delay * self.timeframe,
@@ -169,23 +180,30 @@ class TrendStrategy(Strategy):
             logging.error("generate_trade_report failed: %s", e, exc_info=True)
             return ""
 
+    def _resolve_trailing_delay_from_params(self, timeframe_minutes=None):
+        from strategies.trend.parameters import resolve_trailing_delay_bars
+
+        tf = timeframe_minutes if timeframe_minutes is not None else self.timeframe
+        params_local = {
+            'Timeframe (minutes)': tf,
+            'Trailing Delay (bars)': self.trailing_delay,
+        }
+        if self.trailing_delay_minutes is not None:
+            params_local['Trailing Delay (minutes)'] = self.trailing_delay_minutes
+        return resolve_trailing_delay_bars(params_local, self.params_dict, tf)
+
     @staticmethod
-    def _resolve_trailing_delay_bars(delay_minutes, delay_bars, timeframe_minutes):
-        """
-        Resolve trailing delay in bars from context-aware minutes if present.
-        Fallback to explicit bars for backward compatibility.
-        """
-        tf = max(1, int(round(float(timeframe_minutes))))
+    def _resolve_trailing_delay_bars(delay_minutes, delay_bars, timeframe_minutes, param_dict=None):
+        """Backward-compatible wrapper; prefer _resolve_trailing_delay_from_params."""
+        from strategies.trend.parameters import resolve_trailing_delay_bars
+
+        params_local = {
+            'Timeframe (minutes)': timeframe_minutes,
+            'Trailing Delay (bars)': delay_bars,
+        }
         if delay_minutes is not None:
-            try:
-                mins = max(0.0, float(delay_minutes))
-                return max(0, int(round(mins / tf)))
-            except Exception:
-                pass
-        try:
-            return max(0, int(round(float(delay_bars))))
-        except Exception:
-            return 0
+            params_local['Trailing Delay (minutes)'] = delay_minutes
+        return resolve_trailing_delay_bars(params_local, param_dict, timeframe_minutes)
 
     def _restore_trailing_from_template(self):
         """Reset trailing mechanics from strategy template when trailing is disabled."""
@@ -193,11 +211,7 @@ class TrendStrategy(Strategy):
         self.atr_mult_ts = float(get_param_value(self.params_dict, 'ATR Multiplier for Trailing Stop', 3.0))
         self.trailing_delay_minutes = get_param_value(self.params_dict, 'Trailing Delay (minutes)', None)
         self.trailing_delay = int(get_param_value(self.params_dict, 'Trailing Delay (bars)', 5))
-        self.trailing_delay = self._resolve_trailing_delay_bars(
-            self.trailing_delay_minutes,
-            self.trailing_delay,
-            self.timeframe,
-        )
+        self.trailing_delay = self._resolve_trailing_delay_from_params()
 
     def _restore_rsi_from_template(self):
         """Reset RSI thresholds from template when RSI filter is disabled (GA dead dims)."""
@@ -248,6 +262,16 @@ class TrendStrategy(Strategy):
         """Update params from GA individual."""
         if 'Buy Lookback' in params: self.lookback_buy = int(params['Buy Lookback'])
         if 'Sell Lookback' in params: self.lookback_sell = int(params['Sell Lookback'])
+        if 'Channel Exit Buy Lookback (bars)' in params:
+            self.channel_exit_lookback_buy = max(1, int(params['Channel Exit Buy Lookback (bars)']))
+        elif 'Buy Lookback' in params and 'Channel Exit Buy Lookback (bars)' not in self.params_dict:
+            self.channel_exit_lookback_buy = self.lookback_buy
+        if 'Channel Exit Sell Lookback (bars)' in params:
+            self.channel_exit_lookback_sell = max(1, int(params['Channel Exit Sell Lookback (bars)']))
+        elif 'Sell Lookback' in params and 'Channel Exit Sell Lookback (bars)' not in self.params_dict:
+            self.channel_exit_lookback_sell = self.lookback_sell
+        if 'Channel Exit ATR Offset' in params:
+            self.channel_exit_atr_offset = max(0.0, float(params['Channel Exit ATR Offset']))
         if 'ATR Multiplier for Trailing Stop' in params: self.atr_mult_ts = float(params['ATR Multiplier for Trailing Stop'])
         if 'Initial Stop Loss (%)' in params: self.initial_sl_pct = float(params['Initial Stop Loss (%)'])
         if 'Min ADX Threshold' in params: self.min_adx = float(params['Min ADX Threshold'])
@@ -323,10 +347,33 @@ class TrendStrategy(Strategy):
             self.timeframe = int(round(params['timeframe']))
 
         if self.enable_trailing:
+            from strategies.trend.parameters import (
+                TRAILING_DELAY_BARS,
+                TRAILING_DELAY_MINUTES,
+                active_trailing_delay_gene_key,
+            )
+
+            gene = active_trailing_delay_gene_key(self.params_dict)
+            eff = {'Timeframe (minutes)': self.timeframe}
+            if gene == TRAILING_DELAY_MINUTES:
+                if TRAILING_DELAY_MINUTES in params:
+                    eff[TRAILING_DELAY_MINUTES] = params[TRAILING_DELAY_MINUTES]
+                elif getattr(self, 'trailing_delay_minutes', None) is not None:
+                    eff[TRAILING_DELAY_MINUTES] = self.trailing_delay_minutes
+            elif gene == TRAILING_DELAY_BARS:
+                if TRAILING_DELAY_BARS in params:
+                    eff[TRAILING_DELAY_BARS] = params[TRAILING_DELAY_BARS]
+                else:
+                    eff[TRAILING_DELAY_BARS] = self.trailing_delay
+            else:
+                if getattr(self, 'trailing_delay_minutes', None) is not None:
+                    eff[TRAILING_DELAY_MINUTES] = self.trailing_delay_minutes
+                eff[TRAILING_DELAY_BARS] = self.trailing_delay
             self.trailing_delay = self._resolve_trailing_delay_bars(
-                getattr(self, 'trailing_delay_minutes', None),
-                self.trailing_delay,
+                eff.get(TRAILING_DELAY_MINUTES),
+                eff.get(TRAILING_DELAY_BARS, self.trailing_delay),
                 self.timeframe,
+                self.params_dict,
             )
         else:
             self._restore_trailing_from_template()
@@ -357,6 +404,8 @@ class TrendStrategy(Strategy):
         
         df['donchian_high'] = df['high'].rolling(self.lookback_buy).max().shift(1)
         df['donchian_low'] = df['low'].rolling(self.lookback_sell).min().shift(1)
+        df['donchian_exit_high'] = df['high'].rolling(self.channel_exit_lookback_buy).max().shift(1)
+        df['donchian_exit_low'] = df['low'].rolling(self.channel_exit_lookback_sell).min().shift(1)
         
         # 2. ATR (for stops and filters)
         high_low = df['high'] - df['low']
@@ -663,6 +712,17 @@ class TrendStrategy(Strategy):
             return True, 'RTH Exit', close
         donchian_low = row.donchian_low if hasattr(row, 'donchian_low') else row['donchian_low']
         donchian_high = row.donchian_high if hasattr(row, 'donchian_high') else row['donchian_high']
+        if isinstance(row, pd.Series):
+            donchian_exit_low = row.get('donchian_exit_low', donchian_low)
+            donchian_exit_high = row.get('donchian_exit_high', donchian_high)
+            atr = row.get('atr', 0.0)
+        else:
+            donchian_exit_low = getattr(row, 'donchian_exit_low', donchian_low)
+            donchian_exit_high = getattr(row, 'donchian_exit_high', donchian_high)
+            atr = getattr(row, 'atr', 0.0)
+        if atr is None or (isinstance(atr, float) and pd.isna(atr)):
+            atr = 0.0
+        atr_buffer = self.channel_exit_atr_offset * float(atr)
         
         dir_ = position['direction']
         
@@ -674,21 +734,31 @@ class TrendStrategy(Strategy):
         if dir_ == -1 and high >= stop_price: return True, 'Stop Loss', stop_price
         
         # 2. Take Profit (limit-style target)
-        # Use **close** vs TP, not **high/low**, so HTF candles do not fire on wicks that never
-        # filled the exchange limit (paper fills when trade prints through; wicks in aggregated
-        # bars often overstate vs queue timing). See May 2026 parity: high hit 05:35, fill ~08:30.
+        # GA/backtest: close vs TP (avoid wick-only HTF touches). Paper parity replay sets
+        # ``_paper_parity_broker_tp`` to match IB limit fills when high/low trade through.
         if tp_price is not None and tp_price > 0:
-            if dir_ == 1 and close >= tp_price:
-                return True, 'Take Profit', tp_price
-            if dir_ == -1 and close <= tp_price:
-                return True, 'Take Profit', tp_price
+            broker_tp = getattr(self, "_paper_parity_broker_tp", False)
+            if broker_tp:
+                if dir_ == 1 and high >= tp_price:
+                    return True, "Take Profit", tp_price
+                if dir_ == -1 and low <= tp_price:
+                    return True, "Take Profit", tp_price
+            else:
+                if dir_ == 1 and close >= tp_price:
+                    return True, "Take Profit", tp_price
+                if dir_ == -1 and close <= tp_price:
+                    return True, "Take Profit", tp_price
             
         # 3. Channel Exit (Reversal)
-        # If Long, and Price drops below Donchian Low (Support broken) -> Exit
-        if dir_ == 1 and low < donchian_low:
-             return True, 'Channel Exit', donchian_low
-        if dir_ == -1 and high > donchian_high:
-             return True, 'Channel Exit', donchian_high
+        # Long: low breaks below exit-channel floor minus ATR buffer (looser when offset > 0).
+        if dir_ == 1:
+            exit_level = donchian_exit_low - atr_buffer
+            if low < exit_level:
+                return True, 'Channel Exit', exit_level
+        if dir_ == -1:
+            exit_level = donchian_exit_high + atr_buffer
+            if high > exit_level:
+                return True, 'Channel Exit', exit_level
              
         return False, None, None
 

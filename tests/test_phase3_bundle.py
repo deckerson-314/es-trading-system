@@ -52,7 +52,7 @@ class TestOpenOrdersFlatSkip(unittest.TestCase):
         collect_all_ib_open_orders(ib, refresh_remote=False)
         ib.reqOpenOrders.assert_not_called()
 
-    def test_has_open_exposure_from_bracket(self):
+    def test_has_open_exposure_requires_ib_position_for_filled_bracket(self):
         ib = MagicMock()
         contract = MagicMock()
         contract.conId = 99
@@ -69,7 +69,17 @@ class TestOpenOrdersFlatSkip(unittest.TestCase):
             "entryOrderId": 1,
             "contract": contract,
         }
-        self.assertTrue(_has_open_market_exposure(ib, contract, [bracket]))
+        self.assertFalse(_has_open_market_exposure(ib, contract, [bracket]))
+
+    def test_has_open_exposure_true_when_ib_has_position(self):
+        ib = MagicMock()
+        contract = MagicMock()
+        contract.conId = 99
+        pos = MagicMock()
+        pos.contract.conId = 99
+        pos.position = 1.0
+        ib.positions.return_value = [pos]
+        self.assertTrue(_has_open_market_exposure(ib, contract, []))
 
 
 if __name__ == "__main__":

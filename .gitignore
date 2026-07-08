@@ -44,6 +44,12 @@ temp_plots/
 !Bollinger/parameters/genetic_results_*.csv
 !strategies/trend/parameters/*.csv
 !strategies/session/parameters/*.csv
+!strategies/orb/parameters/*.csv
+!strategies/vwap_regime/parameters/*.csv
+!Session/parameters/genetic_results_*.csv
+!Session/output/genetic_trades_*.csv
+!Orb/parameters/genetic_results_*.csv
+!Orb/output/genetic_trades_*.csv
 
 # Large data file specifically
 **/ES_full_1min_continuous_ratio_adjusted.csv
@@ -52,6 +58,7 @@ ES_full_1min_continuous_ratio_adjusted.csv
 # Output folders
 plots/
 charts/
+paper_logs/
 Backtraderlogs/
 Backtrader/
 ga_diagnostics/

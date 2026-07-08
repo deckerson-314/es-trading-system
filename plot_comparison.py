@@ -165,14 +165,14 @@ def prepare_trend_simulation_df(ohlc_upper_df, params_dict):
     Same pipeline as backtest.run_backtest: resample -> indicators -> filters -> entry signals.
     ohlc_upper_df: index datetime, Open/High/Low/Close (or lowercase).
     """
+    from core.monitoring import prepare_strategy_ohlcv, is_htf_native_ohlcv
+
     df = _ohlc_to_lower_ohlcv(ohlc_upper_df)
     strategy = StrategyFactory.get_strategy("trend", params_dict)
     tf = int(getattr(strategy, "timeframe", 1) or 1)
     if tf > 1:
-        df = (
-            df.resample(f"{tf}min")
-            .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-            .dropna()
+        df, _htf_native = prepare_strategy_ohlcv(
+            df, tf, assume_htf_native=is_htf_native_ohlcv(df, tf)
         )
     df = strategy.calculate_indicators(df)
     if hasattr(strategy, "apply_filters"):
@@ -189,13 +189,16 @@ def prepare_trend_simulation_df(ohlc_upper_df, params_dict):
     return df, strategy
 
 
-def replay_bt_sl_tp_per_bar(prep_df, strategy, bt_entry_ts):
+def replay_bt_sl_tp_per_bar(prep_df, strategy, bt_entry_ts, params_dict=None):
     """
     Replay one backtest position whose entry bar time matches bt_entry_ts (within 90s).
     Returns DataFrame indexed by bar time with columns sl, tp (tp NaN if disabled).
     """
+    from core.sim_fidelity import ga_live_style_entry_enabled
+
     bt_entry_ts = pd.Timestamp(bt_entry_ts)
     pending_entry = None
+    live_style = ga_live_style_entry_enabled(params_dict or {})
     open_positions = []
     tracked = None
     rows = []
@@ -221,9 +224,21 @@ def replay_bt_sl_tp_per_bar(prep_df, strategy, bt_entry_ts):
                 open_positions.pop(i)
         if not open_positions:
             if row.entry_long_signal:
-                pending_entry = {"direction": 1}
+                if live_style:
+                    pos = strategy.setup_position(row.close, 1, row, prep_df)
+                    open_positions.append(pos)
+                    if abs(pd.Timestamp(pos["entry_time"]) - bt_entry_ts) < pd.Timedelta(seconds=90):
+                        tracked = pos
+                else:
+                    pending_entry = {"direction": 1}
             elif row.entry_short_signal:
-                pending_entry = {"direction": -1}
+                if live_style:
+                    pos = strategy.setup_position(row.close, -1, row, prep_df)
+                    open_positions.append(pos)
+                    if abs(pd.Timestamp(pos["entry_time"]) - bt_entry_ts) < pd.Timedelta(seconds=90):
+                        tracked = pos
+                else:
+                    pending_entry = {"direction": -1}
     if not rows:
         return pd.DataFrame(columns=["sl", "tp"])
     out = pd.DataFrame(rows).set_index("t")

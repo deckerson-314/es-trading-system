@@ -7,11 +7,21 @@ import asyncio
 import os
 import json
 import logging
+import re
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, time, timedelta
 import pytz
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Rolling 1-min window kept in memory by IB keepUpToDate + seed_data_ref_from_bars.
+PAPER_WARMUP_MAX_BARS = 15000
+
+_ONEMIN_BAR_LOG_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+ \w+ "
+    r"\[1-min bar\] \[NEW\] (\d{2}:\d{2}:\d{2}).*?"
+    r"O: ([\d.]+) H: ([\d.]+) L: ([\d.]+) C: ([\d.]+) \| Vol: ([\d,]+)"
+)
 
 from core.account import add_to_live_tracker
 from core.execution import check_entries, check_exits
@@ -28,7 +38,12 @@ def configure_bar_pipeline(queue: asyncio.Queue, ctx: Dict[str, Any]) -> None:
     BAR_PIPELINE_CTX = ctx
 
 
-def seed_data_ref_from_bars(bars_obj, data_ref: Dict[str, Any], max_bars: int = 15000) -> bool:
+def seed_data_ref_from_bars(
+    bars_obj,
+    data_ref: Dict[str, Any],
+    max_bars: int = PAPER_WARMUP_MAX_BARS,
+    output_dir: Optional[str] = None,
+) -> bool:
     """Populate data_ref immediately after IB historical subscribe (before async bar pipeline runs)."""
     if bars_obj is None or len(bars_obj) == 0:
         return False
@@ -45,6 +60,8 @@ def seed_data_ref_from_bars(bars_obj, data_ref: Dict[str, Any], max_bars: int = 
         df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_convert("US/Eastern")
         df.set_index("datetime", inplace=True)
         data_ref["data"] = df[["open", "high", "low", "close", "volume"]].copy()
+        if output_dir:
+            persist_live_1min_bars(output_dir, data_ref["data"], max_bars=max_bars)
         return True
     except Exception as e:
         logging.warning("seed_data_ref_from_bars failed: %s", e)
@@ -80,6 +97,8 @@ async def _async_process_bar_snapshot(
         df.set_index("datetime", inplace=True)
         data = df[["open", "high", "low", "close", "volume"]].copy()
         data_ref["data"] = data
+        if has_new and output_dir:
+            persist_live_1min_bars(output_dir, data)
 
         bar_time = data.index[-1]
         latest_row = data.iloc[-1]
@@ -215,6 +234,8 @@ def _sync_on_bar_update_legacy(
         df.set_index("datetime", inplace=True)
         data = df[["open", "high", "low", "close", "volume"]].copy()
         data_ref["data"] = data
+        if has_new and output_dir:
+            persist_live_1min_bars(output_dir, data)
 
         bar_time = data.index[-1]
         latest_row = data.iloc[-1]
@@ -370,6 +391,725 @@ def resample_data(df, timeframe_mins):
     return resampled.dropna()
 
 
+def median_bar_spacing_minutes(index) -> float:
+    """Median minutes between consecutive index timestamps (ignores zero deltas)."""
+    if len(index) < 2:
+        return 1.0
+    deltas = pd.Series(index).diff().dropna()
+    deltas = deltas[deltas > pd.Timedelta(0)]
+    if deltas.empty:
+        return 1.0
+    return float(deltas.dt.total_seconds().median() / 60.0)
+
+
+def is_htf_native_ohlcv(df, timeframe_mins: int, tolerance: float = 0.35) -> bool:
+    """
+    True when OHLCV rows are already strategy-timeframe bars (e.g. live_data.csv HTF log).
+
+    Uses the fraction of inter-row gaps near ``timeframe_mins`` (not median alone) so mixed
+    history files with duplicate 1–2m writes still qualify when most gaps match TF.
+    """
+    if timeframe_mins <= 1 or df is None or len(df) < 3:
+        return False
+    deltas = pd.Series(df.index).diff().dropna()
+    deltas = deltas[deltas > pd.Timedelta(0)]
+    if deltas.empty:
+        return False
+    mins = deltas.dt.total_seconds() / 60.0
+    lo = timeframe_mins * (1.0 - tolerance)
+    hi = timeframe_mins * (1.0 + tolerance)
+    near_tf = ((mins >= lo) & (mins <= hi)).mean()
+    if near_tf >= 0.45:
+        return True
+    if (mins < 1.5).mean() >= 0.45:
+        return False
+    return median_bar_spacing_minutes(df.index) >= timeframe_mins * (1.0 - tolerance)
+
+
+def prepare_strategy_ohlcv(df, timeframe_mins: int, *, assume_htf_native: bool = False):
+    """
+    Build strategy-timeframe OHLCV with live-parity resample rules.
+
+    Returns ``(ohlcv_df, is_htf_native)``. When input is HTF-native (``live_data.csv`` rows
+    from ``save_live_data_row``), pass ``assume_htf_native=True`` or rely on gap detection —
+    rows are **not** re-aggregated (double-resample shifts bar labels).
+    """
+    base = ["open", "high", "low", "close", "volume"]
+    cols = [c for c in base if c in df.columns]
+    out = df[cols].copy().sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    if timeframe_mins <= 1:
+        return out, False
+    if assume_htf_native or is_htf_native_ohlcv(out, timeframe_mins):
+        return out, True
+    return resample_data(out, timeframe_mins), False
+
+
+def normalize_ohlcv_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Load paper OHLCV CSV to ET-naive DatetimeIndex with lowercase columns."""
+    out = df.copy()
+    out.columns = [str(c).lower().strip() for c in out.columns]
+    ohlcv_cols = ["open", "high", "low", "close", "volume"]
+    out = out[[c for c in ohlcv_cols if c in out.columns]]
+    out = out.dropna(subset=ohlcv_cols)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out.index = pd.to_datetime(out.index, utc=True)
+    out.index = out.index.tz_convert("US/Eastern").tz_localize(None)
+    return out
+
+
+def extract_one_minute_ohlcv(df: pd.DataFrame, spacing_tolerance: float = 0.35) -> pd.DataFrame:
+    """
+    Keep rows from a mixed-interval CSV that belong to ~1-minute spacing.
+    Drops HTF rows appended by save_live_data_row (13/14-min gaps).
+    """
+    if df.empty or len(df) < 2:
+        return df
+    out = normalize_ohlcv_index(df)
+    mins = out.index.to_series().diff().dt.total_seconds().div(60.0)
+    keep = mins.isna() | (mins <= 1.0 + spacing_tolerance)
+    # Also keep first row after a gap if prior gap was HTF-sized (session resume).
+    return out.loc[keep]
+
+
+def persist_live_1min_bars(
+    output_dir: str,
+    df_1min: pd.DataFrame,
+    max_bars: int = PAPER_WARMUP_MAX_BARS,
+) -> None:
+    """Write rolling 1-min OHLCV window for paper/backtest parity (matches data_ref)."""
+    if not output_dir or df_1min is None or df_1min.empty:
+        return
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        csv_path = os.path.join(output_dir, "live_1min.csv")
+        snap = normalize_ohlcv_index(df_1min)
+        if len(snap) > int(max_bars):
+            snap = snap.iloc[-int(max_bars):]
+        if os.path.isfile(csv_path):
+            try:
+                existing = normalize_ohlcv_index(
+                    pd.read_csv(csv_path, index_col=0, parse_dates=True)
+                )
+                snap = pd.concat([existing, snap]).sort_index()
+                snap = snap[~snap.index.duplicated(keep="last")]
+                if len(snap) > int(max_bars):
+                    snap = snap.iloc[-int(max_bars):]
+            except Exception:
+                pass
+        snap.to_csv(csv_path)
+    except Exception as e:
+        logging.warning("persist_live_1min_bars failed: %s", e)
+
+
+def parse_1min_bars_from_execution_log(
+    log_path: str,
+    start: Optional[pd.Timestamp] = None,
+    end: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """Recover 1-min OHLCV rows logged by the paper bot ([1-min bar] [NEW] lines)."""
+    if not log_path or not os.path.isfile(log_path):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    start = pd.Timestamp(start) if start is not None else None
+    end = pd.Timestamp(end) if end is not None else None
+    rows: List[Tuple[pd.Timestamp, float, float, float, float, float]] = []
+    current_date: Optional[datetime.date] = None
+    with open(log_path, "r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            if "[1-min bar] [NEW]" not in line:
+                continue
+            head = line[:10]
+            if len(head) >= 10 and head[4] == "-" and head[7] == "-":
+                try:
+                    current_date = datetime.strptime(head, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+            m = _ONEMIN_BAR_LOG_RE.search(line)
+            if not m or current_date is None:
+                continue
+            hh, mm, ss = m.group(1).split(":")
+            ts = pd.Timestamp.combine(
+                current_date,
+                time(int(hh), int(mm), int(ss)),
+            )
+            if start is not None and ts < start:
+                continue
+            if end is not None and ts > end:
+                continue
+            rows.append(
+                (
+                    ts,
+                    float(m.group(2)),
+                    float(m.group(3)),
+                    float(m.group(4)),
+                    float(m.group(5)),
+                    float(m.group(6).replace(",", "")),
+                )
+            )
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    idx, o, h, l, c, v = zip(*rows)
+    return pd.DataFrame(
+        {"open": o, "high": h, "low": l, "close": c, "volume": v},
+        index=pd.DatetimeIndex(idx),
+    ).sort_index()
+
+
+def load_paper_1min_ohlcv(
+    path_1min: str,
+    *,
+    execution_log: Optional[str] = None,
+    log_start: Optional[pd.Timestamp] = None,
+    log_end: Optional[pd.Timestamp] = None,
+    legacy_htf_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Merge 1-min sources for paper/backtest parity: persisted live_1min.csv,
+    execution-log recovery, and (last resort) ~1-min rows extracted from live_data.csv.
+    """
+    frames: List[pd.DataFrame] = []
+    if path_1min and os.path.isfile(path_1min):
+        frames.append(normalize_ohlcv_index(pd.read_csv(path_1min, index_col=0, parse_dates=True)))
+    if execution_log:
+        log_df = parse_1min_bars_from_execution_log(execution_log, log_start, log_end)
+        if not log_df.empty:
+            frames.append(log_df)
+    if not frames and legacy_htf_path and os.path.isfile(legacy_htf_path):
+        legacy = pd.read_csv(legacy_htf_path, index_col=0, parse_dates=True)
+        one_m = extract_one_minute_ohlcv(legacy)
+        if not one_m.empty:
+            logging.warning(
+                "Using ~1-min rows extracted from %s (HTF log fallback; prefer live_1min.csv)",
+                legacy_htf_path,
+            )
+            frames.append(one_m)
+    if not frames:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    out = pd.concat(frames).sort_index()
+    return out[~out.index.duplicated(keep="last")]
+
+
+def _parse_hhmm_policy(s) -> time:
+    s = str(s).strip() if s is not None else ""
+    if not s:
+        return time(17, 30)
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return pd.to_datetime(s, format=fmt).time()
+        except ValueError:
+            continue
+    return pd.to_datetime(s).time()
+
+
+def _et_session_pad_end_time(strategy) -> time:
+    base_date = datetime(2000, 1, 1).date()
+    me = _parse_hhmm_policy(getattr(strategy, "daily_maintenance_end_str", "17:30"))
+    end_dt = pd.Timestamp.combine(base_date, me)
+    with_post_buf = end_dt + timedelta(minutes=int(strategy.maintenance_buffer_minutes))
+    floor_eth = datetime.strptime("18:00", "%H:%M").time()
+    return max(with_post_buf.time(), floor_eth)
+
+
+def pad_htf_for_session_force_exits(
+    df_ohlcv: pd.DataFrame,
+    strategy,
+    restrict_dates: Optional[Set] = None,
+):
+    """Insert synthetic HTF rows for intra-day gaps / session tail (force-exit parity)."""
+    if df_ohlcv.empty:
+        return df_ohlcv
+    tf = max(1, int(getattr(strategy, "timeframe", 1) or 1))
+    pad_end_time = _et_session_pad_end_time(strategy)
+    df = df_ohlcv.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    orig_len = len(df)
+    step = pd.Timedelta(minutes=tf)
+    gap_threshold = step * 1.5
+    existing = set(df.index)
+
+    def synth_from(base: pd.Series) -> pd.Series:
+        p = base.copy()
+        p["volume"] = 0.0
+        return p
+
+    inserts = []
+    idx_list = list(df.index)
+    for i in range(len(idx_list) - 1):
+        a, b = idx_list[i], idx_list[i + 1]
+        if a.date() != b.date():
+            continue
+        if restrict_dates is not None and a.date() not in restrict_dates:
+            continue
+        if (b - a) <= gap_threshold:
+            continue
+        base = df.loc[a]
+        t = a + step
+        while t < b:
+            if t not in existing:
+                inserts.append((t, synth_from(base)))
+                existing.add(t)
+            t = t + step
+
+    for day in sorted(set(df.index.date)):
+        if restrict_dates is not None and day not in restrict_dates:
+            continue
+        sub = df[df.index.date == day]
+        last_ts = sub.index[-1]
+        last_row = sub.iloc[-1]
+        target_close = pd.Timestamp.combine(pd.Timestamp(day).date(), pad_end_time)
+        if last_ts >= target_close:
+            continue
+        t = last_ts + step
+        while t <= target_close:
+            if t not in existing:
+                inserts.append((t, synth_from(last_row)))
+                existing.add(t)
+            t = t + step
+
+    if not inserts:
+        return df
+
+    extra = pd.DataFrame([r for _, r in inserts], index=[ts for ts, _ in inserts])
+    out = pd.concat([df, extra]).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    logging.info(
+        "Padded %s synthetic HTF rows (%sm) through %s ET for force-exit parity.",
+        len(out) - orig_len,
+        tf,
+        pad_end_time,
+    )
+    return out
+
+
+def compute_paper_log_start(
+    strategy,
+    analysis_start: pd.Timestamp,
+    *,
+    max_bars: int = PAPER_WARMUP_MAX_BARS,
+    ib_seed_days: int = 10,
+) -> pd.Timestamp:
+    """
+    Earliest 1-min timestamp to load so HTF indicators can warm up like the live bot.
+
+    Live seeds ~``ib_seed_days`` of 1-min bars from IB (see ``request_historical_data``)
+    and also needs enough history for long SMA / Donchian lookbacks on the resampled series.
+    """
+    tf = max(1, int(getattr(strategy, "timeframe", 1) or 1))
+    need_htf = int(getattr(strategy, "min_bars_required", 0) or 0)
+    if getattr(strategy, "enable_sma_filter", False):
+        need_htf = max(need_htf, int(getattr(strategy, "sma_period", 0) or 0))
+    lookback_buy = int(getattr(strategy, "lookback_buy", 0) or 0)
+    lookback_sell = int(getattr(strategy, "lookback_sell", 0) or 0)
+    need_htf = max(need_htf, lookback_buy, lookback_sell)
+    # 1-min minutes with gap cushion; capped at rolling in-memory window.
+    need_1min = min(int(need_htf * tf * 1.5), int(max_bars))
+    lookback_start = pd.Timestamp(analysis_start) - pd.Timedelta(minutes=need_1min + tf * 5)
+    ib_start = pd.Timestamp(analysis_start) - pd.Timedelta(days=int(ib_seed_days))
+    return min(lookback_start, ib_start)
+
+
+def overlay_live_htf_log(
+    htf: pd.DataFrame,
+    live_data_path: str,
+    strategy,
+    dates: Optional[Set],
+) -> pd.DataFrame:
+    """
+    Replace resampled session OHLCV with HTF rows recorded by ``save_live_data_row``.
+
+    Resampling 1-min history produces a different bar grid than the live bot
+    (phase shifts, extra bars). For paper parity, session dates must use only
+    the bar labels/OHLC the bot actually traded on.
+    """
+    if not live_data_path or not os.path.isfile(live_data_path) or not dates:
+        return htf
+    tf = max(1, int(getattr(strategy, "timeframe", 1) or 1))
+    try:
+        raw = normalize_ohlcv_index(pd.read_csv(live_data_path, index_col=0, parse_dates=True))
+    except Exception:
+        return htf
+    if len(raw) < 2:
+        return htf
+    mins = raw.index.to_series().diff().dt.total_seconds().div(60.0)
+    lo, hi = tf * 0.65, tf * 1.35
+    htf_like = raw[(mins.isna()) | ((mins >= lo) & (mins <= hi))]
+    htf_like = htf_like[[c for c in htf_like.columns if c in {"open", "high", "low", "close", "volume"}]]
+    htf_like = htf_like[htf_like.index.map(lambda t: t.date() in dates)]
+    if htf_like.empty:
+        return htf
+    # Drop resampled rows on overlay dates; keep warmup history on prior dates only.
+    keep_mask = ~htf.index.map(lambda t: t.date() in dates)
+    warmup = htf.loc[keep_mask]
+    out = pd.concat([warmup, htf_like]).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    logging.info(
+        "Replaced session HTF with %s recorded rows from %s (%s warmup rows retained).",
+        len(htf_like),
+        live_data_path,
+        len(warmup),
+    )
+    return out
+
+
+def required_htf_warmup_bars(strategy) -> int:
+    tf = max(1, int(getattr(strategy, "timeframe", 1) or 1))
+    need = int(getattr(strategy, "min_bars_required", 0) or 0)
+    if getattr(strategy, "enable_sma_filter", False):
+        need = max(need, int(getattr(strategy, "sma_period", 0) or 0))
+    need = max(need, int(getattr(strategy, "lookback_buy", 0) or 0))
+    need = max(need, int(getattr(strategy, "lookback_sell", 0) or 0))
+    return need
+
+
+def prepare_paper_parity_ohlcv(
+    df_1min: pd.DataFrame,
+    strategy,
+    *,
+    end_time: Optional[pd.Timestamp] = None,
+    max_bars: int = PAPER_WARMUP_MAX_BARS,
+    pad_dates: Optional[Set] = None,
+    htf_overlay_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Build HTF OHLCV exactly as the live paper bot: rolling 1-min window,
+    resample closed=right/label=right, then optional session padding.
+    """
+    df = normalize_ohlcv_index(df_1min)
+    if df.empty:
+        return df
+    if end_time is not None:
+        df = df[df.index <= pd.Timestamp(end_time)]
+    if len(df) > int(max_bars):
+        df = df.iloc[-int(max_bars):]
+    tf = max(1, int(getattr(strategy, "timeframe", 1) or 1))
+    htf = resample_data(df, tf) if tf > 1 else df
+    if htf_overlay_path and pad_dates:
+        htf = overlay_live_htf_log(htf, htf_overlay_path, strategy, pad_dates)
+    # Session bars from live_data.csv are authoritative; skip synthetic gap padding.
+    if pad_dates and tf > 1 and not htf_overlay_path:
+        htf = pad_htf_for_session_force_exits(htf, strategy, restrict_dates=pad_dates)
+    return htf
+
+
+def parse_paper_bot_active_ranges(
+    execution_log_path: str,
+    *,
+    dates: Optional[Set] = None,
+    end_time: Optional[pd.Timestamp] = None,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Parse windows when the paper bot had an IB market-data subscription.
+
+    A window opens on ``Subscribed to market data`` and closes on ``Disconnecting``.
+    Re-subscribes while already connected extend the same window (refresh).
+    """
+    import re
+
+    if not execution_log_path or not os.path.isfile(execution_log_path):
+        return []
+    sub_re = re.compile(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO Subscribed to market data"
+    )
+    down_re = re.compile(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO Disconnecting"
+    )
+    ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    open_start: Optional[pd.Timestamp] = None
+    last_ts: Optional[pd.Timestamp] = None
+    try:
+        with open(execution_log_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = sub_re.search(line)
+                if m:
+                    ts = pd.Timestamp(m.group(1))
+                    last_ts = ts
+                    if open_start is None:
+                        open_start = ts
+                    continue
+                m = down_re.search(line)
+                if m and open_start is not None:
+                    ts = pd.Timestamp(m.group(1))
+                    last_ts = ts
+                    if ts >= open_start:
+                        ranges.append((open_start, ts))
+                    open_start = None
+        if open_start is not None:
+            end = pd.Timestamp(end_time) if end_time is not None else last_ts
+            if end is None:
+                end = open_start + pd.Timedelta(hours=24)
+            elif end.date() == open_start.date() and end < open_start:
+                end = pd.Timestamp.combine(
+                    open_start.date(), pd.Timestamp("23:59:59").time()
+                )
+            ranges.append((open_start, end))
+    except OSError:
+        return []
+
+    ranges = merge_timestamp_ranges(ranges)
+    ranges = merge_short_active_gaps(ranges, max_gap_seconds=300)
+    if dates is None:
+        return ranges
+
+    day_start = min(pd.Timestamp(d) for d in dates)
+    day_end = max(pd.Timestamp(d) for d in dates) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    clipped: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    for start, end in ranges:
+        overlap_start = max(start, day_start)
+        overlap_end = min(end, day_end)
+        if overlap_start <= overlap_end:
+            clipped.append((overlap_start, overlap_end))
+    return merge_timestamp_ranges(clipped)
+
+
+def merge_short_active_gaps(
+    ranges: List[Tuple[pd.Timestamp, pd.Timestamp]],
+    *,
+    max_gap_seconds: float = 300.0,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """Merge connect windows separated only by brief maintenance/API blips."""
+    merged = merge_timestamp_ranges(ranges)
+    if len(merged) < 2:
+        return merged
+    out: List[Tuple[pd.Timestamp, pd.Timestamp]] = [merged[0]]
+    for start, end in merged[1:]:
+        gap = (start - out[-1][1]).total_seconds()
+        if gap <= max_gap_seconds:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def merge_timestamp_ranges(
+    ranges: List[Tuple[pd.Timestamp, pd.Timestamp]],
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """Merge overlapping/adjacent (start, end) windows."""
+    if not ranges:
+        return []
+    merged: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    for start, end in sorted(ranges, key=lambda x: x[0]):
+        start = pd.Timestamp(start)
+        end = pd.Timestamp(end)
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def read_live_data_csv(live_data_path: str) -> pd.DataFrame:
+    """
+    Load ``live_data.csv`` with dynamic columns (header grows as indicators are added).
+
+    Rows written after the header was created may contain extra fields; assign
+    known trend indicator names to trailing columns.
+    """
+    import csv
+
+    if not live_data_path or not os.path.isfile(live_data_path):
+        return pd.DataFrame()
+
+    trend_extra = [
+        "donchian_high",
+        "donchian_low",
+        "donchian_exit_high",
+        "donchian_exit_low",
+        "atr",
+        "sma_regime",
+        "rsi",
+        "vwap",
+    ]
+
+    with open(live_data_path, "r", encoding="utf-8", errors="replace") as fh:
+        reader = csv.reader(fh)
+        header = [str(c).lower().strip() for c in next(reader)]
+        rows = list(reader)
+
+    orig_len = len(header)
+    max_len = max(orig_len, max((len(r) for r in rows), default=orig_len))
+    while len(header) < max_len:
+        extra_idx = len(header) - orig_len
+        if extra_idx < len(trend_extra):
+            header.append(trend_extra[extra_idx])
+        else:
+            header.append(f"extra_{len(header)}")
+
+    records = []
+    index = []
+    for row in rows:
+        if not row:
+            continue
+        padded = row + [""] * (len(header) - len(row))
+        index.append(padded[0])
+        records.append(padded[1 : len(header)])
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records, columns=header[1:], index=index)
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert("US/Eastern").tz_localize(None)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="ignore")
+    return df
+
+
+def load_paper_compare_htf(
+    live_data_path: str,
+    strategy,
+    analysis_start: pd.Timestamp,
+    analysis_end: pd.Timestamp,
+    *,
+    df_1min: Optional[pd.DataFrame] = None,
+    execution_log_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    HTF series for paper vs backtest compare: recorded live bar labels/OHLC only.
+
+    Uses ``live_data.csv`` (``save_live_data_row`` output) so the backtest bar grid
+    matches the bot — resampling ``live_1min.csv`` alone can shift bar phases.
+
+    When ``df_1min`` and ``execution_log_path`` are supplied, indicator warmup uses
+    the IB seed window at first ``Subscribed to market data`` (same depth as live),
+    then session OHLC from ``live_data.csv`` from connect time onward.
+    """
+    if not live_data_path or not os.path.isfile(live_data_path):
+        return pd.DataFrame()
+    tf = max(1, int(getattr(strategy, "timeframe", 1) or 1))
+    try:
+        raw = read_live_data_csv(live_data_path)
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+    ohlcv_cols = ["open", "high", "low", "close", "volume"]
+    raw = raw.dropna(subset=[c for c in ohlcv_cols if c in raw.columns], how="any")
+    raw = raw[~raw.index.duplicated(keep="last")].sort_index()
+    if tf <= 1:
+        htf = raw
+    else:
+        mins = raw.index.to_series().diff().dt.total_seconds().div(60.0)
+        lo, hi = tf * 0.65, tf * 1.35
+        htf = raw[(mins.isna()) | ((mins >= lo) & (mins <= hi))]
+
+    start = pd.Timestamp(analysis_start)
+    end = pd.Timestamp(analysis_end)
+    need = required_htf_warmup_bars(strategy)
+
+    connect_series = _parse_subscribe_seed_counts(execution_log_path) if execution_log_path else {}
+    if df_1min is not None and not df_1min.empty and connect_series:
+        df1 = normalize_ohlcv_index(df_1min)
+        frames = []
+        for day in sorted({d.date() for d in pd.date_range(start.normalize(), end.normalize(), freq="D")}):
+            day_ts = pd.Timestamp(day)
+            sess = htf[htf.index.date == day]
+            if sess.empty:
+                continue
+            connect = connect_series.get(day)
+            if connect is not None:
+                connect_ts, seed_n = connect
+                warm_htf = ib_htf_seed_at_subscribe(
+                    df1, connect_ts, timeframe=tf, seed_n=int(seed_n),
+                )
+                sess = sess[sess.index >= connect_ts.floor("min")]
+                frames.append(pd.concat([warm_htf, sess[ohlcv_cols]]))
+            else:
+                frames.append(sess[ohlcv_cols])
+        if frames:
+            prior = pd.concat(frames).sort_index()
+            prior = prior[~prior.index.duplicated(keep="last")]
+        else:
+            prior = htf[htf.index <= end]
+    else:
+        prior = htf[htf.index <= end]
+
+    idx_end = prior.index.searchsorted(end, side="right")
+    slice_end = prior.iloc[:idx_end] if idx_end else prior
+    if len(slice_end) <= need:
+        out = slice_end
+    else:
+        session = slice_end[slice_end.index >= start]
+        pre = slice_end[slice_end.index < start]
+        if len(pre) >= need:
+            pre = pre.iloc[-need:]
+        out = pd.concat([pre, session]).sort_index()
+    return out[~out.index.duplicated(keep="last")]
+
+
+def ib_htf_seed_at_subscribe(
+    df_1min: pd.DataFrame,
+    connect_ts: pd.Timestamp,
+    *,
+    timeframe: int,
+    seed_n: int,
+    max_bars: int = PAPER_WARMUP_MAX_BARS,
+) -> pd.DataFrame:
+    """
+    HTF bars implied by IB 1-min seed at subscribe (matches live ``data_ref``).
+
+    Includes connect-day bars **before** ``connect_ts`` so session VWAP and other
+    intraday cumulative indicators match the live bot after reconnect.
+    """
+    ohlcv = ["open", "high", "low", "close", "volume"]
+    connect_ts = pd.Timestamp(connect_ts)
+    day = connect_ts.date()
+    df1 = normalize_ohlcv_index(df_1min).sort_index()
+    if df1.empty:
+        return pd.DataFrame(columns=ohlcv)
+    n = int(seed_n) if seed_n else int(max_bars)
+    warm_1m = df1[df1.index <= connect_ts].iloc[-n:]
+    if warm_1m.empty:
+        return pd.DataFrame(columns=ohlcv)
+    tf = max(1, int(timeframe))
+    warm_htf = resample_data(warm_1m, tf) if tf > 1 else warm_1m
+    prior = warm_htf[warm_htf.index.date < day]
+    same_day = warm_htf[
+        (warm_htf.index.date == day) & (warm_htf.index <= connect_ts)
+    ]
+    if prior.empty and same_day.empty:
+        return pd.DataFrame(columns=ohlcv)
+    out = pd.concat([prior, same_day]).sort_index()
+    return out[~out.index.duplicated(keep="last")][ohlcv]
+
+
+def _parse_subscribe_seed_counts(execution_log_path: str) -> Dict:
+    """Map session date -> (first_subscribe_ts, ib_bar_count) from execution log."""
+    import re
+
+    if not execution_log_path or not os.path.isfile(execution_log_path):
+        return {}
+    sub_re = re.compile(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO Subscribed to market data \((\d+) bars\)"
+    )
+    out: Dict = {}
+    try:
+        with open(execution_log_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = sub_re.search(line)
+                if not m:
+                    continue
+                ts = pd.Timestamp(m.group(1))
+                day = ts.date()
+                if day not in out:
+                    out[day] = (ts, int(m.group(2)))
+    except OSError:
+        return {}
+    return out
+
+
+def resample_mask_to_htf(mask, timeframe_mins: int, htf_index):
+    """Align a 1m boolean mask to HTF bar index (same closed/label as ``resample_data``)."""
+    if timeframe_mins <= 1:
+        return mask
+    aligned = (
+        mask.astype(bool)
+        .resample(f"{timeframe_mins}min", closed="right", label="right")
+        .max()
+        .fillna(False)
+    )
+    return aligned.reindex(htf_index).fillna(False).astype(bool)
+
+
 def _indicators_ready(data):
     """Check if indicators have been calculated (strategy-agnostic).
     Returns True if the data has any indicator columns beyond OHLCV.
@@ -440,15 +1180,32 @@ def save_live_data_row(output_dir, timestamp, row, full_df):
         row_data = {}
         for col in base_cols + extra_cols:
             val = row.get(col, '') if isinstance(row, dict) else getattr(row, col, '')
-            if val != '':
+            if val != '' and val is not None and not (isinstance(val, float) and pd.isna(val)):
                 row_data[col] = val
+        # Persist every computed indicator/filter column for paper/backtest parity.
+        source = row.to_dict() if isinstance(row, pd.Series) else (row if isinstance(row, dict) else {})
+        skip = set(base_cols) | set(row_data.keys())
+        for col, val in source.items():
+            if col in skip or val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            row_data[col] = val
 
         row_series = pd.Series(row_data, name=timestamp)
 
         if not file_exists:
-            row_series.to_frame().T.to_csv(csv_path, mode='w', header=True)
+            row_series.to_frame().T.to_csv(csv_path, mode="w", header=True)
         else:
-            row_series.to_frame().T.to_csv(csv_path, mode='a', header=False)
+            existing = read_live_data_csv(csv_path)
+            new_row = row_series.to_frame().T
+            new_row.index = pd.to_datetime(new_row.index)
+            if getattr(new_row.index, "tz", None) is not None:
+                new_row.index = new_row.index.tz_convert("US/Eastern").tz_localize(None)
+            all_cols = list(dict.fromkeys(list(existing.columns) + list(new_row.columns)))
+            existing = existing.reindex(columns=all_cols)
+            new_row = new_row.reindex(columns=all_cols)
+            combined = pd.concat([existing, new_row])
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            combined.to_csv(csv_path)
     except Exception as e:
         logging.error(f"Failed to save live data row: {e}")
 
@@ -713,9 +1470,12 @@ def log_entry_criteria_status(strategy, positions, resampled_row, data_with_filt
 
 def on_bar_update_handler(bars, hasNewBar, *, strategy, ib, contract, data_ref,
                           positions, completed_trades, live_tracker, bar_log,
-                          dashboard_state, send_email_fn, output_dir, last_data_receipt):
+                          dashboard_state, send_email_fn, output_dir, last_data_receipt,
+                          last_new_bar_receipt=None):
     """IB callback: liveness + snapshot; heavy work runs on the bar pipeline consumer."""
     last_data_receipt["time"] = datetime.now()
+    if hasNewBar and last_new_bar_receipt is not None:
+        last_new_bar_receipt["time"] = datetime.now()
     snap = [(b.date, b.open, b.high, b.low, b.close, b.volume) for b in bars]
 
     if BAR_PIPELINE_QUEUE is not None:
