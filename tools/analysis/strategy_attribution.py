@@ -61,7 +61,7 @@ def load_ga_context(param_csv: str):
     param_dict, _ = load_params(param_csv, return_dataframe=True)
     start = str(param_dict["GA_START_DATE"]["value"])
     end = str(param_dict["GA_END_DATE"]["value"])
-    in_sample, _, is_mask, _, _ = build_ga_training_bundle(
+    in_sample, _, is_mask, _, _, _ = build_ga_training_bundle(
         param_dict,
         ga_start_date=start,
         ga_end_date=end,

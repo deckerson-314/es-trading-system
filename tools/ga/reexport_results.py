@@ -119,6 +119,7 @@ def reexport_checkpoint(checkpoint_path, output_csv):
     else:
         split = int(len(df_eval) * DATA_SPLITS)
         is_mask.iloc[:split] = True
+        oos_mask = ~is_mask
         is_periods.append(df_eval.iloc[:split])
         oos_periods.append(df_eval.iloc[split:])
 
@@ -145,7 +146,7 @@ def reexport_checkpoint(checkpoint_path, output_csv):
         
         # Per-Split Detail (Continuous segments)
         is_periods_res, oos_periods_res = optimize.calculate_split_detail(
-            ind, is_periods, oos_periods, backtest_full_params)
+            ind, is_periods, oos_periods, backtest_full_params, df_full=df_eval)
         
         # Store metrics in the individual object so save_optimized_results can see them
         ind.actual_metrics = {

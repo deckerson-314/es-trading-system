@@ -1,8 +1,8 @@
-# Intraday Strategy Research — Trend, Session, ORB
+# Intraday Strategy Research — Trend, Session, ORB, VWAP Regime
 
-**Last updated:** 2026-07-08  
-**Scope:** Completed GA runs on ES (2020–2025), four-quadrant attribution, comparison to practitioner backtests and academic ORB/VWAP literature.  
-**Purpose:** Record what we learned, why each hypothesis failed, and specify the **next strategy to optimize** — targeting **~1–4 trades/day** for faster statistical testing.
+**Last updated:** 2026-07-11  
+**Scope:** Completed GA runs on ES (2020–2025), four-quadrant attribution, comparison to practitioner backtests and academic ORB/VWAP/MIM literature. Fresh literature/forum survey 2026-07-10 for next hypothesis.  
+**Purpose:** Record what we learned, why each hypothesis failed, and specify the **next strategies to optimize** — targeting **~0.5–4 trades/day** for faster statistical testing.
 
 ---
 
@@ -14,14 +14,26 @@
 | **Session** v1 (VWAP fade) | 2026-07-04 | −$10,151 | 0.61 | 135 | 0 / 1,196 | −$8.5k MC med | **FAIL** |
 | **Session** v2 | 2026-07-05 | −$18,453 | 0.35 | 225 | 0 / 2,164 | −$13.6k MC med | **FAIL** |
 | **ORB** acceptance | 2026-07-06 | −$2,861 | 0.68 | 34 | 58 / 820 | −$3.3k MC med | **FAIL** (Sol #0) |
+| **VWAP Regime** v1 | 2026-07-08 | −$12,732 | 0.73 | 220 | 1 / 2,212 | −$10.8k MC med | **FAIL** |
+| **VWAP Regime** v2 | 2026-07-10 | −$3,349 | 0.71 | 60 | 0 / 2,759 | −$2.7k MC med | **FAIL** — family dead |
 
 \*Trend RS quadrant had a small-sample bug early in attribution (5 trades); entry failure is still clear from SS vs RR and direction diagnostics.
 
-**Cross-cutting finding:** All four hypotheses show **negative entry selection** (strategy entries worse than random OOS timing with matched hold). **Exit logic** sometimes helps (Session v1, ORB) but cannot fix wrong-side entries. **Opposite-direction** diagnostics are often positive — direction/timing is wrong, not always a simple sign flip.
+**Cross-cutting finding:** All completed hypotheses show **negative entry selection** (strategy entries worse than random OOS timing with matched hold). **Exit logic** sometimes helps (Session v1, ORB, VWAP Regime v1) but cannot fix wrong-side entries; v2 exits **hurt**. **Opposite-direction** USD is often tautological for losers — use `% beats opposite` + full flip replay.
 
 **Best relative result:** ORB **Solution_534** — +$3,525 OOS on interleaved slices (PF 1.33), but only **7%** of HOF OOS-positive; **34 contiguous OOS trades** on Sol #0 is too sparse for confidence.
 
-**Recommended next hypothesis:** **`vwap_regime`** — regime-switching between **VWAP pullback (trend days)** and **VWAP deviation fade (range days)**, targeting **1–4 trades/day**, reusing session/OR/VWAP infrastructure. Detailed spec in [§7](#7-recommended-next-strategy-vwap_regime).
+### Recommended next hypotheses (2026-07-11)
+
+| Priority | Strategy | Why | Status |
+|----------|----------|-----|--------|
+| **DONE** | `vwap_regime` v1+v2 | ADX lock did not create OOS+ HOF; activity collapsed; SS−RS & SS−SR both negative on v2 Sol #0 | **Family closed** — `results/ga_analysis_vwap_regime_2026-07-10-1.md` |
+| **P1** | **`orb_v2` — literature ORB baseline** | Practitioner consensus (5–15m OR, 0.5× target, opposite-OR stop) ≠ our failed ORB v1 | Spec §9 |
+| **P1** | **`mim` — Market Intraday Momentum** | Strongest *academic* OHLC-only edge (Gao et al. JFE 2018; Baltussen et al. JFE 2021) | Spec §10 |
+| **P2** | Internals-gated ORB / false-break fade | NexusFi: TICK/VOLD confirmation | Needs new data feed |
+| **Skip** | ICT/FVG, DL, Bollinger revive, further VWAP-regime retunes | — | — |
+
+**Decision rule:** `vwap_regime` closed. Implement **ORB v2** and/or **MIM**. Do not re-tune Session fade, Donchian Trend, or VWAP-regime.
 
 ---
 
@@ -313,15 +325,22 @@ This matches:
 
 Much better than ORB **0.02/day**; similar order to literature VWAP systems (~760 trades / 3 yr ≈ **1/day**).
 
-### 7.4 GA parameter targets (initial)
+### 7.4 GA parameter targets
 
-| Parameter | Proposed `Value` | Rationale |
-|-----------|------------------|-----------|
-| `TARGET_TRADES_DAY` | **2.0** | Center of 1–4 band |
-| `MIN_TRADES_DAY` | **0.25** | ~1 trade every 4 days floor |
-| `NORM_TRADES_MAX` | **3.0** | Align with Trend/Bollinger scale |
-| `Max Entries Per Day` | **3** (optimizable 2–5) | Handful/day cap |
-| `WEIGHT_PNL` | **1.0** | Contiguous edge matters |
+| Parameter | v1 | **v2 (2026-07-10)** | Rationale |
+|-----------|----|---------------------|-----------|
+| `Enable ADX Filter` | 0–1 | **LOCKED = 1** | Sol #0 disabled regime gate |
+| `Timeframe (minutes)` | 3–15 | **LOCKED = 5** | Literature-like bars |
+| `TARGET_TRADES_DAY` | 2.0 | **2.0** | Center of 1–4 band |
+| `MIN_TRADES_DAY` | 0.25 | **0.5** | Sol #0 ~0.27 barely bound |
+| `NORM_TRADES_MAX` | 3.0 | **3.0** | Align with Trend/Bollinger |
+| `Min VWAP Extension` | 4–18 | **4–12** | Sol #0 ~16 too rare |
+| `Fade Band ATR Mult` | 1.2–2.5 | **1.2–2.0** | Tighter σ-band |
+| `Fade/Pullback Confirm` | 1–3 | **1–2** | Less delay |
+| `Pullback Touch Buffer` | 0.25–3 | **0.5–2.0** | Sol #0 too tight |
+| `Trade Start After OR` | 0–45 | **15–45** | VWAP stable window |
+| `Max Hold (bars)` | 18–72 | **12–36** | ~1–3h at TF=5 |
+| `Max Entries Per Day` | 2–5 | **2–5** | Handful/day cap |
 
 ### 7.5 Pass/fail gates (unchanged)
 
@@ -338,34 +357,139 @@ Run attribution on **every** GA export; reject Sol #0 automatically if SS−RS M
 
 **CLI:** `--strategy vwap_regime`
 
-### 7.7 Alternative B (if Regime v1 fails): **ORB v2 (literature baseline)**
+### 7.7 Alternative B (if Regime fails): **ORB v2** — see §8
 
-Minimal ORB aligned with published ES backtests — not a regime switch:
-
-- **5–15 min OR** (not 56).  
-- **Close beyond OR** + optional 1-bar confirm (not 4).  
-- **Target 0.5–1.0× OR width**; stop **opposite OR**.  
-- Filters: wide OR tier, OR-candle direction, **long-only** toggle, vol state.  
-- Expected **0.3–1.5 trades/day**, 100+ trades per OOS window.
-
-Use as **controlled experiment** against ORB v1 to separate “GA failed” vs “ORB class failed.”
+### 7.8 Alternative C: **Market Intraday Momentum** — see §9
 
 ---
 
-## 8. Research backlog
+## 8. Literature / forum survey (2026-07-10) → next strategy
+
+### 8.1 What the literature agrees on
+
+| Theme | Source class | Claim | Fit for our stack |
+|-------|--------------|-------|-------------------|
+| **Day-type first** | NexusFi Academy (2026) | ~70% balance / ~30% trend; wrong tool on wrong day = structural loss | We tried via ADX+VWAP (`vwap_regime`); v1 failed, v2 pending |
+| **Short ORB + 0.5× target** | Edgeful, Trade That Swing, TradingStats, PineScriptForge | 5–15m OR, close beyond OR, stop opposite OR, target **0.5× OR width** | **Not tested** — our ORB v1 used long OR + multi-bar accept + sparse entries |
+| **ORB acceptance** | NexusFi | 5m close beyond OR + short hold outside raises WR ~42%→55–60% | Partial overlap with ORB v1; v1 over-confirmed (4 bars) + wrong OR length |
+| **OAIR / OAOR** | NexusFi / Market Profile | Open inside prior RTH range → balance (~80%); open outside → trend (~80%) | **OHLC-only filter** — unused so far; good ORB v2 gate |
+| **VWAP pullback (trend) / fade (range)** | NexusFi, CrossTrade | Regime-conditional VWAP | Session fade alone failed; regime v1 failed; v2 running |
+| **Market Intraday Momentum** | Gao/Han/Li/Zhou (JFE 2018); Baltussen et al. (JFE 2021) | First half-hour (or rest-of-day) return predicts **last 30 min** | **Never tested**; OHLC-only; ~1 trade/day |
+| **Internals (TICK/VOLD/ADD)** | NexusFi | Confirm OR breaks; fade non-confirmed breaks | Needs new data — P2 |
+| **ICT / FVG / IFVG** | TradeZella, student papers | Liquidity sweep + FVG inversion on ES/NQ | Discretionary / hard to GA; skip |
+| **Deep learning forecasts** | arXiv GCN-LSTM, wavelet-BLSTM | Predict ES returns / vol | Out of scope for current GA engine |
+
+### 8.2 Why our failures do **not** kill the literature recipes
+
+| Our run | What we actually tested | Literature recipe we did **not** test |
+|---------|-------------------------|--------------------------------------|
+| Session v1/v2 | Generic VWAP fade after OR | Strict σ-band + ADX-on + session-type gate |
+| ORB v1 | Long OR (~30–56m), multi-bar acceptance, sparse | **5–15m OR, 1-bar close, 0.5× target, opposite-OR stop** |
+| VWAP Regime v1 | GA turned ADX **off**; ~0.27 trades/day | ADX locked + ~1–2/day (v2 now) |
+| Trend | Donchian chase all day | Not a published ES day-trading core setup |
+
+**Implication:** ORB class is **not falsified** until ORB v2 matches published geometry. VWAP-regime class is **one constrained re-run** from falsification.
+
+### 8.3 Ranking for *this* repo
+
+1. **ORB v2 (literature baseline)** — best controlled experiment; reuses `strategies/orb`; highest practitioner replication density; expected 0.3–1.5 trades/day.  
+2. **MIM (`mim`)** — best *new* academic family; orthogonal to ORB/VWAP; simple rules; ~1 trade/day; strong JFE pedigree + futures replication via hedging-demand channel.  
+3. **Internals-gated ORB** — only after TICK/VOLD history is available.  
+4. **Do not** re-open Session fade or Donchian Trend without a new exogenous signal.
+
+---
+
+## 9. Spec: `orb_v2` — literature ORB baseline
+
+**Class:** extend / retune `OrbAcceptanceStrategy` (or thin `orb_v2` params CSV)  
+**CLI:** `--strategy orb` with `strategies/orb/parameters/orb_v2_strategy_params.csv`  
+**Goal:** Falsify or validate the **published** ES ORB recipe under our friction + interleaved GA.
+
+### 9.1 Locked / narrow search (do not re-discover long OR)
+
+| Parameter | Literature default | GA range |
+|-----------|-------------------|----------|
+| Opening Range | **5 or 15 min** | lock one run each, or discrete {5, 15} |
+| Entry | **1 close** beyond OR (± buffer) | confirm bars **1–2** only |
+| Stop | **Opposite OR** | locked |
+| Target | **0.5 × OR width** | 0.4–1.0 |
+| Max entries/day | **1** | locked |
+| Timeframe | **5 min** | locked |
+| Max OR width | ~0.55% of price or ATR band | optimizable skip-wide |
+| Min OR width | skip dead opens | optimizable |
+| OAIR/OAOR filter | optional: only OAOR for breakout; OAIR → no trade or fade mode off | 0/1 lock after smoke |
+| Long-only toggle | optional (bull regime) | 0/1 |
+
+### 9.2 Expected frequency & gates
+
+- ~0.3–1.5 trades/day → **100+ OOS trades** preferred.  
+- Same deploy gates as §1.2.  
+- Compare Sol #0 contiguous OOS to ORB v1 (−$2.9k / 34 trades) and to HOF Sol #534 (+$3.5k slices).
+
+### 9.3 Pass interpretation
+
+| Outcome | Conclusion |
+|---------|------------|
+| OOS+ and SS−RS > −$2k | ORB class viable → harden filters (OAIR, DOW, vol) |
+| Still OOS− / SS−RS ≪ 0 | ORB class dead **under our costs/sim** → stop ORB variants |
+| Slice-OOS+ but contiguous− | Selection artifact (same as v1) — do not deploy |
+
+---
+
+## 10. Spec: `mim` — Market Intraday Momentum
+
+**Class:** new `strategies/mim/`  
+**CLI:** `--strategy mim`  
+**Academic core:** Gao, Han, Li, Zhou (2018), *Market Intraday Momentum*, Journal of Financial Economics — first half-hour return (from prior close) predicts last half-hour return. Baltussen, Da, van der Wel (2021) link last-30m momentum to **options/ETF hedging demand** across futures.
+
+### 10.1 Logic (minimal)
+
+1. Measure **signal return** \(r_{\text{FH}}\) = return from prior RTH close → 10:00 ET (first 30 min), **or** rest-of-day to 15:30 (Baltussen variant — GA toggle).  
+2. At **15:30 ET**, enter **same direction** as signal if \(|r_{\text{FH}}|\) > threshold (vol-scaled).  
+3. Exit at **16:00 ET** (RTH close) or earlier on stop.  
+4. Filters (literature-aligned): high overnight/open vol, high volume day, optional FOMC/CPI calendar skip or *include* (effect stronger on news days).  
+5. Cap: **1 trade/day**.
+
+### 10.2 Why this fits after our failures
+
+- Orthogonal to VWAP/ORB geometry (time-of-day momentum, not level breakout).  
+- ~1 trade/day → fast attribution sample.  
+- OHLC-only (no internals).  
+- Clear economic story (rebalancing / late-informed / gamma hedge) — not curve-fit folklore.  
+- Risk: published sample ends earlier; must survive **2020–2025 ES** + our pessimistic friction.
+
+### 10.3 GA targets
+
+| Parameter | Value / range |
+|-----------|----------------|
+| Signal window | FH 09:30–10:00 vs ROD→15:30 |
+| Entry time | 15:30 (lock) |
+| Exit | 16:00 RTH (lock) |
+| Min \|signal\| (ATR mult) | 0.1–0.5 |
+| Stop ATR mult | 0.5–1.5 (or none — time exit only) |
+| TARGET_TRADES_DAY | 0.8–1.0 |
+| MIN_TRADES_DAY | 0.4 |
+
+---
+
+## 11. Research backlog
 
 | Priority | Task |
 |----------|------|
-| P0 | Implement `vwap_regime` v1 + params CSV + tests |
+| P0 | ~~Finish `vwap_regime` v2~~ **FAIL** — 0/2759 OOS+; Sol #0 OOS −$3.3k; family **closed** (`results/ga_analysis_vwap_regime_2026-07-10-1.md`) |
 | P0 | Export + attribute **ORB Solution_534** (best slice-OOS) |
-| P1 | ORB v2 literature baseline (5-min OR, 50% target) |
-| P1 | GA: add post-run auto-attribution gate in export pipeline |
-| P2 | Regime labels vs PnL (trend/range/chop day taxonomy) |
-| P2 | Fix Trend attribution RS sample size for old runs |
+| P0 | ~~Export + attribute vwap_regime Solution_223~~ superseded — v2 closed family |
+| P1 | Implement **`orb_v2`** literature baseline (5/15m OR, 0.5× target) — §9 |
+| P1 | Implement **`mim`** Market Intraday Momentum — §10 |
+| P1 | Fix Timeframe lock/export (Jul-10 all sols showed TF=15 while CSV locked Value=5) |
+| P1 | GA: post-run auto-attribution gate in export pipeline |
+| P2 | OAIR/OAOR day-type label vs PnL (OHLC-only) |
+| P2 | Market internals (TICK/VOLD) data path for ORB confirmation |
+| P2 | Re-attribute Trend Jul-03 with current RS code (kill stale n=5 report) |
 
 ---
 
-## 9. Artifact index
+## 12. Artifact index
 
 | Strategy | GA CSV | OOS trades | Attribution |
 |----------|--------|------------|-------------|
@@ -374,25 +498,41 @@ Use as **controlled experiment** against ORB v1 to separate “GA failed” vs �
 | Session v2 | `Session/parameters/genetic_results_2026-07-05-1.csv` | `Session/output/genetic_trades_oos_2026-07-05-1.csv` | `results/attribution_session_oos_2026-07-05.md` |
 | ORB | `Orb/parameters/genetic_results_2026-07-06-1.csv` | `Orb/output/genetic_trades_oos_2026-07-06-1.csv` | `results/attribution_orb_oos_2026-07-06.md` |
 | ORB analysis | — | — | `results/ga_analysis_orb_2026-07-06-1.md` |
+| VWAP Regime v1 | `Vwap_regime/parameters/genetic_results_2026-07-08-1.csv` | `Vwap_regime/output/genetic_trades_oos_2026-07-08-1.csv` | `results/attribution_vwap_regime_oos_2026-07-08.md` |
+| VWAP Regime v2 | `Vwap_regime/parameters/genetic_results_2026-07-10-1.csv` | `Vwap_regime/output/genetic_trades_oos_2026-07-10-1_sol0.csv` | `results/attribution_vwap_regime_oos_2026-07-10_sol0.md` |
+| VWAP analysis v1 | — | — | `results/ga_analysis_vwap_regime_2026-07-08-1.md` |
+| VWAP analysis v2 | — | — | `results/ga_analysis_vwap_regime_2026-07-10-1.md` |
 
 ---
 
-## 10. References
+## 13. References
 
 ### Academic
 
+- Gao, L., Han, Y., Li, S. Z., & Zhou, G. (2018). *Market Intraday Momentum.* Journal of Financial Economics. [ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0304405X18301351) · [SSRN](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2440866)  
+- Baltussen, G., Da, Z., & van der Wel, M. (2021). *Hedging Demand and Market Intraday Momentum.* Journal of Financial Economics. [ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0304405X21001598)  
 - Huang, Y.-H., et al. (2019). *Assessing the Profitability of Timely Opening Range Breakout on Index Futures Markets.* IEEE Access. [DOI](https://doi.org/10.1109/access.2019.2899177)  
 - Zarattini, C., et al. (2023). *A Profitable Day Trading Strategy For The U.S. Equity Market.* [UniSG](https://www.alexandria.unisg.ch/handle/20.500.14171/122125)  
 - *Day trading returns across volatility states* (ORB on S&P 500 futures). [Diva Portal PDF](https://www.diva-portal.org/smash/get/diva2:732318/FULLTEXT02.pdf)  
 - Zanetti, M. *Intraday mean-reversion with costs and walk-forward.* [GitHub](https://github.com/marcozanetti-dev/intraday-mean-reversion-costs-aware)
 
-### Practitioner / research blogs
+### Practitioner / forums
 
-- [TradingStats ORB guide](https://tradingstats.net/orb-breakout-strategy-guide/) · [ORB deep dive](https://tradingstats.net/orb-strategy-research/)  
+- [NexusFi ES playbook](https://nexusfi.com/a/strategies/es-futures-trading-strategies) — day type, VWAP pullback, ORB acceptance  
+- [NexusFi regime detection](https://nexusfi.com/a/automation/regime-detection-automated-trading)  
+- [NexusFi market internals](https://nexusfi.com/a/strategies/trading-with-market-internals)  
+- [TradingStats ORB guide](https://tradingstats.net/orb-breakout-strategy-guide/) (6,142 days ES/NQ extension probabilities)  
 - [Edgeful 5-min ES ORB](https://www.edgeful.com/blog/posts/5-minute-opening-range-breakout-es-strategy)  
+- [Trade That Swing ORB](https://tradethatswing.com/opening-range-breakout-strategy-up-400-this-year/) (15m OR, 5m close, 50% target)  
 - [CrossTrade VWAP reversion](https://crosstrade.io/learn/trading-strategies/vwap-reversion)  
-- [NexusFi ES playbook — VWAP pullback](https://nexusfi.com/a/strategies/es-futures-trading-strategies)  
-- [PineScriptForge ES backtests](https://pinescriptforge.com/es/vwap-deviation/backtest) (VWAP deviation, ORB, scalp — treat as marketing, useful for magnitude benchmarks)
+- [PineScriptForge ES ORB / VWAP](https://pinescriptforge.com/ES/opening-range-breakout/backtest) (marketing benchmarks — use for magnitude only)  
+- [Alpha Architect summary of MIM](https://alphaarchitect.com/attention-prop-traders-the-first-half-hour-of-trading-predicts-the-last-half-hour/)
+
+### Explicitly deprioritized
+
+- ICT / IFVG / liquidity-sweep discretionary models (not systematic-GA ready).  
+- Wavelet/GCN-LSTM return forecasts (different research program).  
+- Unfiltered overnight gap fade (fill rates collapse for large gaps; equity overnight-to-intraday reversal often dies after costs).
 
 ---
 

@@ -4,16 +4,16 @@ Enable Long Trades,TRUE,,,bool,Allow long entries
 Enable Short Trades,TRUE,,,bool,Allow short entries
 Max Open Trades,1,1,1,int,Max concurrent trades
 Transaction Cost (Per Trade),15,15,15,float,Friction per round-trip
-Timeframe (minutes),5,3,15,int,Bar size for VWAP regime logic
+Timeframe (minutes),5,5,5,int,LOCKED v2: literature-like 5m bars (was 3-15)
 === Session Timing ===,,,,,
 Opening Range (minutes),30,15,45,int,OR window from RTH open
 Min OR Width (pts),4,2,12,float,Skip dead sessions (OR too tight)
 Max OR Width (pts),40,20,55,float,Skip chaotic opens (OR too wide)
-Trade Start After OR (min),15,0,45,int,Buffer after OR before entries
-Trade End Before RTH Close (min),30,15,90,int,Stop new trades N min before close
+Trade Start After OR (min),30,15,45,int,v2: VWAP stable window (was 0-45)
+Trade End Before RTH Close (min),30,15,60,int,Stop new trades N min before close (was 15-90)
 Max Entries Per Day,3,2,5,int,Cap entries per session (~handful/day)
 === Regime Classifier ===,,,,,
-Enable ADX Filter,1,0,1,int,ADX gates for trend vs range
+Enable ADX Filter,1,1,1,int,LOCKED v2: regime gate mandatory (Sol #0 turned this off)
 ADX Period,14,10,21,int,ADX lookback
 Min Trend ADX,20,15,28,float,Trend-day floor (pullback mode)
 Max Range ADX,22,15,28,float,Range-day cap (fade mode)
@@ -22,13 +22,13 @@ Max ATR (pts),25,10,40,float,Max volatility (crisis skip)
 Trend Side Pct,0.62,0.55,0.75,float,Fraction of post-OR bars on one VWAP side
 Min VWAP Crosses,2,1,4,int,Range day: min VWAP crosses since OR
 === Trend: VWAP Pullback ===,,,,,
-Pullback Touch Buffer (pts),1.0,0.25,3,float,Touch zone around VWAP
-Pullback Confirm Bars,1,1,3,int,Rejection bars at VWAP
-Trend Target R Multiple,1.5,1.0,3.0,float,TP = entry +/- R * risk
+Pullback Touch Buffer (pts),1.0,0.5,2.0,float,v2: touch zone (was 0.25-3; Sol #0 too tight)
+Pullback Confirm Bars,1,1,2,int,v2: rejection bars (was 1-3)
+Trend Target R Multiple,1.5,1.0,2.5,float,TP = entry +/- R * risk (was 1-3)
 === Range: VWAP Deviation Fade ===,,,,,
-Min VWAP Extension (pts),8,4,18,float,Min distance from VWAP before fade
-Fade Band ATR Multiplier,1.75,1.2,2.5,float,ATR band around VWAP for extension
-Fade Confirm Bars,2,1,3,int,Bars reverting toward VWAP
+Min VWAP Extension (pts),8,4,12,float,v2: literature band (was 4-18; Sol #0 ~16 too rare)
+Fade Band ATR Multiplier,1.75,1.2,2.0,float,v2: ATR band (was 1.2-2.5)
+Fade Confirm Bars,2,1,2,int,v2: revert bars (was 1-3)
 === RTH / Maintenance ===,,,,,
 Enable RTH Filter,1,1,1,int,LOCKED: RTH session only
 RTH Start (HH:MM),09:30,,,str,RTH open Eastern
@@ -45,7 +45,7 @@ Maintenance Buffer Minutes,15,5,30,int,Buffer around maintenance
 === Exit Logic ===,,,,,
 Stop ATR Multiplier,1.25,0.8,2.0,float,Initial stop distance
 TP VWAP Buffer (pts),1.0,0,2,float,Range mode: exit near VWAP
-Max Hold (bars),36,18,72,int,Time stop (~1.5-6h at TF=5)
+Max Hold (bars),24,12,36,int,v2: time stop at TF=5 (~1-3h; was 18-72)
 Enable Trailing Stop,0,0,1,int,Optional ATR trail after delay
 Trailing Delay (bars),3,2,8,int,Bars before trail ratchet
 ATR Multiplier for Trailing Stop,2,1.5,3.5,float,Trail distance if enabled
@@ -63,7 +63,7 @@ DATA_SPLITS,0.65,0.65,0.65,float,IS fraction per interleaved slice
 DATA_SIZE,0,0,0,int,0 = full history
 USE_INTERLEAVED_SPLIT,TRUE,TRUE,TRUE,bool,Interleaved IS/OOS
 NUM_SPLIT_PERIODS,11,11,11,int,OOS slices
-MIN_TRADES_DAY,0.25,0.25,0.25,float,Min activity floor
+MIN_TRADES_DAY,0.5,0.5,0.5,float,v2: activity floor (was 0.25; Sol #0 ~0.27 barely bound)
 MIN_PROFIT_PER_TRADE,25,25,25,float,Min profit/trade norm
 MIN_TRADES_PEN_WEIGHT,-150,-150,-150,float,Low-trade penalty
 NORM_SORTINO_MAX,8,8,8,float,Sortino cap
@@ -81,7 +81,7 @@ GA_CONSERVATIVE_STOP_SLIPPAGE,1,1,1,float,LOCKED
 GA_CONSERVATIVE_ENTRY_SLIPPAGE,1,1,1,float,LOCKED
 GA_CONSERVATIVE_CHANNEL_SLIPPAGE,0.25,0.25,0.25,float,LOCKED
 GA_PESSIMISTIC_STOPS,1,1,1,int,LOCKED
-GA_DIVERSE_SEED,0,0,0,int,Off for v1
+GA_DIVERSE_SEED,0,0,0,int,Off
 WEIGHT_SORTINO,1,,,float,Fitness: Sortino
 WEIGHT_DRAWDOWN,-1.2,,,float,Fitness: drawdown
 WEIGHT_PF,2,,,float,Fitness: profit factor

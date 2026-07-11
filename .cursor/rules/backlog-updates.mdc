@@ -1,0 +1,40 @@
+---
+description: Keep BACKLOG.md updated when finishing related work (fixed vs verified)
+alwaysApply: true
+---
+
+# Backlog updates (`BACKLOG.md`)
+
+When finishing work that matches an item in `BACKLOG.md`, update that file in the **same change** (or same PR/commit batch). Do not wait for the user to ask.
+
+## When to update
+
+- Closing or implementing a backlog bug/feature
+- Discovering code already implements an open `[ ]` item
+- Completing soak/verification with concrete evidence
+- Deprioritizing or cancelling an item (note why briefly)
+
+## Status conventions (match existing file)
+
+- Open: `- [ ] Short description`
+- Fixed in tree, not proven live: `- [x] … — **fixed** YYYY-MM-DD · **verified** pending`
+- Verified: `- [x] … — **fixed** YYYY-MM-DD · **verified** YYYY-MM-DD (evidence: …)` then move to **Done (recent)** when appropriate
+- Priority: prefix with `**Now**` only for 1–3 active items; clear `**Now**` when done or deprioritized
+
+## Do / don't
+
+- **Do** mark **fixed** when the implementation is in the tree (code review + tests OK).
+- **Do not** mark **verified** from code review alone for live/paper/execution items — need log line, trade id, soak note, or explicit user confirmation.
+- **Do not** invent backlog items for every tiny change; only track work that belongs in Bugs / Features / Testing / Ops.
+- **Do not** dump ephemeral GA run metrics into `BACKLOG.md` — use `docs/strategy_research.md` or run reports under `results/`.
+- Full audits of the whole backlog only when the user asks (or after a large milestone they request).
+
+## Example
+
+```markdown
+# After implementing broker Stop deferral:
+- [x] No STRATEGY SIGNAL EXIT + market while stop armed — **fixed** 2026-07-09 · **verified** pending
+
+# After paper trade confirms:
+- [x] … — **fixed** 2026-07-09 · **verified** 2026-07-10 (evidence: TRADE CLOSE Broker Stop @ … in paper log)
+```

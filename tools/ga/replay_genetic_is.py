@@ -128,7 +128,7 @@ def main():
     use_interleaved = bool(_cfg(param_dict, "USE_INTERLEAVED_SPLIT", True))
     num_periods = int(_cfg(param_dict, "NUM_SPLIT_PERIODS", 5))
 
-    in_sample, _oos, is_mask, _isp, _osp = opt.build_ga_training_bundle(
+    in_sample, _oos, is_mask, _isp, _osp, _oos_mask = opt.build_ga_training_bundle(
         param_dict,
         ga_start_date=ga_start,
         ga_end_date=ga_end,

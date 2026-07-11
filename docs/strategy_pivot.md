@@ -1,9 +1,10 @@
 # Strategy Pivot History
 
-**Date:** 2026-07-08  
-**Master doc:** [`docs/strategy_research.md`](strategy_research.md) — full learnings, attribution, literature comparison, next strategy spec.
+**Date:** 2026-07-11  
+**Master doc:** [`docs/strategy_research.md`](strategy_research.md) — full learnings, attribution, literature comparison, next strategy specs.
 
-**Status:** Trend, Session, and ORB v1 **failed** OOS validation. **Active target:** `vwap_regime` (regime-switching VWAP pullback + deviation fade, ~1–4 trades/day).
+**Status:** Trend, Session, ORB v1, **VWAP Regime v1+v2** all **failed** OOS validation. VWAP-regime family **closed**.  
+**Next:** **ORB v2** literature baseline and/or **Market Intraday Momentum (`mim`)** — see research doc §8–10. Analysis: `results/ga_analysis_vwap_regime_2026-07-10-1.md`.
 
 ---
 
@@ -80,6 +81,17 @@ Attribution: SS − RS −$3.3k · entries anti-predictive. See `results/ga_anal
 3. **Range mode:** VWAP deviation fade with rejection (literature-aligned Session fix).
 4. **Cap:** 2–5 entries/day (GA target ~2 trades/day).
 
+### Params v2 (2026-07-10) — after Jul-08 FAIL
+
+Locked / tightened for literature-aligned re-run (`--fresh`):
+
+| Change | Detail |
+|--------|--------|
+| `Enable ADX Filter` | **LOCKED = 1** (Sol #0 had turned it off) |
+| `Timeframe` | **LOCKED = 5** |
+| `MIN_TRADES_DAY` | **0.5** (was 0.25) |
+| Extension / fade / confirm / hold / trade-start | Narrowed toward ~1–2 trades/day recipe |
+
 ### Commands
 
 ```powershell
@@ -107,10 +119,19 @@ python tools/analysis/strategy_attribution.py `
 |----------|--------|
 | **trend** | Donchian chase; SS − RS ~ −$28k Jul-03 |
 | **session** | VWAP fade; 0/2164 OOS-profitable Jul-05 |
-| **orb** | Long-OR acceptance; Sol #0 OOS −$2.9k Jul-06 |
+| **orb v1** | Long-OR multi-bar acceptance; Sol #0 OOS −$2.9k Jul-06 — **class not falsified** until literature ORB v2 is tested |
+| **vwap_regime v1** | Sol #0 OOS −$12.7k; ADX gate disabled by GA |
+| **vwap_regime v2** | Sol #0 OOS −$3.3k; 0/2759 OOS+; ADX locked but activity collapsed; SS−RS −$2.7k & SS−SR −$3.8k — **family closed** |
+
+## Next
+
+See [`strategy_research.md`](strategy_research.md) §8–10:
+
+1. **`orb_v2`** — 5/15m OR, 0.5× target, opposite-OR stop (practitioner consensus).  
+2. **`mim`** — Market Intraday Momentum (Gao et al. JFE 2018): first half-hour → last half-hour.
 
 ## Preserved infrastructure
 
 - GA engine, sim fidelity, paper/backtest parity, attribution, live IB execution — unchanged.
 - Bollinger — separate product line.
-- Session indicators (VWAP, OR) — shared by ORB.
+- Session indicators (VWAP, OR) — shared by ORB / future MIM.

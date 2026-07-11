@@ -2441,6 +2441,22 @@ def get_robustness_metrics(is_res, oos_res, is_periods_res, oos_periods_res):
         'robustness_score': robustness_score
     }
 
+def _period_eval_mask(df_full: pd.DataFrame, period_df: pd.DataFrame) -> pd.Series:
+    """Boolean mask on df_full for bars belonging to period_df (warmup uses full history)."""
+    return pd.Series(df_full.index.isin(period_df.index), index=df_full.index)
+
+
+def run_backtest_period(params, period_df, param_dict, df_full=None, suppress_output=True):
+    """
+    Evaluate one IS/OOS slice. When df_full is provided, indicators use full history
+    and simulation is restricted to the period mask (same fidelity as GA IS fitness).
+    """
+    if df_full is not None and len(df_full) > 0 and period_df is not None and len(period_df) > 0:
+        mask = _period_eval_mask(df_full, period_df)
+        return run_backtest(params, df_full, param_dict, suppress_output=suppress_output, mask=mask)
+    return run_backtest(params, period_df, param_dict, suppress_output=suppress_output)
+
+
 def calculate_split_detail(params, is_periods, oos_periods, param_dict, df_full=None):
     """
     Calculates primary performance metrics for each IS and OOS split individually.
@@ -2452,28 +2468,14 @@ def calculate_split_detail(params, is_periods, oos_periods, param_dict, df_full=
     # Process In-Sample periods
     for i, period_df in enumerate(is_periods):
         p_name = f"P{i*2+1}" if len(is_periods) > 1 else "IS"
-        # If full history is available, use it for warm-up but restrict evaluation to the period's date range
-        if df_full is not None:
-            # Create a mask for just this period
-            mask = pd.Series(False, index=df_full.index)
-            mask.loc[period_df.index[0]:period_df.index[-1]] = True
-            res = run_backtest(params, df_full, param_dict, mask=mask)
-        else:
-            res = run_backtest(params, period_df, param_dict)
-            
+        res = run_backtest_period(params, period_df, param_dict, df_full=df_full)
         res['period_name'] = p_name
         is_results.append(res)
         
     # Process Out-of-Sample periods
     for i, period_df in enumerate(oos_periods):
         p_name = f"P{(i+1)*2}" if len(oos_periods) > 1 else "OOS"
-        if df_full is not None:
-            mask = pd.Series(False, index=df_full.index)
-            mask.loc[period_df.index[0]:period_df.index[-1]] = True
-            res = run_backtest(params, df_full, param_dict, mask=mask)
-        else:
-            res = run_backtest(params, period_df, param_dict)
-            
+        res = run_backtest_period(params, period_df, param_dict, df_full=df_full)
         res['period_name'] = p_name
         oos_results.append(res)
         
@@ -3912,7 +3914,8 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             is_period_stats_html = "<table class='oos-periods-table'><thead><tr> <th>Period #</th> <th>Date Range</th> <th>Total PNL</th> <th>Trades</th> <th>Win Rate</th> <th>Profit Factor</th> <th>Sortino</th> <th>Max DD</th> <th>Avg Trades/Day</th> <th>Avg Profit/Trade</th> <th>Avg Span (min)</th> </tr></thead><tbody>"
             for i, is_period in enumerate(is_periods, 1):
                 try:
-                    period_res = run_backtest(best_params, is_period, param_dict, suppress_output=True)
+                    period_res = run_backtest_period(
+                        best_params, is_period, param_dict, df_full=in_sample)
                     period_trades = period_res.pop('trades_df')
                     if not period_trades.empty:
                         total_pnl = period_trades['pnl'].sum()
@@ -3947,8 +3950,9 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
             
             for i, oos_period in enumerate(oos_periods, 1):
                 try:
-                    # Run backtest on this individual OOS period
-                    period_res = run_backtest(best_params, oos_period, param_dict, suppress_output=True)
+                    # Full-history warmup + period mask (parity with GA IS / CSV export)
+                    period_res = run_backtest_period(
+                        best_params, oos_period, param_dict, df_full=in_sample)
                     period_trades = period_res.pop('trades_df')
                     
                     if not period_trades.empty:
@@ -4143,8 +4147,18 @@ def build_ga_training_bundle(
     verbose=True,
 ):
     """
-    Load ES 1m data and build (in_sample, oos, is_mask, is_periods, oos_periods) exactly as the GA uses.
-    Import this from tools (or notebooks) to replay `run_backtest(params, in_sample, ..., mask=is_mask)`.
+    Load ES 1m data and build the GA training bundle.
+
+    Returns
+    -------
+    in_sample, oos, is_mask, is_periods, oos_periods, oos_mask
+
+    Both ``in_sample`` and ``oos`` are the **full** GA-window OHLCV (identical frames).
+    Evaluate with masks so indicators warm up on the full history:
+
+    - IS fitness / aggregate: ``run_backtest(params, in_sample, ..., mask=is_mask)``
+    - OOS aggregate / export: ``run_backtest(params, oos, ..., mask=oos_mask)``
+      (``oos_mask`` is always ``~is_mask``)
     """
     if data_csv is None:
         data_csv = os.environ.get(
@@ -4206,25 +4220,28 @@ def build_ga_training_bundle(
                     print(f"  Period {i+1}: OOS ({len(period):,} rows, {period.index[0]} to {period.index[-1]})")
 
         in_sample = df.copy()
-        oos = df[~is_mask]
+        oos = df.copy()
+        oos_mask = ~is_mask
         if verbose:
             print(f"\nIS Mask coverage: {is_mask.sum():,} rows ({is_mask.sum()/len(df)*100:.1f}%)")
+            print(f"OOS Mask coverage: {oos_mask.sum():,} rows ({oos_mask.sum()/len(df)*100:.1f}%)")
             print("=" * 50)
     else:
         split = int(len(df) * float(data_splits))
         is_mask = pd.Series(False, index=df.index)
         is_mask.iloc[:split] = True
+        oos_mask = ~is_mask
         in_sample = df.copy()
-        oos = df.iloc[split:]
+        oos = df.copy()
         is_periods = [df.iloc[:split]] if split > 0 else []
         oos_periods = [df.iloc[split:]] if split < len(df) else []
         if verbose:
             print(f"\n=== Using Simple Chronological Split ===")
             print(f"IS: {is_mask.sum()} rows ({is_mask.sum()/len(df)*100:.1f}%)")
-            print(f"OOS: {len(oos)} rows ({len(oos)/len(df)*100:.1f}%)")
+            print(f"OOS: {oos_mask.sum()} rows ({oos_mask.sum()/len(df)*100:.1f}%)")
             print("=" * 50)
 
-    return in_sample, oos, is_mask, is_periods, oos_periods
+    return in_sample, oos, is_mask, is_periods, oos_periods, oos_mask
 
 
 def verify_config_compatibility(saved_config, current_config):
@@ -4481,7 +4498,7 @@ def main():
     }
     
     data_csv_arg = args.data_csv or os.environ.get('TRADING_DATA_CSV')
-    in_sample, oos, is_mask, is_periods, oos_periods = build_ga_training_bundle(
+    in_sample, oos, is_mask, is_periods, oos_periods, oos_mask = build_ga_training_bundle(
         param_dict,
         ga_start_date=GA_START_DATE,
         ga_end_date=GA_END_DATE,
@@ -4533,8 +4550,8 @@ def main():
         
         # Run backtests to get actual metrics for the dashboard
         print("Running backtests for the specified solution...")
-        is_res = run_backtest(params_loaded, in_sample, param_dict, suppress_output=False)
-        oos_res = run_backtest(params_loaded, oos, param_dict, suppress_output=False)
+        is_res = run_backtest(params_loaded, in_sample, param_dict, suppress_output=False, mask=is_mask)
+        oos_res = run_backtest(params_loaded, oos, param_dict, suppress_output=False, mask=oos_mask)
         
         trades_is = is_res.pop('trades_df')
         trades_oos = oos_res.pop('trades_df')
@@ -5179,8 +5196,8 @@ def main():
                                 if original_type == 'bool' and isinstance(is_params[n], (int, float)):
                                     is_params[n] = bool(int(round(is_params[n])))
                         
-                        # Run actual backtest to get real metrics
-                        is_res_actual = run_backtest(is_params, in_sample, param_dict, suppress_output=True)
+                        # Run actual backtest to get real metrics (IS mask = GA fitness path)
+                        is_res_actual = run_backtest(is_params, in_sample, param_dict, suppress_output=True, mask=is_mask)
                         if isinstance(is_res_actual, dict):
                             # Calculate avg profit per trade for display
                             ppt_val = 0.0
@@ -5205,7 +5222,7 @@ def main():
                                          'avg_profit_per_trade': best_fitness_display[5] if len(best_fitness_display) > 5 else 0}
                 
                 # Calculate OOS every 3 generations (or on first generation) to show progress without slowing down too much
-                if len(hof) > 0 and (gen % 3 == 0 or gen == start_gen) and len(oos) > 0:
+                if len(hof) > 0 and (gen % 3 == 0 or gen == start_gen) and bool(oos_mask.any()):
                     # Run OOS backtest on best solution for intermediate progress tracking
                     try:
                         # Convert TP Method to boolean flags if needed
@@ -5224,7 +5241,8 @@ def main():
                                 if original_type == 'bool' and isinstance(oos_params[n], (int, float)):
                                     oos_params[n] = bool(int(round(oos_params[n])))
                         
-                        oos_res_actual = run_backtest(oos_params, oos, param_dict, suppress_output=True)
+                        oos_res_actual = run_backtest(
+                            oos_params, oos, param_dict, suppress_output=True, mask=oos_mask)
                         if isinstance(oos_res_actual, dict):
                             oos_res_display = {
                                 'sortino': oos_res_actual.get('sortino', 0),
@@ -5496,7 +5514,7 @@ def main():
                 if original_type == 'bool' and isinstance(is_params_final[n], (int, float)):
                     is_params_final[n] = bool(int(round(is_params_final[n])))
         
-        is_res = run_backtest(is_params_final, in_sample, param_dict, suppress_output=False, debug=True)
+        is_res = run_backtest(is_params_final, in_sample, param_dict, suppress_output=False, debug=True, mask=is_mask)
         if not isinstance(is_res, dict):
             print("ERROR: is_res is not a dict!")
             is_res = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'trades_df': pd.DataFrame()}
@@ -5514,13 +5532,15 @@ def main():
     
     # Run OOS backtest with error handling
     try:
-        if len(oos) == 0:
-            print("WARNING: OOS data is empty, skipping OOS backtest")
+        if not bool(oos_mask.any()):
+            print("WARNING: OOS mask is empty, skipping OOS backtest")
             oos_res = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'total_profit': 0}
             trades_oos = pd.DataFrame()
         else:
             # Use the same converted parameters for OOS backtest (ensures consistency)
-            oos_res = run_backtest(is_params_final, oos, param_dict, suppress_output=False)
+            # Full history + oos_mask so indicators warm up across IS bars (parity with GA IS path)
+            oos_res = run_backtest(
+                is_params_final, oos, param_dict, suppress_output=False, mask=oos_mask)
             if not isinstance(oos_res, dict):
                 print("ERROR: oos_res is not a dict!")
                 oos_res = {'sortino': 0, 'max_drawdown': 0, 'avg_trades_day': 0, 'profit_factor': 0, 'trades_df': pd.DataFrame()}
@@ -5617,7 +5637,7 @@ def main():
         is_periods,
         oos_periods,
         suffix,
-        oos_mask=oos_mask if 'oos_mask' in locals() else None,
+        oos_mask=oos_mask,
         csv_progress_callback=_csv_dash_progress,
     )
     
@@ -5792,15 +5812,34 @@ def main():
     # Generate Interactive HTML Dashboard
     # ------------------------------------------------------------------
     print("\n=== Generating Interactive HTML Dashboard ===")
-    # Generate final HTML dashboard with complete results - write directly to web directory
+    # Generate final HTML dashboard with complete results - write directly to web directory.
+    # Must pass is_periods/oos_periods (same as mid-run / CSV-phase dashboards) or the
+    # Individual IS/OOS Period Statistics tables disappear on completion.
     os.makedirs(WEB_DIR, exist_ok=True)
-    generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict, 
-                            logbook, is_res, oos_res, trades_is, trades_oos,
-                            WEB_DASHBOARD, DIAG_DIR,  # Write to web directory as primary location
-                            current_gen=NUM_GEN, total_gen=NUM_GEN, is_final=True, auto_launch=True,
-                            in_sample=in_sample if 'in_sample' in locals() else None,
-                            best_gen_found=best_gen_found,
-                            pop=pop)
+    generate_html_dashboard(
+        hof,
+        best,
+        is_params_final if 'is_params_final' in locals() else best_params,
+        best_fitness,
+        param_keys,
+        param_dict,
+        logbook,
+        is_res,
+        oos_res,
+        trades_is,
+        trades_oos,
+        WEB_DASHBOARD,
+        DIAG_DIR,
+        current_gen=NUM_GEN,
+        total_gen=NUM_GEN,
+        is_final=True,
+        auto_launch=True,
+        is_periods=is_periods if 'is_periods' in locals() else None,
+        oos_periods=oos_periods if 'oos_periods' in locals() else None,
+        in_sample=in_sample if 'in_sample' in locals() else None,
+        best_gen_found=best_gen_found if 'best_gen_found' in locals() else None,
+        pop=pop if 'pop' in locals() else None,
+    )
     print(f"HTML Dashboard (FINAL)  {WEB_DASHBOARD}")
     
     # Also copy to diagnostics directory for backup
@@ -5881,6 +5920,16 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         _dash_every = 10
     _dash_every = max(1, _dash_every)
 
+    # OOS must use full-history + mask (same warmup fidelity as IS). Derive mask if omitted.
+    if oos_mask is None:
+        oos_mask = ~is_mask
+    # Prefer the full GA window for OOS eval when `oos` is a legacy sliced frame.
+    oos_eval_df = in_sample
+    if oos is not None and len(oos) == len(in_sample) and oos.index.equals(in_sample.index):
+        oos_eval_df = oos
+    if not oos_mask.index.equals(oos_eval_df.index):
+        oos_mask = oos_mask.reindex(oos_eval_df.index).fillna(False).astype(bool)
+
     if csv_progress_callback and n_export > 0:
         try:
             csv_progress_callback(0, n_export)
@@ -5902,15 +5951,15 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         export_params, effective_params = build_solution_export_params(
             raw_params, param_dict, param_df, param_keys)
 
-        # Calculate Splits and Robustness for Top Solutions
+        # Calculate Splits and Robustness for Top Solutions (full-history warmup)
         is_periods_res, oos_periods_res = calculate_split_detail(
-            effective_params, is_periods, oos_periods, param_dict)
+            effective_params, is_periods, oos_periods, param_dict, df_full=in_sample)
 
         # Get aggregate results for this solution
         sol_is_res = run_backtest(
             effective_params, in_sample, param_dict, suppress_output=True, mask=is_mask)
         sol_oos_res = run_backtest(
-            effective_params, oos, param_dict, suppress_output=True, mask=oos_mask)
+            effective_params, oos_eval_df, param_dict, suppress_output=True, mask=oos_mask)
         
         # Calculate Robustness Evaluation
         robust = get_robustness_metrics(sol_is_res, sol_oos_res, is_periods_res, oos_periods_res)

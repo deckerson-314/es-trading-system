@@ -141,7 +141,7 @@ def main() -> int:
         return 1
 
     effective, param_dict, col = _load_solution(args.solution, ga_csv, param_csv)
-    in_sample, oos, is_mask, _, _ = build_ga_training_bundle(
+    in_sample, oos, is_mask, _, _, oos_mask = build_ga_training_bundle(
         param_dict,
         ga_start_date=str(param_dict["GA_START_DATE"]["value"]),
         ga_end_date=str(param_dict["GA_END_DATE"]["value"]),
@@ -155,11 +155,11 @@ def main() -> int:
 
     print(f"Solution column: {col}")
     print(f"Window: {param_dict['GA_START_DATE']['value']} -> {param_dict['GA_END_DATE']['value']}")
-    print("(OOS replay uses disjoint OOS bars, same as GA trade export.)")
+    print("(OOS replay uses full-history warmup + OOS mask, same as GA trade export.)")
     print()
 
-    base_oos = _summarize(_run(effective, param_dict, oos, invert=False))
-    flip_oos = _summarize(_run(effective, param_dict, oos, invert=True))
+    base_oos = _summarize(_run(effective, param_dict, oos, invert=False, mask=oos_mask))
+    flip_oos = _summarize(_run(effective, param_dict, oos, invert=True, mask=oos_mask))
     base_is = _summarize(_run(effective, param_dict, in_sample, invert=False, mask=is_mask))
     flip_is = _summarize(_run(effective, param_dict, in_sample, invert=True, mask=is_mask))
 

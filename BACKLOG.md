@@ -39,29 +39,33 @@ Prefix the line with **Now** at the start (e.g. `- [ ] **Now** dashboard does no
 
 Live execution / parity ([docs/execution_and_trailing_stop_design.md](docs/execution_and_trailing_stop_design.md) §9.2):
 
-- [ ] **Now** Flat-book cleanup cancels bracket legs before IB fill lands (`core/protection.py`, `tools/safety/guards.py`) — **fixed** 2026-05-21 · **verified** pending (2026-05-21 trade: stop 52 Cancelled @ entry)
-- [ ] **Now** Post-open stop verify + re-protect when broker leg missing (`ensure_bracket_protective_stop`) — **fixed** 2026-05-21 · **verified** pending
-- [ ] Working-stop detection ignores PendingCancel/Inactive (`es_position_has_protective_exit_orders`) — **fixed** 2026-05-21 · **verified** pending
-- [ ] `_force_close_position`: TRADE CLOSE log + report slippage/live_exit_type — **fixed** 2026-05-21 · **verified** pending
-- [ ] No `STRATEGY SIGNAL EXIT: Stop Loss` + market while stop `Submitted`/`PreSubmitted` and position open
-- [ ] No `STRATEGY SIGNAL EXIT: Take Profit` + market while TP limit active and position open
-- [ ] `bars_held` after N **strategy** bars equals expected (not ~13×N on 1-min clock)
-- [ ] During `trailing_delay`, broker stop stays at entry `initial_sl_pct` (no chandelier tighten in logs)
-- [ ] Typical SL/TP exits show child order `Filled`, not only market order
-- [ ] Channel exits labeled `Channel Exit (signal)`, not `Broker Stop`
-- [ ] Strategy bar processing: trail log line precedes any exit signal log on that bar
-- [ ] Backtest/GA regression unchanged on fixed seed
-- [ ] Compare report: `live_exit_type` in `{broker_stop, broker_tp, channel_signal, software_backup, maintenance, rth}`
+Code review 2026-07-09: several items below already have implementations + unit tests; they stay **verified pending** until a live/paper trade log confirms behavior.
+
+- [x] Flat-book cleanup cancels bracket legs before IB fill lands (`core/protection.py`, `tools/safety/guards.py`) — **fixed** 2026-05-21 · **verified** pending (2026-05-21 trade: stop 52 Cancelled @ entry)
+- [x] Post-open stop verify + re-protect when broker leg missing (`ensure_bracket_protective_stop`) — **fixed** 2026-05-21 · **verified** pending
+- [x] Working-stop detection ignores PendingCancel/Inactive (`es_position_has_protective_exit_orders`) — **fixed** 2026-05-21 · **verified** pending
+- [x] `_force_close_position`: TRADE CLOSE log + report slippage/live_exit_type — **fixed** 2026-05-21 · **verified** pending
+- [x] No `STRATEGY SIGNAL EXIT: Stop Loss` + market while stop `Submitted`/`PreSubmitted` and position open — **fixed** 2026-05-21 (`LIVE_BROKER_AUTHORITATIVE_EXIT` defer path in `core/execution.py`) · **verified** pending
+- [x] No `STRATEGY SIGNAL EXIT: Take Profit` + market while TP limit active and position open — **fixed** 2026-05-21 (same broker-authoritative defer) · **verified** pending
+- [x] `bars_held` after N **strategy** bars equals expected (not ~13×N on 1-min clock) — **fixed** 2026-05-21 (`skip_trailing` on 1-min ticks; tests in `test_exit_logic.py`) · **verified** pending
+- [x] During `trailing_delay`, broker stop stays at entry `initial_sl_pct` (no chandelier tighten in logs) — **fixed** 2026-05-21 (trail delay + defer; `test_trend_functional.py`) · **verified** pending
+- [ ] Typical SL/TP exits show child order `Filled`, not only market order — **open** (soak observation; depends on broker-authoritative path working end-to-end)
+- [x] Channel exits labeled `Channel Exit (signal)`, not `Broker Stop` — **fixed** 2026-05-21 (`_exit_channel_signal` / `_live_exit_type`) · **verified** pending
+- [x] Strategy bar processing: trail log line precedes any exit signal log on that bar — **fixed** 2026-05-21 (Phase 2 order: trail → TP sync → `check_exit`) · **verified** pending
+- [ ] Backtest/GA regression unchanged on fixed seed — **open** (verification task, not a code defect)
+- [x] Compare / trade report: `live_exit_type` in `{broker_stop, broker_tp, channel_signal, software_backup, maintenance, rth}` — **fixed** 2026-05-20 (`unified_trade_report.py`, `completed_trades.py`) · **verified** pending
 
 ### GA dashboard (`optimize.py`)
 
-- [ ] GA split analysis disappears once the GA is complete
+- [x] OOS (and final IS trade export) ran without full-history warmup / mask — **fixed** 2026-07-10 (`build_ga_training_bundle` returns full `oos` + `oos_mask`; export/dashboard/split detail use `mask`; regression in `tests/test_ga_oos_warmup_mask.py`) · **verified** pending (re-export or next GA finish to confirm OOS PnL vs prior cold-path numbers)
+
+*(no other open items)*
 
 ### Paper Dashboard
-- [ ] **Now** Dashboard lockup with open position: single-flight refresh + throttle `reqOpenOrders` (`main.py`) — **fixed** 2026-05-21 · **verified** pending (2026-05-21 trade: status.js timeout storm)
-- [ ] **Now** When position is open, the graph flash the population of the bars associated with the trade periodically.
-- [ ] **Now** Active position table does not show current PNL and the unrealized PNL at the top is always 0
-- [ ] dashboard does not survive api restart
+- [x] Dashboard lockup with open position: single-flight refresh + throttle `reqOpenOrders` (`main.py`) — **fixed** 2026-05-21 · **verified** pending (2026-05-21 trade: status.js timeout storm)
+- [ ] **Now** When position is open, the graph flash the population of the bars associated with the trade periodically. — **open** (no `uirevision` / stable-range fix found in `paper_status.js`)
+- [x] Active position table does not show current PNL and the unrealized PNL at the top is always 0 — **fixed** 2026-06-10 (`render_positions_panel` Unrealized col; `_merge_positions_for_dashboard` / portfolio events) · **verified** pending (confirm with open paper position; bot-bracket subtable still has no Unrealized col)
+- [x] dashboard does not survive api restart — **fixed** 2026-06-10 (infinite Gateway reconnect + `run_reconnection_safety_sequence` + post-reconnect dashboard refresh) · **verified** pending (needs Gateway reboot soak)
 - [x] Bar chart entry/exit hover: price, bar time, SL/TP@open/close (`tools/dashboard/updates.py`) — **fixed** 2026-05-20 · **verified** pending
 - [x] Bar chart: closed-trade SL/TP trail from timeline (`closed_trade_lines`) — **fixed** 2026-05-20 · **verified** pending (needs closed trade on new dashboard)
 - [x] Active Positions: bot bracket table with entry time, duration, SL/TP (`main.py` + dashboard) — **fixed** 2026-05-20 · **verified** pending (needs open bracket)
@@ -71,14 +75,14 @@ Live execution / parity ([docs/execution_and_trailing_stop_design.md](docs/execu
 - [x] Ctrl+C cooperative shutdown (no `ib.disconnect()` in signal handler) (`main.py`) — **fixed** 2026-05-20 · **verified** pending
 
 ### Backtest
-- [ ] If no "--solution" arguement is used, the backetest should use the "Value" column in the csv file
-- [ ] The backtest dashboard should show the parameters that were used
-- [ ] Old Bollinger Backtest dashboard is non-functional and shouldn't be separate
-- [ ] **Paper vs backtest parity: `live_data.csv` / HTF resample mismatch** — `save_live_data_row` appends **13m HTF snapshots** (~`:09/:22/:35/:48`), not continuous 1-min OHLCV; `compare_paper_backtest_trend.py` and `backtest.py` load that file as 1-min and **re-resample**, shifting bar labels (~3m phase: paper **09:35** vs replay **09:45**) and distorting indicators (e.g. Jun 9 2026 09:45 long: paper SMA **7455** pass vs replay SMA **7507** fail on same Donchian breakout). Live uses `resample_data` (`closed='right', label='right'`); backtest uses `resample('13T')` defaults. Investigate: persist true 1-min feed separately; unify resample everywhere; compare on HTF rows or 1-min source without double-resample. Ref: `core/monitoring.py` (`save_live_data_row`, `resample_data`), `compare_paper_backtest_trend.py`, `backtest.py`.
+- [ ] If no `--solution` / `--solutions` argument is used, the backtest should use the `Value` column in the CSV — **open / partial** (`--params` already loads `Value` via `load_params`; GA file path still defaults to Solution_0 when a GA CSV is implied)
+- [x] The backtest dashboard should show the parameters that were used — **fixed** 2026-05-20 (`Strategy Parameters` section in `tools/dashboard/updates.py`; `params_source` plumbed) · **verified** pending
+- [ ] Old Bollinger Backtest dashboard is non-functional and shouldn't be separate — **open**
+- [ ] **Paper vs backtest parity: `live_data.csv` / HTF resample mismatch** — **open / partial** (`backtest.py` now has HTF-native pass-through when basename contains `live_data`; full 1-min feed persistence + unified `closed='right', label='right'` still needed). Ref: `core/monitoring.py` (`save_live_data_row`, `resample_data`), `compare_paper_backtest_trend.py`, `backtest.py`.
 
 ### Code
 
-- [ ] Fix indentation in `BB_Genetic_v3.py` parameter analysis section (~lines 1650–2439); re-enable commented block (inline `TODO`)
+- [ ] Fix indentation in `BB_Genetic_v3.py` parameter analysis section (~lines 1650–2439); re-enable commented block (inline `TODO`) — **open** (legacy file; low priority unless v3 is still used)
 
 ---
 
@@ -168,6 +172,7 @@ Optional ops ([GA_PARAMETER_CONTEXT_PLAN.md](GA_PARAMETER_CONTEXT_PLAN.md)):
 
 Move items here when **verified** (keep the full fixed/verified suffix).
 
+- [x] GA split analysis disappears once the GA is complete — **fixed** 2026-07-09 (final `generate_html_dashboard` now passes `is_periods`/`oos_periods`; regression in `tests/test_ga_dashboard_split_analysis.py`) · **verified** 2026-07-09 (evidence: unit tests)
 - [x] GA dashboard: convergence bands, HoF charts, Plotly CDN fixes ([DASHBOARD_UPDATE_CHECKLIST.md](DASHBOARD_UPDATE_CHECKLIST.md) §1–2) — **fixed** 2026-05-10 · **verified** 2026-05-10
 - [x] GA parameter context: `--data-csv`, `.cursorrules` data safety ([GA_PARAMETER_CONTEXT_PLAN.md](GA_PARAMETER_CONTEXT_PLAN.md)) — **fixed** 2026-05-10 · **verified** 2026-05-10
 - [x] Sortino/DD population bands when `actual_*_best` shown (`optimize.py`) — **fixed** 2026-05-10 · **verified** 2026-05-10
@@ -212,4 +217,4 @@ DASHBOARD_DEBUG=1
 | [NEW_ARCHITECTURE_PLAN.md](NEW_ARCHITECTURE_PLAN.md) | Bracket/standalone order architecture |
 | [PRESUBMITTED_STOP_ORDERS_EXPLANATION.md](PRESUBMITTED_STOP_ORDERS_EXPLANATION.md) | IB stop state behavior |
 
-*Created: 2026-05-18.*
+*Created: 2026-05-18. Last audited vs code: 2026-07-09 (many live/paper items code-complete; verification still pending).*

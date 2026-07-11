@@ -73,7 +73,7 @@ def main():
     start = str(param_dict["GA_START_DATE"]["value"])
     end = str(param_dict["GA_END_DATE"]["value"])
     ohlcv = load_ohlcv(start, end)
-    in_sample, oos_df, is_mask, _, _ = build_ga_training_bundle(
+    in_sample, oos_df, is_mask, _, _, oos_mask = build_ga_training_bundle(
         param_dict,
         ga_start_date=start,
         ga_end_date=end,
@@ -83,7 +83,6 @@ def main():
         num_periods=int(param_dict["NUM_SPLIT_PERIODS"]["value"]),
         verbose=False,
     )
-    oos_mask = ~is_mask
 
     pnls = []
     print(f"Random baseline: {N_RANDOM} genomes from {PARAM_CSV.name}")
