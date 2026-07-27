@@ -46,10 +46,12 @@ temp_plots/
 !strategies/session/parameters/*.csv
 !strategies/orb/parameters/*.csv
 !strategies/vwap_regime/parameters/*.csv
+!strategies/sr_zones/parameters/*.csv
 !Session/parameters/genetic_results_*.csv
 !Session/output/genetic_trades_*.csv
 !Orb/parameters/genetic_results_*.csv
 !Orb/output/genetic_trades_*.csv
+!Sr_zones/parameters/genetic_results_*.csv
 
 # Large data file specifically
 **/ES_full_1min_continuous_ratio_adjusted.csv

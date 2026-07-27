@@ -62,7 +62,80 @@ class StrategyFactory:
             except ImportError as e:
                 logging.error(f"Factory: Failed to import VwapRegimeStrategy: {e}")
                 raise
+        elif name == "mim":
+            try:
+                from strategies.mim.strategy import MimStrategy
+                logging.info("Factory: Loading MimStrategy")
+                return MimStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import MimStrategy: {e}")
+                raise
+        elif name == "candle" or name == "candle_pattern":
+            try:
+                from strategies.candle.strategy import CandlePatternStrategy
+                logging.info("Factory: Loading CandlePatternStrategy")
+                return CandlePatternStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import CandlePatternStrategy: {e}")
+                raise
+        elif name == "rth_drift" or name == "rthdrift" or name == "session_part":
+            try:
+                from strategies.rth_drift.strategy import RthDriftStrategy
+                logging.info("Factory: Loading RthDriftStrategy")
+                return RthDriftStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import RthDriftStrategy: {e}")
+                raise
+        elif name == "ema_cross" or name == "emacross":
+            try:
+                from strategies.ema_cross.strategy import EmaCrossStrategy
+                logging.info("Factory: Loading EmaCrossStrategy")
+                return EmaCrossStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import EmaCrossStrategy: {e}")
+                raise
+        elif name == "vwap_reclaim" or name == "vwapreclaim" or name == "reclaim":
+            try:
+                from strategies.vwap_reclaim.strategy import VwapReclaimStrategy
+                logging.info("Factory: Loading VwapReclaimStrategy")
+                return VwapReclaimStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import VwapReclaimStrategy: {e}")
+                raise
+        elif name in ("open_drive_pullback", "opendrive", "open_drive", "odp"):
+            try:
+                from strategies.open_drive_pullback.strategy import OpenDrivePullbackStrategy
+                logging.info("Factory: Loading OpenDrivePullbackStrategy")
+                return OpenDrivePullbackStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import OpenDrivePullbackStrategy: {e}")
+                raise
+        elif name in ("tod_hold", "todhold", "fixed_tod", "tod"):
+            try:
+                from strategies.tod_hold.strategy import TodHoldStrategy
+                logging.info("Factory: Loading TodHoldStrategy")
+                return TodHoldStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import TodHoldStrategy: {e}")
+                raise
+        elif name in ("session_premium", "sessprem", "overnight_premium", "ovn", "session_risk"):
+            try:
+                from strategies.session_premium.strategy import SessionPremiumStrategy
+                logging.info("Factory: Loading SessionPremiumStrategy")
+                return SessionPremiumStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import SessionPremiumStrategy: {e}")
+                raise
+        elif name in ("sr_zones", "sr", "sr_breakout", "srzones"):
+            try:
+                from strategies.sr_zones.strategy import SrZonesStrategy
+                logging.info("Factory: Loading SrZonesStrategy")
+                return SrZonesStrategy(params_dict)
+            except ImportError as e:
+                logging.error(f"Factory: Failed to import SrZonesStrategy: {e}")
+                raise
         else:
             raise ValueError(
-                f"Unknown strategy: '{strategy_name}'. Available: ['bollinger', 'orb', 'session', 'trend', 'vwap_regime']"
+                f"Unknown strategy: '{strategy_name}'. "
+                f"Available: ['bollinger', 'orb', 'mim', 'candle', 'rth_drift', 'ema_cross', 'vwap_reclaim', 'open_drive_pullback', 'tod_hold', 'session_premium', 'sr_zones', 'session', 'trend', 'vwap_regime']"
             )

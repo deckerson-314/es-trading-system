@@ -1,0 +1,84 @@
+Name,Value,Min,Max,Type,Description
+=== Strategy Config ===,,,,,
+Enable Long Trades,1,0,1,int,Allow longs (optimizable)
+Enable Short Trades,1,0,1,int,Allow shorts (two-sided)
+Max Open Trades,1,1,1,int,LOCKED one position
+Transaction Cost (Per Trade),15.0,15,15,float,Friction per round-trip
+Timeframe (minutes),7,3,15,int,Bar size (optimized)
+=== Entry: Multi-zone S/R Breakout ===,,,,,
+Zone Width ATR Mult,0.4622,0.15,0.80,float,Half-width k of zone around wick extreme
+Strength Threshold,4.5663,1.0,6.0,float,Min zone strength for breakout entry
+Volume Mult,1.0,1.0,2.5,float,Entry volume >= mult x volume MA
+Dissipation (per bar),0.9946,0.05,2.0,float,Linear strength loss per bar (max(0 strength - d))
+Stop Pad ATR,0.3199,0.0,0.50,float,Stop beyond origin zone edge in ATR
+Max Hold (bars),49,6,60,int,Time exit
+Min Opposite Zone Dist (ATR),0.5,0.5,0.5,float,LOCKED min room entry→opposite zone (ATR); blocks micro post-entry TP
+Entry Headroom (ATR),1.2602,0.0,2.5,float,Min clearance entry→next strong opposite zone (ATR); 0=off; overlap-aware
+=== Filters ===,,,,,
+Enable RTH Filter,1,1,1,int,LOCKED RTH only
+RTH Start (HH:MM),09:30,,,str,RTH open Eastern
+RTH End (HH:MM),16:00,,,str,RTH close Eastern
+RTH Exit Buffer (minutes),5,5,5,int,LOCKED flatten before close
+Enable Maintenance Filter,1,1,1,int,LOCKED
+Daily Maintenance Start (HH:MM),17:00,,,str,Daily maintenance start
+Daily Maintenance End (HH:MM),17:30,,,str,Daily maintenance end
+Weekend Maintenance Start Day,4,4,4,int,Friday
+Weekend Maintenance Start Time (HH:MM),17:00,,,str,Friday maintenance start
+Weekend Maintenance End Day,6,6,6,int,Sunday
+Weekend Maintenance End Time (HH:MM),18:00,,,str,Sunday maintenance end
+Maintenance Buffer Minutes,44,5,60,int,Exit force-flat buffer before maintenance (minutes)
+Maintenance Entry Buffer (minutes),105,30,240,int,Block new entries within N min of maint/RTH force-flat
+=== Exit Logic ===,,,,,
+Enable Stop Loss,1,1,1,int,LOCKED origin-zone stop on
+Stop ATR Multiplier,1.0,1.0,1.0,float,Unused (stop from zone edge + pad)
+Enable Take Profit,0,0,0,int,LOCKED off (opposite-zone exit)
+Take Profit ATR Multiplier,2.0,2.0,2.0,float,Unused
+Enable Trailing Stop,0,0,0,int,LOCKED off (classic ATR trail)
+Trailing Delay (bars),1,1,1,int,Unused
+ATR Multiplier for Trailing Stop,2.0,2.0,2.0,float,Unused
+Enable Breakeven Stop,0,0,1,int,After MFE>=trigger ATR move stop to entry+/-pad
+Breakeven Trigger (ATR),0.2989,0.25,2.0,float,MFE in ATR units before arming breakeven stop
+Breakeven Pad (ATR),0.0,0.0,0.0,float,LOCKED pad beyond entry when BE arms (0=exact entry)
+=== GA Criteria ===,,,,,
+POP_SIZE,150,150,150,int,Short diagnostic pop
+NUM_GEN,25,25,25,int,Short diagnostic gens
+CX_PB,0.5,0.5,0.5,float,Crossover
+MUT_PB,0.4,0.4,0.4,float,Mutation
+MUT_MU,0.0,0,0,float,Mutation mean
+MUT_SIGMA,0.3,0.3,0.3,float,Mutation sigma
+TARGET_TRADES_DAY,1.5,1.5,1.5,float,Activity target
+TRADES_PENALTY_WEIGHT,0.25,0.25,0.25,float,Excess trade penalty
+DD_WEIGHT,0.5,0.5,0.5,float,Drawdown weight
+DATA_SPLITS,0.65,0.65,0.65,float,IS fraction
+DATA_SIZE,0,0,0,int,0 = full history
+USE_INTERLEAVED_SPLIT,True,TRUE,TRUE,bool,Interleaved IS/OOS
+NUM_SPLIT_PERIODS,11,11,11,int,OOS slices
+MIN_TRADES_DAY,0.3,0.3,0.3,float,Activity floor
+MIN_PROFIT_PER_TRADE,15.0,15,15,float,Min profit/trade norm
+MIN_TRADES_PEN_WEIGHT,-120.0,-120,-120,float,Low-trade penalty
+NORM_SORTINO_MAX,8.0,8,8,float,Sortino cap
+NORM_DD_MAX,80000.0,80000,80000,float,DD norm cap
+NORM_PF_MAX,2.5,2.5,2.5,float,PF norm cap
+NORM_TRADES_MAX,3.0,3.0,3.0,float,Trades/day norm
+NORM_PNL_MAX,150000.0,150000,150000,float,PnL norm cap
+NORM_PROFIT_TRADE_MAX,100.0,100,100,float,PPT norm cap
+MIN_WIN_RATE,0.35,0.35,0.35,float,Min win rate
+SORTINO_CAP,8.0,8,8,float,Sortino cap
+GA_START_DATE,2020-01-02,2020-01-02,2020-01-02,str,Backtest start
+GA_END_DATE,2025-10-10,2025-10-10,2025-10-10,str,Backtest end
+GA_LIVE_STYLE_ENTRY,1,1,1,int,LOCKED enter signal-bar close
+GA_CONSERVATIVE_STOP_SLIPPAGE,1.0,1,1,float,LOCKED
+GA_CONSERVATIVE_ENTRY_SLIPPAGE,1.0,1,1,float,LOCKED
+GA_CONSERVATIVE_CHANNEL_SLIPPAGE,0.25,0.25,0.25,float,LOCKED
+GA_PESSIMISTIC_STOPS,1,1,1,int,LOCKED
+GA_DIVERSE_SEED,0,0,0,int,Off
+WEIGHT_SORTINO,1.0,,,float,Fitness: Sortino
+WEIGHT_DRAWDOWN,-1.0,,,float,Fitness: drawdown
+WEIGHT_PF,2.0,,,float,Fitness: profit factor
+WEIGHT_TRADES,0.5,,,float,Fitness: trades/day
+WEIGHT_PNL,1.2,,,float,Fitness: total PnL
+WEIGHT_PPT,1.0,,,float,Fitness: profit/trade
+MIN_TRADE_DURATION,3.0,3,3,float,Min avg hold minutes
+MAX_WIN_RATE_CAP,0.85,0.85,0.85,float,Suspicious win-rate cap
+LIMIT_MAX_LOSS,50000.0,50000,50000,float,Loss soft-gate
+LIMIT_MIN_SORTINO,0.4,0.4,0.4,float,Sortino soft-gate

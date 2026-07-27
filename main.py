@@ -166,6 +166,24 @@ if not args.params:
         args.params = r'strategies\orb\parameters\orb_strategy_params.csv'
     elif args.strategy.lower() in ('vwap_regime', 'vwap'):
         args.params = r'strategies\vwap_regime\parameters\vwap_regime_strategy_params.csv'
+    elif args.strategy.lower() == 'mim':
+        args.params = r'strategies\mim\parameters\mim_strategy_params.csv'
+    elif args.strategy.lower() in ('candle', 'candle_pattern'):
+        args.params = r'strategies\candle\parameters\candle_strategy_params.csv'
+    elif args.strategy.lower() in ('rth_drift', 'rthdrift', 'session_part'):
+        args.params = r'strategies\rth_drift\parameters\rth_drift_strategy_params.csv'
+    elif args.strategy.lower() in ('ema_cross', 'emacross'):
+        args.params = r'strategies\ema_cross\parameters\ema_cross_strategy_params.csv'
+    elif args.strategy.lower() in ('vwap_reclaim', 'vwapreclaim', 'reclaim'):
+        args.params = r'strategies\vwap_reclaim\parameters\vwap_reclaim_strategy_params.csv'
+    elif args.strategy.lower() in ('open_drive_pullback', 'opendrive', 'open_drive', 'odp'):
+        args.params = r'strategies\open_drive_pullback\parameters\open_drive_pullback_strategy_params.csv'
+    elif args.strategy.lower() in ('tod_hold', 'todhold', 'fixed_tod', 'tod'):
+        args.params = r'strategies\tod_hold\parameters\tod_hold_strategy_params.csv'
+    elif args.strategy.lower() in ('session_premium', 'sessprem', 'overnight_premium', 'ovn', 'session_risk'):
+        args.params = r'strategies\session_premium\parameters\session_premium_strategy_params.csv'
+    elif args.strategy.lower() in ('sr_zones', 'sr', 'sr_breakout', 'srzones'):
+        args.params = r'strategies\sr_zones\parameters\sr_zones_strategy_params.csv'
 
 # Validate Output Directory
 if not os.path.exists(args.output_dir):

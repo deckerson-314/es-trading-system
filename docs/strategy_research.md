@@ -1,8 +1,7 @@
-# Intraday Strategy Research — Trend, Session, ORB, VWAP Regime
+# Intraday Strategy Research — Trend, Session, ORB, VWAP Regime, MIM
 
-**Last updated:** 2026-07-11  
-**Scope:** Completed GA runs on ES (2020–2025), four-quadrant attribution, comparison to practitioner backtests and academic ORB/VWAP/MIM literature. Fresh literature/forum survey 2026-07-10 for next hypothesis.  
-**Purpose:** Record what we learned, why each hypothesis failed, and specify the **next strategies to optimize** — targeting **~0.5–4 trades/day** for faster statistical testing.
+**Last updated:** 2026-07-27  
+**Scope:** Completed GA runs on ES (2020–2025), four-quadrant attribution, comparison to practitioner backtests and academic ORB/VWAP/MIM literature. Fresh literature/forum survey 2026-07-10 for next hypothesis. ORB v2 thorough HOF analysis (not Sol #0–centric): `results/ga_analysis_orb_v2_2026-07-12-orb-v2-15m.md`. MIM closed: `results/ga_analysis_mim_2026-07-14-mim-v1.md`. Candle exit re-export: `results/ga_analysis_candle_exit_sol74_2026-07-15_reexport.md`. EMA cross: `results/ga_analysis_ema_cross_2026-07-16-ema-cross-v1.md`. `sr_zones` v1 **FAIL**; oppdist05 / buffers-be climate **PASS deploy lens**; g75 **5/5** Sol94; v3 locked-buffers **finished** but climate thinner (0×5/5) — peak Sol145: `results/ga_analysis_sr_zones_2026-07-27-sr-zones-v3-locked-buffers.md`.
 
 ---
 
@@ -15,25 +14,51 @@
 | **Session** v2 | 2026-07-05 | −$18,453 | 0.35 | 225 | 0 / 2,164 | −$13.6k MC med | **FAIL** |
 | **ORB** acceptance | 2026-07-06 | −$2,861 | 0.68 | 34 | 58 / 820 | −$3.3k MC med | **FAIL** (Sol #0) |
 | **VWAP Regime** v1 | 2026-07-08 | −$12,732 | 0.73 | 220 | 1 / 2,212 | −$10.8k MC med | **FAIL** |
+| **ORB v2** lit 15m | 2026-07-12 | −$5,779 | 0.89 | ~0.25 t/d | **4 / 880** | export SS−RS +$8.1k† | **FAIL** (deploy) |
 | **VWAP Regime** v2 | 2026-07-10 | −$3,349 | 0.71 | 60 | 0 / 2,759 | −$2.7k MC med | **FAIL** — family dead |
+| **MIM** v1 | 2026-07-14 | −$6,868 | 0.92 | 358 | n/a‡ | not run (IS− HOF) | **FAIL** — family closed |
+| **Candle** v1 | 2026-07-14 | +$10,932 (Sol0) / **+$36.5k Sol74** | 1.06 / **1.18** | 414 / **498** | **162 / 788** | Sol74 SS−RS **+$48k** | **GA OK** — paper Sol 74/55 |
+| **rth_drift** v1 | 2026-07-15 | −$27,574 | 0.86 | — | **1 / 653** | — | **FAIL** — no deploy |
+| **Candle exit** Sol74 | 2026-07-15 | **+$25,904** (Sol0) / best **+$33.6k** | 1.13 / 1.17 | — | **913 / 1244** | — | **No upgrade** — keep Sol74 exits |
+| **EMA cross** v1 | 2026-07-16 | −$75,536 | 0.74 | ~1.1 t/d | **0 / 252** | — | **FAIL** — activity OK, no OOS |
+| **sr_zones** v1 | 2026-07-24 | −$3,900 | 0.94 | — | **2 / 80** | — | **FAIL** — thin OOS+; not paper |
+| **sr_zones** oppdist05 | 2026-07-25 | **+$6,088** | 1.07 | — | **50 / 93** | — | **PASS lens** — climate only; not paper yet |
+| **sr_zones** buffers-be | 2026-07-25→26 g75 | **+$9,473** (Sol0) / **+$9.2k Sol94** | 1.09 | — | **78 / 315** | — | **PASS lens** — **Sol94 5/5**; BE rejected |
+| **sr_zones** v3 locked | 2026-07-26→27 | **−$12,400** (Sol0) / **+$26.0k Sol145** | 0.89 / **1.24** | — | **31 / 313** | — | **Thin climate** — locks held; **0×5/5**; Sol145 4/5 peak |
 
-\*Trend RS quadrant had a small-sample bug early in attribution (5 trades); entry failure is still clear from SS vs RR and direction diagnostics.
+\*Trend RS quadrant had a small-sample bug early in attribution (5 trades); entry failure is still clear from SS vs RR and direction diagnostics.  
+†ORB v2: GA CSV OOS −$5.8k; exported trade file SS +$4.7k with SS−RS +$8.1k — reconcile export path; deploy gate still FAIL (0.5% OOS+ HOF).  
+‡MIM: full HOF genetic_results CSV aborted (~11k Pareto); checkpoint shows **0 / 11,026** with fitness Sortino ≥ 0; Sol #0 IS −$12.8k / OOS −$6.9k.  
+Candle: deliberate high-DOF probe; OOS+ cluster is long-only **flipped pins** + EMA (drift motif). Analysis: `results/ga_analysis_candle_2026-07-14-candle-v1.md`.  
+Dual follow-ups: `results/ga_analysis_dual_2026-07-16_rth_drift_and_exit.md` — rth_drift FAIL; exit-only dense OOS+ after TF fix but still below Sol 74.  
+EMA cross v1: `results/ga_analysis_ema_cross_2026-07-16-ema-cross-v1.md` — activity ~1.2 t/d, **0/252 OOS+**; FAIL deploy.  
+sr_zones v1: `results/ga_analysis_sr_zones_2026-07-24-sr-zones-v1.md` — Sol #0 IS+/OOS−; OOS+ **2/80**; FAIL deploy.  
+sr_zones oppdist05: `results/ga_analysis_sr_zones_2026-07-25-sr-zones-v1-oppdist05.md` — Sol0 OOS **+$6.1k**; OOS+ **50/93**; PASS deploy lens (climate vs v1; not same-seed).  
+sr_zones buffers-be gen24: `results/ga_analysis_sr_zones_2026-07-25-sr-zones-v2-buffers-be.md` — Sol0 OOS **+$9.7k** / **4/5**; OOS+ **47/120**; deploy was Sol45.  
+sr_zones buffers-be **g75**: `results/ga_analysis_sr_zones_2026-07-26-sr-zones-v2-buffers-be_g75.md` — HOF **315**; OOS+ **78/315 (24.8%)**; **3× 5/5** (Sol94/95/96); deploy **Sol94**; BE still rejected; maint entry **~105** / maint buf **44** / TF **7**.  
+sr_zones **v3 locked-buffers**: `results/ga_analysis_sr_zones_2026-07-27-sr-zones-v3-locked-buffers.md` — HOF **313**; OOS+ **31/313 (9.9%)**; **0×5/5** / **2×4/5**; Sol0 OOS−; deploy **Sol145** (TF=14, OOS+$26.0k, PF 1.24, rob 68.5); locks held; locking did **not** densify 5/5 vs g75.
 
-**Cross-cutting finding:** All completed hypotheses show **negative entry selection** (strategy entries worse than random OOS timing with matched hold). **Exit logic** sometimes helps (Session v1, ORB, VWAP Regime v1) but cannot fix wrong-side entries; v2 exits **hurt**. **Opposite-direction** USD is often tautological for losers — use `% beats opposite` + full flip replay.
+**Cross-cutting finding:** Most completed hypotheses show **negative entry selection**. ORB v2 export is a possible exception (SS−RS +) but Sol #0 / HOF still fail deploy gates. **Exit logic** sometimes helps but cannot rescue a dead HOF. **MIM** adds: last-30m academic momentum also fails IS under our costs; the 15:30→16:00 clock itself has no free long drift.
 
-**Best relative result:** ORB **Solution_534** — +$3,525 OOS on interleaved slices (PF 1.33), but only **7%** of HOF OOS-positive; **34 contiguous OOS trades** on Sol #0 is too sparse for confidence.
+**Best relative result:** ORB **Solution_534** (v1) / Sol 323 (tzfix) — thin OOS+ tails; never enough HOF mass to deploy.
 
-### Recommended next hypotheses (2026-07-11)
+### Recommended next hypotheses (2026-07-14)
 
 | Priority | Strategy | Why | Status |
 |----------|----------|-----|--------|
-| **DONE** | `vwap_regime` v1+v2 | ADX lock did not create OOS+ HOF; activity collapsed; SS−RS & SS−SR both negative on v2 Sol #0 | **Family closed** — `results/ga_analysis_vwap_regime_2026-07-10-1.md` |
-| **P1** | **`orb_v2` — literature ORB baseline** | Practitioner consensus (5–15m OR, 0.5× target, opposite-OR stop) ≠ our failed ORB v1 | Spec §9 |
-| **P1** | **`mim` — Market Intraday Momentum** | Strongest *academic* OHLC-only edge (Gao et al. JFE 2018; Baltussen et al. JFE 2021) | Spec §10 |
+| **DONE** | `vwap_regime` v1+v2 | ADX lock did not create OOS+ HOF; activity collapsed; SS−RS & SS−SR both negative on v2 Sol #0 | **Family closed** |
+| **DONE** | **`orb_v2` lit 15m** | Geometry traded ~0.4 t/d; Sol #0 OOS−; OOS+ 4/880 | **FAIL deploy** — `results/ga_analysis_orb_v2_2026-07-12-orb-v2-15m.md` |
+| **DONE** | **`mim` Market Intraday Momentum** | Geometry OK; Sol #0 OOS −$6.9k; 0 fitness-IS+ in 11k HOF | **FAIL / closed** — `results/ga_analysis_mim_2026-07-14-mim-v1.md` |
+| **P2** | ORB v2 5m OR alternate | Only if you want second OR geometry after MIM | `orb_v2_5m_strategy_params.csv` |
 | **P2** | Internals-gated ORB / false-break fade | NexusFi: TICK/VOLD confirmation | Needs new data feed |
-| **Skip** | ICT/FVG, DL, Bollinger revive, further VWAP-regime retunes | — | — |
+| **ACTIVE** | **`candle` pattern (overfit / GA sanity)** | **PAPER** Sol **74** — exit-only **no upgrade** (best OOS +$33.6k vs +$36.5k) | `results/ga_analysis_candle_exit_sol74_2026-07-15_reexport.md` |
+| **DONE** | **`ema_cross` (event + activity)** | **FAIL** — 0/252 OOS+; ~1.2 t/d activity only | `results/ga_analysis_ema_cross_2026-07-16-ema-cross-v1.md` |
+| **ACTIVE** | **`vwap_reclaim` (excursion → cross)** | Next GA — session VWAP reclaim/reject, target ~2 t/d | `results/plan_vwap_reclaim_2026-07-17.md` |
+| **DONE** | **`rth_drift` (honest participation)** | **FAIL** — 1/653 OOS+; do not paper | `results/ga_analysis_dual_2026-07-16_rth_drift_and_exit.md` |
+| **DONE** | **`sr_zones` (multi-zone S/R)** | v1 FAIL; oppdist05 PASS; headroom FAIL; buffers-be g75 PASS (**Sol94 5/5**); v3 locked thin climate (**Sol145** 4/5 peak) | **Watch** — attrib Sol145 vs Sol94 vs Sol2 |
+| **Skip** | ICT/FVG, DL, Bollinger revive, further VWAP-regime / ORB v1 / MIM / ema_cross retunes | — | — |
 
-**Decision rule:** `vwap_regime` closed. Implement **ORB v2** and/or **MIM**. Do not re-tune Session fade, Donchian Trend, or VWAP-regime.
+**Decision rule:** `vwap_regime`, **ORB v2 15m**, and **MIM** closed for deploy. **Candle** is a deliberate high-overfit GA probe (not a deploy candidate a priori). Do not re-tune Session fade, Donchian Trend, VWAP-regime, or MIM variants without a new opportunity class.
 
 ---
 
@@ -402,23 +427,26 @@ Run attribution on **every** GA export; reject Sol #0 automatically if SS−RS M
 ## 9. Spec: `orb_v2` — literature ORB baseline
 
 **Class:** extend / retune `OrbAcceptanceStrategy` (or thin `orb_v2` params CSV)  
-**CLI:** `--strategy orb` with `strategies/orb/parameters/orb_v2_strategy_params.csv`  
+**CLI:** `--strategy orb --params strategies/orb/parameters/orb_v2_strategy_params.csv`  
+(Alternate 5m OR: `orb_v2_5m_strategy_params.csv`)  
 **Goal:** Falsify or validate the **published** ES ORB recipe under our friction + interleaved GA.
 
 ### 9.1 Locked / narrow search (do not re-discover long OR)
 
-| Parameter | Literature default | GA range |
-|-----------|-------------------|----------|
-| Opening Range | **5 or 15 min** | lock one run each, or discrete {5, 15} |
-| Entry | **1 close** beyond OR (± buffer) | confirm bars **1–2** only |
-| Stop | **Opposite OR** | locked |
-| Target | **0.5 × OR width** | 0.4–1.0 |
-| Max entries/day | **1** | locked |
-| Timeframe | **5 min** | locked |
-| Max OR width | ~0.55% of price or ATR band | optimizable skip-wide |
+| Parameter | Literature default | GA range / lock |
+|-----------|-------------------|-----------------|
+| Opening Range | **5 or 15 min** | **Locked per CSV** (15m primary; 5m alternate) |
+| Entry | **1 close** beyond OR (± buffer) | confirm bars **1–2** |
+| Stop | **Opposite OR** | **locked on** |
+| Target | **0.5 × OR width** | **0.4–1.0** |
+| Max entries/day | **1** | **locked** |
+| Timeframe | **5 min** | **locked** |
+| Trailing | off | **locked off** |
+| Max OR width | ATR / pts band | optimizable skip-wide |
 | Min OR width | skip dead opens | optimizable |
-| OAIR/OAOR filter | optional: only OAOR for breakout; OAIR → no trade or fade mode off | 0/1 lock after smoke |
-| Long-only toggle | optional (bull regime) | 0/1 |
+| VWAP / ADX | optional | 0–1 |
+| OAIR/OAOR filter | optional later | not in v2 smoke |
+| Long-only toggle | optional | both sides on |
 
 ### 9.2 Expected frequency & gates
 
@@ -438,8 +466,9 @@ Run attribution on **every** GA export; reject Sol #0 automatically if SS−RS M
 
 ## 10. Spec: `mim` — Market Intraday Momentum
 
-**Class:** new `strategies/mim/`  
+**Class:** `strategies/mim/`  
 **CLI:** `--strategy mim`  
+**Status (2026-07-14):** **FAIL / family closed** — `results/ga_analysis_mim_2026-07-14-mim-v1.md`  
 **Academic core:** Gao, Han, Li, Zhou (2018), *Market Intraday Momentum*, Journal of Financial Economics — first half-hour return (from prior close) predicts last half-hour return. Baltussen, Da, van der Wel (2021) link last-30m momentum to **options/ETF hedging demand** across futures.
 
 ### 10.1 Logic (minimal)
@@ -470,26 +499,106 @@ Run attribution on **every** GA export; reject Sol #0 automatically if SS−RS M
 | TARGET_TRADES_DAY | 0.8–1.0 |
 | MIN_TRADES_DAY | 0.4 |
 
+### 10.4 GA result (`mim-v1`, 120 gen)
+
+| Metric | Value |
+|--------|-------|
+| HOF | 11,026 · **0** with fitness Sortino ≥ 0 |
+| Sol #0 IS / OOS | −$12,769 / **−$6,868** · PF 0.88 / **0.92** · 404 / 358 trades |
+| Best logbook IS PnL (gen 119) | −$19.6k · PF 0.90 |
+| Window control (always-long 15:30→16:00) | Gross **−$5.6k** on GA dates |
+| Full HOF CSV | Aborted (not needed for FAIL) |
+
+**Process read:** Geometry and GA search behaved consistently with a hostile last-30m opportunity set under our costs. Residual optional checks (friction=$0, attribution, fitness hand-match) are **not** recommended as a debug hunt before closing the family — see analysis note §Process integrity.
+
 ---
 
-## 11. Research backlog
+## 11. Spec: `sr_zones` — multi-zone S/R breakout
+
+**Status (2026-07-27):** v1 **FAIL**; oppdist05 + buffers-be climate **PASS deploy lens** (not paper until attrib); headroom **FAIL**; g75 **5/5** Sol94; **v3 locked-buffers COMPLETE** — climate thinner (31/313 OOS+, 0×5/5), peak **Sol145** 4/5.  
+**Package:** `strategies/sr_zones/` · params `strategies/sr_zones/parameters/sr_zones_strategy_params.csv`  
+**Plan:** `results/ga_plan_sr_zones_v3_locked_buffers_2026-07-26.md` · `results/plan_sr_zones_2026-07-24.md` · **Latest analysis:** `results/ga_analysis_sr_zones_2026-07-27-sr-zones-v3-locked-buffers.md`
+
+Clean v1: causal swing pivots → ATR-width zones (cap 3S+3R), volume-seeded strength with survived-test boost + per-bar dissipation, flip S↔R on close-through, breakout entry with strength + volume gates. Exits: origin-zone stop → opposite strong zone (min dist ATR) → max hold / RTH. No ADX/EMA/RSI.
+
+**CLI:** `python optimize.py --strategy sr_zones --fresh --run-tag sr-zones-v1 --cores 6`  
+Aliases: `sr`, `sr_breakout`.
+
+### Diagnostic GA `sr-zones-v1` (25 gens · Dissipation gene)
+
+| Gate | Result |
+|------|--------|
+| Sol #0 | IS **+$43.4k** / PF 1.53 → OOS **−$3.9k** / PF 0.94 (Sortino −0.50) — classic IS+/OOS− |
+| HOF | 80 sols · OOS+ **2/80** · best OOS **+$1.2k** · Sol0 positive OOS splits **1/5** |
+| Climate | Long-only · TF=7 · wide zones (~0.79 ATR) · vol mult ≈1.0 |
+| Deploy lens | **FAIL** — thin OOS+ mass |
+
+**Artifacts:** `Sr_zones/parameters/genetic_results_2026-07-24-sr-zones-v1.csv` · `web/ga_dashboard_v4_sr-zones-v1.html`
+
+### Comparison GA `sr-zones-v1-oppdist05` (seed 20260725 · Min Opposite Zone Dist ATR=0.5)
+
+| Gate | Result |
+|------|--------|
+| Sol #0 | IS **+$68.2k** / PF 1.62 → OOS **+$6.1k** / PF 1.07 (Sortino **+0.88**) |
+| HOF | 93 sols · OOS+ **50/93 (53.8%)** · best OOS **+$20.7k** · Sol0 positive OOS splits **3/5** |
+| vs v1 | **Not same-seed A/B** (baseline SEED=None) — climate comparison only |
+| Deploy lens | **PASS** — dense OOS+ + Sol0 OOS+; attrib/paper soak before live |
+
+**Artifacts:** `Sr_zones/parameters/genetic_results_2026-07-25-sr-zones-v1-oppdist05.csv` · `web/ga_dashboard_v4_sr-zones-v1-oppdist05.html` · wrap `results/ga_analysis_sr_zones_2026-07-25-sr-zones-v1-oppdist05.md`
+
+### Comparison GA `sr-zones-v2-buffers-be` (seed 20260725 · maint entry buffer + BE + unlocked maint buffer)
+
+**gen24 (first finish):** HOF 120 · OOS+ 47/120 (39.2%) · 0×5/5 · deploy Sol45 4/5 — wrap `…2026-07-25-sr-zones-v2-buffers-be.md`
+
+**gen75 overnight resume (2026-07-26 complete):**
+
+| Gate | Result |
+|------|--------|
+| Sol #0 | OOS **+$9.5k** / PF 1.09 / Sortino +1.76 · splits **4/5** · rob 48.8 |
+| HOF | **315** sols · OOS+ **78/315 (24.8%)** · best OOS **+$12.6k** (Sol6 4/5) · **3** at 5/5 · **12** at 4/5 |
+| Gene takeaways | Maint entry **~105**; maint buffer **44**; TF **7**; shorts **100% ON**; **BE rejected** (1/315, 0 OOS+); headroom median **~0.59** |
+| vs gen24 | Absolute OOS+ ↑ (47→78); rate ↓ on HOF growth; **first 5/5**; gen24 Sol45 fingerprint not retained |
+| vs oppdist05 Sol2 | Same 5/5 tier; Sol94 rob ≈ Sol2 (59.1 vs 59.3) but lower OOS $ / PF |
+| Deploy lens | **PASS** — export **Sol94** (5/5, OOS+$9.2k, rob 59.1); keep oppdist05 Sol2 as higher-$ 5/5 ref |
+
+**Artifacts:** `Sr_zones/parameters/genetic_results_2026-07-25-sr-zones-v2-buffers-be.csv` · deploy `strategies/sr_zones/parameters/sr_zones_deploy_sol94_buffers-be_g75_2026-07-26.csv` · wrap `results/ga_analysis_sr_zones_2026-07-26-sr-zones-v2-buffers-be_g75.md` · HOF summary `results/sr_zones_v2_buffers_be_hof_summary.csv`
+
+### Overnight GA `sr-zones-v3-locked-buffers` (seed 20260726 · 100 gen · **COMPLETE 2026-07-27**)
+
+Locks from g75 evidence: Maintenance Entry Buffer **105**, Maintenance Buffer Minutes **44**, Enable Breakeven Stop **OFF** (+ Breakeven Trigger **0.5**). Entry Headroom narrowed to **0.25–1.25**. Min Opposite Zone Dist **0.5**. POP 150 / NUM_GEN **100**.
+
+| Gate | Result |
+|------|--------|
+| Sol #0 | IS +$78.7k → OOS **−$12.4k** / PF 0.89 / Sortino −1.70 · splits **1/5** · rob 8.0 — **not deployable** |
+| HOF | **313** sols · OOS+ **31/313 (9.9%)** · best OOS **+$26.0k** (Sol145) · **0** at 5/5 · **2** at 4/5 |
+| Gene takeaways | Locks **held**; TF OOS+ **14** (no TF=7); diss **floor 0.05**; strength/zoneW/vol high; headroom winners ~0.7 |
+| vs g75 | OOS+ rate ↓ (24.8%→9.9%); 5/5 ↓ (3→0); Sol0 worse; peak OOS $ ↑; locking did **not** densify 5/5 |
+| Deploy lens | **Thin** — export **Sol145** (4/5, OOS+$26.0k, PF 1.24, rob 68.5); keep g75 Sol94 + oppdist05 Sol2 as split refs |
+
+**Artifacts:** `Sr_zones/parameters/genetic_results_2026-07-26-sr-zones-v3-locked-buffers.csv` · deploy `strategies/sr_zones/parameters/sr_zones_deploy_sol145_v3-locked-buffers_2026-07-27.csv` · wrap `results/ga_analysis_sr_zones_2026-07-27-sr-zones-v3-locked-buffers.md` · HOF summary `results/sr_zones_v3_locked_buffers_hof_summary.csv` · plan `results/ga_plan_sr_zones_v3_locked_buffers_2026-07-26.md`
+
+---
+
+## 12. Research backlog
 
 | Priority | Task |
 |----------|------|
+| P0 | ~~Smoke + short diagnostic GA for **`sr_zones`** (`--run-tag sr-zones-v1`)~~ **FAIL** — Sol #0 OOS −$3.9k; OOS+ 2/80; oppdist05 **PASS** 50/93; buffers-be g75 **PASS** 78/315 Sol94 5/5; v3 locked **thin** 31/313 Sol145 4/5 (`…v3-locked-buffers.md`) |
 | P0 | ~~Finish `vwap_regime` v2~~ **FAIL** — 0/2759 OOS+; Sol #0 OOS −$3.3k; family **closed** (`results/ga_analysis_vwap_regime_2026-07-10-1.md`) |
 | P0 | Export + attribute **ORB Solution_534** (best slice-OOS) |
 | P0 | ~~Export + attribute vwap_regime Solution_223~~ superseded — v2 closed family |
-| P1 | Implement **`orb_v2`** literature baseline (5/15m OR, 0.5× target) — §9 |
-| P1 | Implement **`mim`** Market Intraday Momentum — §10 |
+| P1 | ~~Implement **`orb_v2`** literature baseline~~ **FAIL deploy** — Sol #0 OOS −$5.8k; OOS+ 4/880 (`results/ga_analysis_orb_v2_2026-07-12-orb-v2-15m.md`) |
+| P1 | ~~Implement **`mim`**~~ **FAIL / closed** — Sol #0 OOS −$6.9k; 0 fitness-IS+ / 11k HOF (`results/ga_analysis_mim_2026-07-14-mim-v1.md`) |
 | P1 | Fix Timeframe lock/export (Jul-10 all sols showed TF=15 while CSV locked Value=5) |
 | P1 | GA: post-run auto-attribution gate in export pipeline |
+| P1 | GA: default `TRADING_GA_CSV_MAX_SOLUTIONS` (e.g. 200); optional parallel CSV export |
 | P2 | OAIR/OAOR day-type label vs PnL (OHLC-only) |
 | P2 | Market internals (TICK/VOLD) data path for ORB confirmation |
 | P2 | Re-attribute Trend Jul-03 with current RS code (kill stale n=5 report) |
 
 ---
 
-## 12. Artifact index
+## 13. Artifact index
 
 | Strategy | GA CSV | OOS trades | Attribution |
 |----------|--------|------------|-------------|
@@ -502,10 +611,16 @@ Run attribution on **every** GA export; reject Sol #0 automatically if SS−RS M
 | VWAP Regime v2 | `Vwap_regime/parameters/genetic_results_2026-07-10-1.csv` | `Vwap_regime/output/genetic_trades_oos_2026-07-10-1_sol0.csv` | `results/attribution_vwap_regime_oos_2026-07-10_sol0.md` |
 | VWAP analysis v1 | — | — | `results/ga_analysis_vwap_regime_2026-07-08-1.md` |
 | VWAP analysis v2 | — | — | `results/ga_analysis_vwap_regime_2026-07-10-1.md` |
+| ORB v2 | `Orb/parameters/genetic_results_2026-07-12-orb-v2-15m.csv` | — | `results/ga_analysis_orb_v2_2026-07-12-orb-v2-15m.md` |
+| MIM v1 | *(HOF CSV aborted)* · checkpoint `strategies/mim/checkpoints/ga_checkpoint_v4_mim-v1.pkl` | `Mim/output/genetic_trades_oos_2026-07-14-mim-v1.csv` | `results/ga_analysis_mim_2026-07-14-mim-v1.md` |
+| sr_zones v1 | `Sr_zones/parameters/genetic_results_2026-07-24-sr-zones-v1.csv` | — | `results/ga_analysis_sr_zones_2026-07-24-sr-zones-v1.md` |
+| sr_zones oppdist05 | `Sr_zones/parameters/genetic_results_2026-07-25-sr-zones-v1-oppdist05.csv` | — | `results/ga_analysis_sr_zones_2026-07-25-sr-zones-v1-oppdist05.md` |
+| sr_zones buffers-be | `Sr_zones/parameters/genetic_results_2026-07-25-sr-zones-v2-buffers-be.csv` | — | `results/ga_analysis_sr_zones_2026-07-26-sr-zones-v2-buffers-be_g75.md` (gen24: `…2026-07-25-…buffers-be.md`) |
+| sr_zones v3 locked | `Sr_zones/parameters/genetic_results_2026-07-26-sr-zones-v3-locked-buffers.csv` | — | `results/ga_analysis_sr_zones_2026-07-27-sr-zones-v3-locked-buffers.md` |
 
 ---
 
-## 13. References
+## 14. References
 
 ### Academic
 

@@ -50,6 +50,7 @@ CRITICAL ARGUMENTS:
                           WARNING: Will overwrite previous run logs if filenames collide.
 
   --seed N                Optional int. Fixes Python and NumPy RNG for reproducible GA runs (A/B).
+                          If omitted, a random seed is auto-drawn, logged, and stored in the checkpoint.
 
 COMMON QUESTIONS:
   Q: How do I resume a run?
@@ -222,7 +223,8 @@ parser.add_argument(
     '--seed',
     type=int,
     default=None,
-    help='Random seed for deterministic GA runs (A/B reproducibility)',
+    help='Random seed for deterministic GA runs (A/B reproducibility). '
+         'If omitted, auto-draws from entropy, logs it, and stores SEED in the checkpoint.',
 )
 args, _unknown_cli = parser.parse_known_args()
 
@@ -250,6 +252,24 @@ if args.params == DEFAULT_PARAM_CSV:
         PARAM_CSV = os.path.join('strategies', 'orb', 'parameters', 'orb_strategy_params.csv')
     elif args.strategy == 'vwap_regime':
         PARAM_CSV = os.path.join('strategies', 'vwap_regime', 'parameters', 'vwap_regime_strategy_params.csv')
+    elif args.strategy == 'mim':
+        PARAM_CSV = os.path.join('strategies', 'mim', 'parameters', 'mim_strategy_params.csv')
+    elif args.strategy in ('candle', 'candle_pattern'):
+        PARAM_CSV = os.path.join('strategies', 'candle', 'parameters', 'candle_strategy_params.csv')
+    elif args.strategy in ('rth_drift', 'rthdrift', 'session_part'):
+        PARAM_CSV = os.path.join('strategies', 'rth_drift', 'parameters', 'rth_drift_strategy_params.csv')
+    elif args.strategy in ('ema_cross', 'emacross'):
+        PARAM_CSV = os.path.join('strategies', 'ema_cross', 'parameters', 'ema_cross_strategy_params.csv')
+    elif args.strategy in ('vwap_reclaim', 'vwapreclaim', 'reclaim'):
+        PARAM_CSV = os.path.join('strategies', 'vwap_reclaim', 'parameters', 'vwap_reclaim_strategy_params.csv')
+    elif args.strategy in ('open_drive_pullback', 'opendrive', 'open_drive', 'odp'):
+        PARAM_CSV = os.path.join('strategies', 'open_drive_pullback', 'parameters', 'open_drive_pullback_strategy_params.csv')
+    elif args.strategy in ('tod_hold', 'todhold', 'fixed_tod', 'tod'):
+        PARAM_CSV = os.path.join('strategies', 'tod_hold', 'parameters', 'tod_hold_strategy_params.csv')
+    elif args.strategy in ('session_premium', 'sessprem', 'overnight_premium', 'ovn', 'session_risk'):
+        PARAM_CSV = os.path.join('strategies', 'session_premium', 'parameters', 'session_premium_strategy_params.csv')
+    elif args.strategy in ('sr_zones', 'sr', 'sr_breakout', 'srzones'):
+        PARAM_CSV = os.path.join('strategies', 'sr_zones', 'parameters', 'sr_zones_strategy_params.csv')
     else:
         PARAM_CSV = args.params
 else:
@@ -307,7 +327,12 @@ if args.dashboard_from:
              if suffix_part != 'v4': # Don't use v4 as suffix if possible
                  suffix = suffix_part
                  print(f"Inferred suffix from checkpoint: {suffix}")
-    except:
+                 # Keep OUTPUT_CSV / trade paths in sync with inferred suffix
+                 OUTPUT_CSV = os.path.join(output_dir, f'genetic_results_{suffix}.csv')
+                 TRADES_OOS_CSV = os.path.join(strategy_name_cap, 'output', f'genetic_trades_oos_{suffix}.csv')
+                 TRADES_IS_CSV = os.path.join(strategy_name_cap, 'output', f'genetic_trades_is_{suffix}.csv')
+                 print(f"Re-export Output Filename: {OUTPUT_CSV}")
+    except Exception:
         pass
 else:
     # Dynamic Checkpoint Path based on strategy (defaulting to bollinger for now)
@@ -959,6 +984,7 @@ def core_evaluate(ind, df_local, param_dict_local, param_keys_local, mask_local=
     apply_volume_param_context(params, param_dict_local)
     apply_rth_param_context(params, param_dict_local)
     apply_maintenance_param_context(params, param_dict_local)
+    apply_breakeven_param_context(params, param_dict_local)
     apply_lookback_bars_from_minutes(params, param_dict_local)
 
     metrics = run_backtest(params, df_local, param_dict_local, suppress_output=True, mask=mask_local)
@@ -1756,6 +1782,14 @@ def apply_rth_param_context(params_local, param_dict_local):
 
 _MAINT_CONTEXT_KEYS = (
     'Maintenance Buffer Minutes',
+    # Note: Maintenance Entry Buffer also gates RTH force-flat — keep as always-on
+    # gene (not stripped when maintenance filter is off).
+)
+
+
+_BREAKEVEN_CONTEXT_KEYS = (
+    'Breakeven Trigger (ATR)',
+    'Breakeven Pad (ATR)',
 )
 
 
@@ -1785,11 +1819,26 @@ def apply_maintenance_param_context(params_local, param_dict_local):
     return params_local
 
 
+def breakeven_stop_enabled(params_local, param_dict_local):
+    """True if MFE→breakeven stop is on for this evaluation."""
+    return _toggle_int_enabled(params_local, param_dict_local, 'Enable Breakeven Stop')
+
+
+def apply_breakeven_param_context(params_local, param_dict_local):
+    """When breakeven is off, drop trigger/pad genes (dead dimensions)."""
+    if breakeven_stop_enabled(params_local, param_dict_local):
+        return params_local
+    for k in _BREAKEVEN_CONTEXT_KEYS:
+        params_local.pop(k, None)
+    return params_local
+
+
 # Parent toggle -> child genes stripped at evaluation when parent is off.
 # Genome slots may still mutate (dead dimensions); CSV export must preserve raw
 # genome values for children — not template back-fill after stripping.
 PARAM_CONTEXT_GROUPS = (
     ('Enable Trailing Stop', _TRAILING_CONTEXT_KEYS),
+    ('Enable Breakeven Stop', _BREAKEVEN_CONTEXT_KEYS),
     ('Enable RSI Filter', _RSI_CONTEXT_KEYS),
     ('Enable ADX Filter', _ADX_CONTEXT_KEYS),
     ('Enable SMA Filter', _SMA_CONTEXT_KEYS),
@@ -2089,7 +2138,15 @@ def finalize_ga_solution_params(raw_params, param_dict):
         clamped_params['Trailing Delay (bars)'] = max(0, int(round(clamped_params['Trailing Delay (bars)'])))
     if 'Trailing Delay (minutes)' in clamped_params:
         clamped_params['Trailing Delay (minutes)'] = max(0, int(round(clamped_params['Trailing Delay (minutes)'])))
-    clamped_params['Timeframe (minutes)'] = max(1, int(round(clamped_params.get('Timeframe (minutes)', 15))))
+    # Locked / non-gene Timeframe must come from the params CSV Value — never a
+    # hardcoded default. A prior fallback of 15 overwrote Min=Max locks (e.g. TF=6)
+    # during CSV export and made OOS aggregates disagree with GA fitness / final dashboards.
+    if 'Timeframe (minutes)' in clamped_params:
+        clamped_params['Timeframe (minutes)'] = max(
+            1, int(round(clamped_params['Timeframe (minutes)'])))
+    elif param_dict and 'Timeframe (minutes)' in param_dict:
+        tv = param_dict['Timeframe (minutes)'].get('value', 1)
+        clamped_params['Timeframe (minutes)'] = max(1, int(round(float(tv))))
     apply_trailing_param_context(clamped_params, param_dict)
     if trailing_stop_enabled(clamped_params, param_dict):
         sync_trailing_delay_params(
@@ -2100,6 +2157,7 @@ def finalize_ga_solution_params(raw_params, param_dict):
     apply_volume_param_context(clamped_params, param_dict)
     apply_rth_param_context(clamped_params, param_dict)
     apply_maintenance_param_context(clamped_params, param_dict)
+    apply_breakeven_param_context(clamped_params, param_dict)
     apply_lookback_bars_from_minutes(clamped_params, param_dict)
     if 'Max Open Trades' in clamped_params:
         clamped_params['Max Open Trades'] = max(1, int(round(clamped_params['Max Open Trades'])))
@@ -2138,6 +2196,9 @@ def merge_solution_params_with_template(clamped_params, param_dict, param_df):
     ambiguous unless loaders fell back to the template ``Value`` column. We merge
     ``param_dict`` / ``param_df`` defaults so every parameter row gets an explicit
     value in each Solution_* column.
+
+    Locked genes (Min==Max) always take the template ``Value``, even if a prior
+    finalize step injected a hardcoded default (e.g. Timeframe=15).
     """
     merged = dict(clamped_params)
     for _, row in param_df.iterrows():
@@ -2155,11 +2216,23 @@ def merge_solution_params_with_template(clamped_params, param_dict, param_df):
         typ = meta.get('type', '')
         if typ in ('statistic', 'robustness', 'split_detail'):
             continue
-        if name in merged:
-            continue
         default_val = meta.get('value')
         if default_val is None and 'Value' in row.index:
             default_val = row['Value']
+
+        locked = False
+        try:
+            mn, mx = meta.get('min'), meta.get('max')
+            if mn is not None and mx is not None and float(mn) == float(mx):
+                locked = True
+        except (TypeError, ValueError):
+            locked = False
+
+        if locked:
+            merged[name] = default_val
+            continue
+        if name in merged:
+            continue
         merged[name] = default_val
     return merged
 
@@ -2461,6 +2534,10 @@ def calculate_split_detail(params, is_periods, oos_periods, param_dict, df_full=
     """
     Calculates primary performance metrics for each IS and OOS split individually.
     If df_full is provided, it uses it for full history warm-up.
+
+    Prefer ``split_detail_from_aggregates`` for CSV export (2 masked sims + trade
+    segmentation). This path re-sims each period and is kept for dashboard /
+    legacy callers that need independent period masks.
     """
     is_results = []
     oos_results = []
@@ -2479,6 +2556,137 @@ def calculate_split_detail(params, is_periods, oos_periods, param_dict, df_full=
         res['period_name'] = p_name
         oos_results.append(res)
         
+    return is_results, oos_results
+
+
+def _empty_split_metrics(period_name: str) -> dict:
+    return {
+        'period_name': period_name,
+        'sortino': 0.0,
+        'max_drawdown': 0.0,
+        'avg_trades_day': 0.0,
+        'profit_factor': 0.0,
+        'total_profit': 0.0,
+        'avg_profit_per_trade': 0.0,
+        'avg_trade_duration_min': 0.0,
+        'trades_df': pd.DataFrame(),
+    }
+
+
+def metrics_from_trades_df(trades_df, *, total_days=1, bar_minutes=1.0) -> dict:
+    """
+    Compute standard GA metrics from an existing trades frame (no re-simulation).
+    Mirrors the metric block at the end of ``run_backtest``.
+    """
+    out = _empty_split_metrics('')
+    del out['period_name']
+    if trades_df is None or len(trades_df) == 0 or 'pnl' not in getattr(trades_df, 'columns', []):
+        return out
+
+    tdf = trades_df.copy()
+    total_profit = float(tdf['pnl'].sum())
+    tdf['cum_pnl'] = tdf['pnl'].cumsum()
+    tdf['peak'] = tdf['cum_pnl'].cummax()
+    tdf['drawdown'] = tdf['peak'] - tdf['cum_pnl']
+    max_drawdown = tdf['drawdown'].max()
+    if pd.isna(max_drawdown):
+        max_drawdown = 0.0
+
+    downside_returns = tdf[tdf['pnl'] < 0]['pnl']
+    if len(downside_returns) > 1:
+        downside_std = float(downside_returns.std())
+    elif len(downside_returns) == 1:
+        downside_std = abs(float(downside_returns.iloc[0]))
+    else:
+        downside_std = 0.001
+
+    avg_return = float(tdf['pnl'].mean())
+    if avg_return > 0:
+        sortino = (avg_return / max(0.001, downside_std)) * (252 ** 0.5)
+    else:
+        sortino = (avg_return / max(0.1, downside_std)) * (252 ** 0.5)
+    sortino = max(-500.0, min(float(sortino), 500.0))
+
+    gross_profit = float(tdf[tdf['pnl'] > 0]['pnl'].sum())
+    gross_loss = abs(float(tdf[tdf['pnl'] < 0]['pnl'].sum()))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
+
+    days = max(1, int(total_days) if total_days else 1)
+    avg_trades_day = len(tdf) / days
+    avg_ppt = float(tdf['pnl'].mean()) if len(tdf) else 0.0
+    avg_dur = _mean_trade_duration_minutes(tdf, bar_minutes=bar_minutes)
+
+    return {
+        'sortino': sortino,
+        'max_drawdown': float(max_drawdown),
+        'avg_trades_day': float(avg_trades_day),
+        'profit_factor': float(profit_factor),
+        'total_profit': total_profit,
+        'avg_profit_per_trade': avg_ppt,
+        'avg_trade_duration_min': float(avg_dur),
+        'trades_df': tdf,
+    }
+
+
+def _trade_entry_times(trades_df: pd.DataFrame) -> pd.Series:
+    if trades_df is None or trades_df.empty or 'entry_time' not in trades_df.columns:
+        return pd.Series(dtype='datetime64[ns]')
+    return pd.to_datetime(trades_df['entry_time'])
+
+
+def _period_day_count(period_df: pd.DataFrame) -> int:
+    if period_df is None or len(period_df) == 0:
+        return 1
+    try:
+        return max(1, len(set(period_df.index.date)))
+    except Exception:
+        return max(1, len(period_df))
+
+
+def split_detail_from_aggregates(is_res, oos_res, is_periods, oos_periods, bar_minutes=1.0):
+    """
+    Build per-split metrics by segmenting aggregate IS/OOS trades (2-pass CSV path).
+
+    Runs no additional backtests. Each trade is assigned to the period whose
+    timestamp range contains its ``entry_time``. This matches aggregate-mask
+    economics (including gap force-closes already applied in the parent sims).
+    """
+    is_trades = (is_res or {}).get('trades_df')
+    oos_trades = (oos_res or {}).get('trades_df')
+    if is_trades is None:
+        is_trades = pd.DataFrame()
+    if oos_trades is None:
+        oos_trades = pd.DataFrame()
+
+    is_entry = _trade_entry_times(is_trades)
+    oos_entry = _trade_entry_times(oos_trades)
+
+    is_results = []
+    for i, period_df in enumerate(is_periods or []):
+        p_name = f"P{i * 2 + 1}" if len(is_periods) > 1 else "IS"
+        if period_df is None or len(period_df) == 0 or is_trades.empty or is_entry.empty:
+            is_results.append(_empty_split_metrics(p_name))
+            continue
+        t0, t1 = period_df.index[0], period_df.index[-1]
+        sub = is_trades.loc[(is_entry >= t0) & (is_entry <= t1)]
+        metrics = metrics_from_trades_df(
+            sub, total_days=_period_day_count(period_df), bar_minutes=bar_minutes)
+        metrics['period_name'] = p_name
+        is_results.append(metrics)
+
+    oos_results = []
+    for i, period_df in enumerate(oos_periods or []):
+        p_name = f"P{(i + 1) * 2}" if len(oos_periods) > 1 else "OOS"
+        if period_df is None or len(period_df) == 0 or oos_trades.empty or oos_entry.empty:
+            oos_results.append(_empty_split_metrics(p_name))
+            continue
+        t0, t1 = period_df.index[0], period_df.index[-1]
+        sub = oos_trades.loc[(oos_entry >= t0) & (oos_entry <= t1)]
+        metrics = metrics_from_trades_df(
+            sub, total_days=_period_day_count(period_df), bar_minutes=bar_minutes)
+        metrics['period_name'] = p_name
+        oos_results.append(metrics)
+
     return is_results, oos_results
 
 
@@ -2771,6 +2979,16 @@ def generate_elite_parameter_insight_html(hof, param_keys, param_dict, max_indiv
     sc_div, sc_script = extract_chart_html(sc_html)
 
     return info_html, hist_div, hist_script, sc_div, sc_script
+
+
+def _refresh_ga_dashboard_manifest(quiet: bool = True) -> None:
+    """Rebuild web/ga_dashboard_manifest.js so index.html lists tagged mid-run dashboards."""
+    try:
+        from tools.dashboard.build_ga_manifest import main as _rebuild_ga_manifest
+        _rebuild_ga_manifest()
+    except Exception as e:
+        if not quiet:
+            print(f"Warning: Could not refresh GA dashboard manifest: {e}")
 
 
 def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, param_dict,
@@ -3801,11 +4019,17 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
         "</div>"
     )
     
-    # Generate full HTML with tooltips and auto-refresh
-    # Use JavaScript refresh that preserves scroll position instead of meta refresh
+    # Mid-run: poll tiny *_status.json and reload only when generation advances.
+    # Scroll preserved via sessionStorage + delayed restore (Plotly layout).
     refresh_script = ''
     if not is_final:
-        refresh_script = " <script> // Auto-refresh every 30 seconds, preserving scroll position (function() { let scrollPosition = sessionStorage.getItem('ga_dashboard_scroll'); if (scrollPosition) { window.scrollTo(0, parseInt(scrollPosition)); }  // Save scroll position before refresh window.addEventListener('beforeunload', function() { sessionStorage.setItem('ga_dashboard_scroll', window.pageYOffset || document.documentElement.scrollTop); });  // Auto-refresh after 30 seconds setTimeout(function() { sessionStorage.setItem('ga_dashboard_scroll', window.pageYOffset || document.documentElement.scrollTop); location.reload(); }, 30000); })(); </script>"
+        _gen_meta = int(current_gen) if current_gen is not None else 0
+        _tot_meta = int(total_gen) if total_gen is not None else 0
+        refresh_script = (
+            f'<meta name="ga-generation" content="{_gen_meta}">\n'
+            f'<meta name="ga-total-gen" content="{_tot_meta}">\n'
+            '<script src="ga_dashboard_refresh.js"></script>\n'
+        )
     
     # Refactored HTML generation to avoid f-string limits
     
@@ -4026,6 +4250,20 @@ def generate_html_dashboard(hof, best, best_params, best_fitness, param_keys, pa
                 f"Failed to write dashboard to {primary!r} and fallback {fb!r}: {e!r}; {e2!r}"
             ) from e2
 
+    # Tiny status sidecar so the open dashboard reloads once per generation (not on a timer).
+    try:
+        import json as _json
+        status = {
+            "generation": int(current_gen) if current_gen is not None else 0,
+            "total": int(total_gen) if total_gen is not None else 0,
+            "is_final": bool(is_final),
+            "updated": pd.Timestamp.now().isoformat(),
+        }
+        status_path = os.path.splitext(written_path)[0] + "_status.json"
+        _atomic_write_utf8(status_path, _json.dumps(status, indent=2) + "\n")
+    except Exception:
+        pass
+
     # Auto-launch only if requested (first update or final update)
     if auto_launch:
         try:
@@ -4174,12 +4412,11 @@ def build_ga_training_bundle(
             "Place the file under Bollinger/data, pass --data-csv, or set TRADING_DATA_CSV."
         )
 
+    from core.timezone_utils import to_naive_us_eastern
+
     df = pd.read_csv(data_csv, header=None, names=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    if df['datetime'].dt.tz is None:
-        df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern').dt.tz_localize(None)
-    else:
-        df['datetime'] = df['datetime'].dt.tz_convert('US/Eastern').dt.tz_localize(None)
+    # Hist OHLC is Eastern wall clock (naive). Aware stamps → ET; never treat naive as UTC.
+    df['datetime'] = to_naive_us_eastern(pd.to_datetime(df['datetime'], format='mixed'))
     df.set_index('datetime', inplace=True)
 
     if verbose:
@@ -4279,10 +4516,24 @@ def main():
     print("# Checkpoint/Resume enabled - saves after each generation")
     print("# Use --fresh or -f flag to force a fresh start (ignores checkpoint)")
 
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
+    # Always lock a concrete SEED for this launch (explicit CLI or auto-drawn).
+    # Resume restores RNG from checkpoint later via load_checkpoint — do not re-seed there.
+    _seed_from_cli = args.seed is not None
+    if not _seed_from_cli:
+        import secrets
+        args.seed = secrets.randbelow(2**32)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    # Defer auto-seed console line when a resume is likely; print after fresh fallback if needed.
+    _will_try_resume = (
+        not args.fresh
+        and not args.dashboard_from
+        and os.path.exists(CHECKPOINT_FILE)
+    )
+    if _seed_from_cli:
         print(f"Random seed fixed to {args.seed}")
+    elif not _will_try_resume:
+        print(f"Random seed fixed to {args.seed} (auto-drawn; pass --seed {args.seed} to replay)")
 
     # Load Parameters (only in main process, not in workers)
     param_dict, param_df = load_params(PARAM_CSV, return_dataframe=True)
@@ -4696,10 +4947,24 @@ def main():
             logbook = tools.Logbook()
             logbook.header = GA_LOGBOOK_HEADER_FULL
             start_gen = 0
-        elif not verify_config_compatibility(saved_config, current_config):
-            print("\nWARNING: Config mismatch detected!")
-            print("Continuing with saved checkpoint despite config mismatch...")
-            print("(Delete checkpoint file to start fresh if needed)")
+            # load_checkpoint restored RNG; re-apply launch seed for this fresh fallback
+            random.seed(args.seed)
+            np.random.seed(args.seed)
+            if not _seed_from_cli:
+                print(f"Random seed fixed to {args.seed} (auto-drawn; pass --seed {args.seed} to replay)")
+        else:
+            if not verify_config_compatibility(saved_config, current_config):
+                print("\nWARNING: Config mismatch detected!")
+                print("Continuing with saved checkpoint despite config mismatch...")
+                print("(Delete checkpoint file to start fresh if needed)")
+            # Resume: prefer checkpoint SEED when CLI omitted --seed.
+            # RNG was already restored in load_checkpoint; do not re-seed here.
+            if not _seed_from_cli and saved_config.get('SEED') is not None:
+                args.seed = saved_config['SEED']
+                current_config['SEED'] = saved_config['SEED']
+            elif not _seed_from_cli:
+                # Old checkpoint without SEED — keep auto-drawn value already in current_config
+                print(f"Random seed fixed to {args.seed} (auto-drawn; pass --seed {args.seed} to replay)")
     else:
         # Start fresh
         pop = toolbox.population(n=POP_SIZE)
@@ -4712,6 +4977,9 @@ def main():
         logbook.header = GA_LOGBOOK_HEADER_FULL
         start_gen = 0
         print("\nStarting fresh run...")
+        if not _seed_from_cli and _will_try_resume:
+            # Resume was attempted but no usable checkpoint — log the auto-drawn seed now
+            print(f"Random seed fixed to {args.seed} (auto-drawn; pass --seed {args.seed} to replay)")
     
     # Statistics for multi-objective
     stats = tools.Statistics(lambda ind: ind.fitness.values)
@@ -5288,6 +5556,7 @@ def main():
                     )
                     dash_duration = (datetime.now() - start_dash).total_seconds()
                     print(f"  [{datetime.now().strftime('%H:%M:%S')}] dashboard updated (took {dash_duration:.1f}s)")
+                    _refresh_ga_dashboard_manifest(quiet=True)
                     # Also copy to diagnostics directory for backup
                     try:
                         import shutil
@@ -5424,6 +5693,7 @@ def main():
     apply_volume_param_context(best_params, param_dict)
     apply_rth_param_context(best_params, param_dict)
     apply_maintenance_param_context(best_params, param_dict)
+    apply_breakeven_param_context(best_params, param_dict)
     apply_lookback_bars_from_minutes(best_params, param_dict)
     if 'Max Open Trades' in best_params:
         best_params['Max Open Trades'] = max(1, int(round(best_params['Max Open Trades'])))
@@ -5496,8 +5766,10 @@ def main():
     # Run IS backtest with error handling
     try:
         # Convert parameters the same way evaluation does (TP Method, booleans, etc.)
-        # This ensures Selected Solution Performance matches the Optimized Values
-        is_params_final = best_params.copy()
+        # This ensures Selected Solution Performance matches the Optimized Values.
+        # Merge locked template rows (Min==Max) so non-gene params match core_evaluate.
+        is_params_final = merge_solution_params_with_template(
+            best_params.copy(), param_dict, param_df)
         
         # Convert TP Method to boolean flags if needed
         if 'TP Method' in is_params_final:
@@ -5571,11 +5843,11 @@ def main():
     
     # ------------------------------------------------------------------
     # Write genetic_results_*.csv early (before plots + dashboard)
-    # Each solution runs split-level + aggregate backtests; large HoF can take a long time.
+    # Each solution: 2 masked aggregates (IS+OOS) then trade segmentation into splits.
     # ------------------------------------------------------------------
     print("\n=== Writing optimized parameters CSV (genetic_results) ===")
     print(
-        "  This step can take many minutes if HoF is large (split backtests per solution). "
+        "  This step can take many minutes if HoF is large (2 aggregate backtests per solution). "
         "By default, CSV export includes all HoF solutions; set TRADING_GA_CSV_MAX_SOLUTIONS to cap.",
         flush=True,
     )
@@ -5754,7 +6026,9 @@ def main():
         plt.legend()
         plt.grid()
         plt.tight_layout()
-        plt.savefig(f'{DIAG_DIR}/param_evolution/{pname.replace(" ", "_")}.png')
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in pname.replace(" ", "_"))
+        safe = safe.strip("_") or "param"
+        plt.savefig(f'{DIAG_DIR}/param_evolution/{safe}.png')
         plt.close()
     print(f"Parameter plots  {DIAG_DIR}/param_evolution/")
     
@@ -5842,6 +6116,9 @@ def main():
     )
     print(f"HTML Dashboard (FINAL)  {WEB_DASHBOARD}")
     
+    # Refresh index.html GA run list
+    _refresh_ga_dashboard_manifest(quiet=False)
+
     # Also copy to diagnostics directory for backup
     try:
         import shutil
@@ -5861,8 +6138,9 @@ def main():
 
 def _select_hof_for_csv_export(hof):
     """
-    CSV export runs split-detail + aggregate backtests per solution and can dominate
-    wall time when the Pareto front is large.
+    CSV export runs two masked aggregate backtests per solution (IS + OOS), then
+    segments trades into per-split rows. Large Pareto fronts can still dominate
+    wall time.
 
     Environment:
       TRADING_GA_CSV_MAX_SOLUTIONS  (default: uncapped when unset/blank)
@@ -5951,16 +6229,16 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
         export_params, effective_params = build_solution_export_params(
             raw_params, param_dict, param_df, param_keys)
 
-        # Calculate Splits and Robustness for Top Solutions (full-history warmup)
-        is_periods_res, oos_periods_res = calculate_split_detail(
-            effective_params, is_periods, oos_periods, param_dict, df_full=in_sample)
-
-        # Get aggregate results for this solution
+        # Two masked aggregate backtests (IS + OOS), then segment trades into splits.
+        # Avoids ~13 full-window re-sims per solution (period-by-period path).
         sol_is_res = run_backtest(
             effective_params, in_sample, param_dict, suppress_output=True, mask=is_mask)
         sol_oos_res = run_backtest(
             effective_params, oos_eval_df, param_dict, suppress_output=True, mask=oos_mask)
-        
+        bar_minutes = float(effective_params.get('Timeframe (minutes)', 1) or 1)
+        is_periods_res, oos_periods_res = split_detail_from_aggregates(
+            sol_is_res, sol_oos_res, is_periods, oos_periods, bar_minutes=bar_minutes)
+
         # Calculate Robustness Evaluation
         robust = get_robustness_metrics(sol_is_res, sol_oos_res, is_periods_res, oos_periods_res)
         
@@ -6248,8 +6526,10 @@ def save_optimized_results(hof, best, param_df, param_dict, in_sample, oos, is_m
     output_df.to_csv(OUTPUT_CSV, index=False)
     print(f"Optimized CSV with {num_solutions} solutions  {OUTPUT_CSV}")
     
-    # Archive checkpoint
-    if os.path.exists(CHECKPOINT_FILE):
+    # Archive checkpoint (skip in --dashboard-from re-export so source pkl is preserved)
+    if args.dashboard_from:
+        print("Dashboard/re-export mode: leaving checkpoint file in place.")
+    elif os.path.exists(CHECKPOINT_FILE):
         archive_checkpoint = os.path.join(DIAG_DIR, f'ga_checkpoint_{suffix}.pkl')
         try:
             if os.path.exists(archive_checkpoint): os.remove(archive_checkpoint)
